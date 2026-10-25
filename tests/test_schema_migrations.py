@@ -1,0 +1,253 @@
+"""Adding a column to a store that already holds data, on SQLite and Postgres."""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+from vestigo.store import (
+    _BASELINE_SCHEMA_VERSION,
+    _LATEST_SCHEMA_VERSION,
+    _MIGRATIONS,
+    ArtifactStore,
+    StoreSchemaMismatch,
+)
+
+
+def _columns(db_path) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(artifact_versions)")}
+    finally:
+        conn.close()
+
+
+def _version(db_path) -> int:
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestMigrationList:
+    def test_versions_are_unique_and_ordered(self):
+        """Applying by ``version`` means a duplicate would silently skip one."""
+        versions = [m.version for m in _MIGRATIONS]
+        assert versions == sorted(versions)
+        assert len(versions) == len(set(versions))
+
+    def test_every_version_is_above_the_baseline(self):
+        """A migration at or below the baseline never runs on an old database."""
+        assert all(m.version > _BASELINE_SCHEMA_VERSION for m in _MIGRATIONS)
+
+
+class TestFreshDatabase:
+    def test_is_stamped_at_the_latest_version(self, tmp_path):
+        store = ArtifactStore(tmp_path / "fresh")
+
+        assert _version(store.db_path) == _LATEST_SCHEMA_VERSION
+
+    def test_has_every_migrated_column(self, tmp_path):
+        store = ArtifactStore(tmp_path / "fresh")
+
+        assert "content_sha256" in _columns(store.db_path)
+
+
+class TestExistingDatabase:
+    def test_a_store_predating_the_version_table_is_migrated(self, tmp_path):
+        """The case the mechanism exists for."""
+        store = ArtifactStore(tmp_path / "old")
+        db_path = store.db_path
+
+        # Rewind it to what a pre-migration database looked like.
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE schema_version")
+        conn.execute("ALTER TABLE artifact_versions DROP COLUMN content_sha256")
+        conn.commit()
+        conn.close()
+        assert "content_sha256" not in _columns(db_path)
+
+        ArtifactStore(tmp_path / "old")  # reopening applies what is pending
+
+        assert "content_sha256" in _columns(db_path)
+        assert _version(db_path) == _LATEST_SCHEMA_VERSION
+
+    def test_reopening_a_current_database_applies_nothing(self, tmp_path):
+        """Idempotent, and the common path: every construction runs this."""
+        db_path = ArtifactStore(tmp_path / "s").db_path
+        before = _version(db_path)
+
+        for _ in range(3):
+            ArtifactStore(tmp_path / "s")
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+        assert _version(db_path) == before
+        assert rows == 1, "a no-op reopen must not stamp another row"
+
+    def test_data_survives_a_migration(self, tmp_path):
+        """The rows are why the store could not be recreated."""
+        import hashlib
+
+        store = ArtifactStore(tmp_path / "old")
+        version = store.create_artifact("keeper", hashlib.sha256(b"x").hexdigest())
+        with store.open_blob_writer("keeper", version) as writer:
+            writer.write(b"x")
+        store.finalize_artifact("keeper", version, schema_json="", row_count=0, byte_size=1)
+
+        conn = sqlite3.connect(store.db_path)
+        conn.execute("DROP TABLE schema_version")
+        conn.execute("ALTER TABLE artifact_versions DROP COLUMN content_sha256")
+        conn.commit()
+        conn.close()
+
+        reopened = ArtifactStore(tmp_path / "old")
+
+        artifact = reopened.get_artifact("keeper", version)
+        assert artifact is not None
+        assert artifact.state == "ready"
+
+    def test_a_store_a_newer_strata_migrated_is_refused(self, tmp_path):
+        """An older Strata on a migrated store would write rows the newer one does not expect."""
+        db_path = ArtifactStore(tmp_path / "s").db_path
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, 0)",
+            (_LATEST_SCHEMA_VERSION + 1,),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(RuntimeError, match="newer than this Strata supports"):
+            ArtifactStore(tmp_path / "s")
+
+
+class TestAReadOnlyOpen:
+    """For commands that only inspect: the store stays exactly as it was."""
+
+    def test_an_older_database_is_refused_untouched(self, tmp_path):
+        db_path = ArtifactStore(tmp_path / "old").db_path
+        conn = sqlite3.connect(db_path)
+        conn.execute("DELETE FROM schema_version WHERE version >= 9")
+        conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (8, 0)")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreSchemaMismatch, match="version 8, older"):
+            ArtifactStore(tmp_path / "old", read_only=True)
+
+        assert _version(db_path) == 8
+        conn = sqlite3.connect(db_path)
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        finally:
+            conn.close()
+        assert "notebook_workers" not in tables
+
+    def test_a_database_from_before_versioning_is_refused(self, tmp_path):
+        db_path = ArtifactStore(tmp_path / "old").db_path
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE schema_version")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreSchemaMismatch, match="older"):
+            ArtifactStore(tmp_path / "old", read_only=True)
+
+    def test_a_newer_database_is_refused_as_before(self, tmp_path):
+        db_path = ArtifactStore(tmp_path / "s").db_path
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, 0)",
+            (_LATEST_SCHEMA_VERSION + 1,),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreSchemaMismatch, match="newer than this Strata supports"):
+            ArtifactStore(tmp_path / "s", read_only=True)
+
+    def test_a_current_database_opens(self, tmp_path):
+        ArtifactStore(tmp_path / "s")
+
+        assert ArtifactStore(tmp_path / "s", read_only=True).stats()["total_versions"] == 0
+
+
+class TestConstantsAndMigrationsAgree:
+    def test_a_migrated_database_matches_a_fresh_one(self, tmp_path):
+        """A column added to the schema constants without a migration breaks only old stores.
+
+        Every other test starts from a fresh database, so nothing else would notice.
+        """
+        fresh = ArtifactStore(tmp_path / "fresh")
+
+        aged = ArtifactStore(tmp_path / "aged")
+        conn = sqlite3.connect(aged.db_path)
+        conn.execute("DROP TABLE schema_version")
+        conn.execute("ALTER TABLE artifact_versions DROP COLUMN content_sha256")
+        conn.commit()
+        conn.close()
+        migrated = ArtifactStore(tmp_path / "aged")
+
+        assert _columns(migrated.db_path) == _columns(fresh.db_path)
+
+
+def _ready(store, artifact_id, executor, inputs, input_versions=None) -> None:
+    from vestigo.provenance import TransformSpec
+
+    spec = TransformSpec(executor=executor, params={"sql": "SELECT 1"}, inputs=inputs)
+    version = store.create_artifact(
+        artifact_id, f"hash-{artifact_id}", transform_spec=spec, input_versions=input_versions
+    )
+    store.finalize_artifact(artifact_id, version, "{}", 1, 1)
+
+
+class TestTheMisboundBuildMigration:
+    def test_fails_embedded_builds_over_eleven_inputs_and_what_read_them(self, tmp_path):
+        """Their bytes bound input10 before input2; anything built over them inherits that."""
+        store = ArtifactStore(tmp_path / "s")
+        twelve = [f"strata://artifact/in{i}@v=1" for i in range(12)]
+        _ready(store, "wide", "local://duckdb_sql@v1", twelve)
+        _ready(store, "wide_bare", "duckdb_sql@v1", twelve[:11])
+        _ready(
+            store,
+            "reader",
+            "local://duckdb_sql@v1",
+            ["strata://name/wide"],
+            {"strata://name/wide": "wide@v=1"},
+        )
+        _ready(store, "narrow", "local://duckdb_sql@v1", twelve[:10])
+        _ready(store, "remote", "pandas_script@v1", twelve)
+        conn = sqlite3.connect(store.db_path)
+        conn.execute("DELETE FROM schema_version WHERE version >= 11")
+        conn.commit()
+        conn.close()
+
+        reopened = ArtifactStore(tmp_path / "s")
+
+        states = {a: reopened.get_artifact(a, 1).state for a in ("wide", "wide_bare", "reader")}
+        assert states == {"wide": "failed", "wide_bare": "failed", "reader": "failed"}
+        assert reopened.find_by_provenance("hash-wide") is None
+        assert reopened.find_by_provenance("hash-reader") is None
+        assert reopened.find_by_provenance("hash-narrow") is not None
+        assert reopened.find_by_provenance("hash-remote") is not None
+        assert _version(reopened.db_path) == _LATEST_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("dialect_name", ["sqlite"])
+def test_column_exists_reports_truthfully(tmp_path, dialect_name):
+    """The primitive every migration is built from."""
+    from vestigo.sql_backend import SqliteDialect
+
+    store = ArtifactStore(tmp_path / "s")
+    dialect = SqliteDialect(store.db_path)
+    conn = dialect.connect()
+    try:
+        assert dialect.column_exists(conn, "artifact_versions", "content_sha256")
+        assert not dialect.column_exists(conn, "artifact_versions", "no_such_column")
+    finally:
+        conn.close()
