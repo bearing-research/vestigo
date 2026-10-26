@@ -28,3 +28,41 @@ history; its version matches the Strata release that pins it.
   once at import.
 - **Formal models.** TLA+ models of the artifact and build lifecycles with
   the configurations that found and then closed their bugs.
+
+### Fixed before the first release (audit of 2026-10-26)
+
+Store:
+- `delete_artifact` of a dedup canonical hands its bytes to every version reading them through `superseded_by`, not only to published or retained ones; a rooted (pinned) version is refused like a published one.
+- `promote_version` carries the source's retention edges, `minted`, `computation_key` and `release_id`, and takes a `tenant`; another tenant's id raises `ArtifactIdTaken`.
+- A sweep recomputes reachability under the write lock per batch and refuses a candidate with a requirement edge into it, so a hold landing mid-sweep keeps what it reads.
+- Two fresh first boots of one SQLite store both succeed: the WAL pragma is retried while another process creates the schema and the fresh stamp runs under the schema lock.
+- `import_artifact` losing the provenance race on PostgreSQL returns the holder and drops its attempt blob instead of raising the driver's error.
+- Use notes never wait behind a SQLite writer: a lookup returns while a sweep or a long finalize holds the lock.
+- `finalize_canonical_together` promotes in a fixed order, so two runs finalizing one computation's outputs in opposite orders both finish on PostgreSQL.
+- A retried finalize of a row another id overtook returns that canonical; `set_name` accepts a superseded version; `cleanup_failed` never reuses a version number; `retain` without a tenant records the version's; a read-only open of a missing store raises `StoreSchemaMismatch` and creates nothing; a sweep tolerates an id another sweep removed.
+- `set_definitions` takes a `tenant`, checks every node against that scope and writes nothing on an unknown one.
+
+Builds and releases:
+- `AssertReferenceRevision` guards the `AdvanceReference` of the same name in the same transaction, so two builds asserting one revision have one winner on PostgreSQL as on SQLite; a first advance is one upsert.
+- `accept` rejects a release whose build stopped building under it; `fail_build`, `complete_build`, `start_build`, `update_build_output`, `claim_build` and `reclaim_expired_build` serialize on the build's write key.
+- `claim_build` and `reclaim_expired_build` clear the build's attempt, and a lapsed lease fences its attempt until it is renewed, so a reclaimed build's old attempt releases nothing.
+- `open_attempt` and `resume` refuse while another attempt's or a runner's lease is live; `accept` raises `ReleaseIncomplete` for a building row staged under the release but not declared; a release's tenant defaults to its build's and a mismatch is refused; `abandon`, `attach` and `mark_prepared` take the calling attempt; `prepare` raises `ReleaseError` for a taken sequence; an `InsertAuditEvent` inside a release holds the audit lock; the release columns are added under the schema lock.
+
+Graph and provenance:
+- `GraphStore.inputs` returns ports in the encoders' byte order on every collation; nodes are inserted in id order so two batches sharing nodes cannot deadlock on PostgreSQL.
+- `Traversal` refuses `max_depth` below one; `topological_order` refuses a root the store lacks; a non-ASCII port name, a role that is not an identifier after NFKC, a label containing `:`, a negative version in `artifact_uri`, and a `TransformSpec` with non-string keys, non-JSON values or non-finite floats are refused with `ValueError`. No stored hash or encoding changes.
+
+Backends:
+- S3 and GCS readers treat only a missing object as absent; access denied, expired credentials and connection errors propagate on every backend's read, exists, size and delete.
+- A PostgreSQL connection wrapper is a context manager, releases itself with a warning when dropped unclosed, refuses a nested acquisition over uncommitted writes or a failed transaction, and releases from any thread; pooled connections are checked before they are handed out.
+- The local backend fsyncs the directory after placing a blob and reports a lost delete race as absent; the inline GCS key file is written without following a planted symlink; half an S3 key pair is refused.
+
+### Changed
+- `find_dependents` and `list_name_reads` read the whole store when `tenant` is omitted; `tenant=None` is the default tenant, as everywhere else.
+- Migration 11, which repaired the first consumer's embedded builds, is a no-op here; the repair is the consumer's.
+- The TLA+ models describe the code as it is: the lifecycle model has the `superseded_by` pointer path and a `PointersResolve` invariant, the lease model an `OpenAttempt` action and a fence on the attempt and its lease.
+
+### Added
+- `ArtifactStore.versions_of_computation(computation_key, tenant=None)`.
+- A README section naming every public entry point; the package docstring lists every module.
+- Tests for every fix above, the cloud backends over fake filesystems and clients (the emulator round trips are opt-in through `VESTIGO_S3_ENDPOINT_URL`, `VESTIGO_GCS_ENDPOINT_OVERRIDE` and `VESTIGO_AZURE_CONNECTION_STRING`), the pooled connection lifecycle on a live PostgreSQL, and the build store's attempts, leases and console chunks. `VESTIGO_REQUIRE_DOCKER=1` turns a missing Docker daemon into a failure, as CI sets it.
