@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version without the leading v (e.g. 0.11.0). Required on manual runs."
+        description: "Version without the leading v (e.g. 0.1.0). Required on manual runs."
         required: true
         type: string
 

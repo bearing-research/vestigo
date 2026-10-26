@@ -5,12 +5,13 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
-## 0.11.0
+## 0.1.0 - 2026-10-26
 
 First release from its own repository. The package was extracted from
 [Strata](https://github.com/bearing-research/strata) under ADR 002
 (source-first ledger extraction, Strata #1294 to #1299) and carries that
-history; its version matches the Strata release that pins it.
+history. It is versioned on its own from here; Strata pins the version it
+was built against.
 
 - **Store.** Immutable versioned artifacts deduplicated by provenance hash,
   with mutable references (compare-and-set, approval), retention roots and
