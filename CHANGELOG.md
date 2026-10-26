@@ -41,6 +41,7 @@ Store:
 - `finalize_canonical_together` promotes in a fixed order, so two runs finalizing one computation's outputs in opposite orders both finish on PostgreSQL.
 - A retried finalize of a row another id overtook returns that canonical; `set_name` accepts a superseded version; `cleanup_failed` never reuses a version number; `retain` without a tenant records the version's; a read-only open of a missing store raises `StoreSchemaMismatch` and creates nothing; a sweep tolerates an id another sweep removed.
 - `set_definitions` takes a `tenant`, checks every node against that scope and writes nothing on an unknown one.
+- `promote_version` closes the source blob's reader when it refuses the id or its transaction fails; on an object store that reader is an open response body.
 
 Builds and releases:
 - `AssertReferenceRevision` guards the `AdvanceReference` of the same name in the same transaction, so two builds asserting one revision have one winner on PostgreSQL as on SQLite; a first advance is one upsert.
