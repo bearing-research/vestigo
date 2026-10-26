@@ -58,6 +58,7 @@ Backends:
 - The local backend fsyncs the directory after placing a blob and reports a lost delete race as absent; the inline GCS key file is written without following a planted symlink; half an S3 key pair is refused.
 
 ### Changed
+- The S3 and GCS backends run on their clouds' own SDKs, boto3 and google-cloud-storage, in place of PyArrow's filesystems, and the package has no required dependency: `vestigo[s3]` and `vestigo[gcs]` bring each backend's SDK. One client per backend reads, writes and signs, so a role resolves once and its session token signs the URLs, and a GCS key reaches the client directly instead of through `GOOGLE_APPLICATION_CREDENTIALS`. An upload lands whole or not at all, so a failed overwrite keeps the previous object. A missing object is still absent; any other error is the SDK's (`botocore.exceptions.ClientError`, `google.api_core.exceptions.GoogleAPICallError`) rather than an `OSError`. `GCSBlobStore` without a key, not anonymous and with no Application Default Credentials fails at construction. A custom endpoint is addressed path-style and may be given as `host:port`. `BlobSettings.gcs_default_bucket_location` is gone: the store never creates a bucket.
 - `find_dependents` and `list_name_reads` read the whole store when `tenant` is omitted; `tenant=None` is the default tenant, as everywhere else.
 - Migration 11, which repaired the first consumer's embedded builds, is a no-op here; the repair is the consumer's.
 - The TLA+ models describe the code as it is: the lifecycle model has the `superseded_by` pointer path and a `PointersResolve` invariant, the lease model an `OpenAttempt` action and a fence on the attempt and its lease.
@@ -65,4 +66,4 @@ Backends:
 ### Added
 - `ArtifactStore.versions_of_computation(computation_key, tenant=None)`.
 - A README section naming every public entry point; the package docstring lists every module.
-- Tests for every fix above, the cloud backends over fake filesystems and clients (the emulator round trips are opt-in through `VESTIGO_S3_ENDPOINT_URL`, `VESTIGO_GCS_ENDPOINT_OVERRIDE` and `VESTIGO_AZURE_CONNECTION_STRING`), the pooled connection lifecycle on a live PostgreSQL, and the build store's attempts, leases and console chunks. `VESTIGO_REQUIRE_DOCKER=1` turns a missing Docker daemon into a failure, as CI sets it.
+- Tests for every fix above, the S3 backend over moto and the GCS and Azure backends over fake clients, every object-store backend against its emulator (MinIO, fake-gcs-server, Azurite) started through Docker like the PostgreSQL suite, the pooled connection lifecycle on a live PostgreSQL, and the build store's attempts, leases and console chunks. `VESTIGO_REQUIRE_DOCKER=1` turns a missing Docker daemon into a failure, as CI sets it.
