@@ -211,15 +211,15 @@ class TestTheMisboundBuildMigration:
     def test_fails_embedded_builds_over_eleven_inputs_and_what_read_them(self, tmp_path):
         """Their bytes bound input10 before input2; anything built over them inherits that."""
         store = ArtifactStore(tmp_path / "s")
-        twelve = [f"strata://artifact/in{i}@v=1" for i in range(12)]
+        twelve = [f"vestigo://artifact/in{i}@v=1" for i in range(12)]
         _ready(store, "wide", "local://duckdb_sql@v1", twelve)
         _ready(store, "wide_bare", "duckdb_sql@v1", twelve[:11])
         _ready(
             store,
             "reader",
             "local://duckdb_sql@v1",
-            ["strata://name/wide"],
-            {"strata://name/wide": "wide@v=1"},
+            ["vestigo://name/wide"],
+            {"vestigo://name/wide": "wide@v=1"},
         )
         _ready(store, "narrow", "local://duckdb_sql@v1", twelve[:10])
         _ready(store, "remote", "pandas_script@v1", twelve)

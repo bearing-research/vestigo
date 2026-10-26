@@ -434,7 +434,7 @@ class Gate2:
     def test_an_alias_move_leaves_a_bound_run_on_its_exact_inputs(self, ledger: Ledger):
         build_id = _build(ledger)
         release = ledger.releases.prepare(build_id, "a1", "checkpoint")
-        bound = {"strata://artifact/features@v=3": "features@v=3"}
+        bound = {"vestigo://artifact/features@v=3": "features@v=3"}
         version = ledger.store.create_artifact(
             "bound-output",
             checkpoint_output_key(PARENT, build_id, 1, "model"),

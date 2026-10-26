@@ -99,7 +99,7 @@ class TestRoots:
         upstream = _ready(store)
         ref = f"{upstream[0]}@v={upstream[1]}"
         held = store.create_artifact(
-            "held", "prov-h", input_versions={f"strata://artifact/{ref}": ref}, minted=True
+            "held", "prov-h", input_versions={f"vestigo://artifact/{ref}": ref}, minted=True
         )
         store.write_blob("held", held, b"h")
         store.finalize_artifact("held", held, "", None, 1)

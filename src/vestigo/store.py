@@ -20,6 +20,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from vestigo import uris
 from vestigo.graph import GRAPH_DDL, GraphStore, NodeId, NodeSpec
 from vestigo.provenance import TransformSpec, parse_transform_spec
 from vestigo.releases import RELEASE_DDL
@@ -119,7 +120,10 @@ def _ancestor_of(input_uri: str, recorded: object) -> tuple[str, int] | None:
     """
     if not isinstance(recorded, str):
         return None
-    if not (input_uri.startswith("strata://artifact/") or input_uri.startswith("strata://name/")):
+    if not (
+        input_uri.startswith(uris.artifact_uri_prefix())
+        or input_uri.startswith(uris.name_uri_prefix())
+    ):
         return None
     artifact_id, separator, version = recorded.partition("@v=")
     if not separator or not version.isdigit():
@@ -4183,7 +4187,7 @@ class ArtifactStore:
 
         return NameStatus(
             name=name,
-            artifact_uri=f"strata://artifact/{artifact.id}@v={artifact.version}",
+            artifact_uri=uris.artifact_uri(artifact.id, artifact.version),
             artifact_id=artifact.id,
             version=artifact.version,
             state=artifact.state,
@@ -4254,7 +4258,7 @@ class ArtifactStore:
         """
         # Inputs are recorded as "artifact_id@v=N" or as the full URI.
         search_pattern = _like_literal(f'"{artifact_id}@v={version}"')
-        uri_pattern = _like_literal(f'"strata://artifact/{artifact_id}@v={version}"')
+        uri_pattern = _like_literal(f'"{uris.artifact_uri(artifact_id, version)}"')
 
         conn = self._get_connection()
         try:
@@ -4312,7 +4316,7 @@ class ArtifactStore:
                 if artifact.input_versions:
                     try:
                         input_vers = json.loads(artifact.input_versions)
-                        exact_uri = f"strata://artifact/{artifact_id}@v={version}"
+                        exact_uri = uris.artifact_uri(artifact_id, version)
                         # Match the exact dependency entry instead of substring prefixes.
                         for uri, ver in input_vers.items():
                             if uri == exact_uri or ver == input_version_used or ver == exact_uri:
@@ -4330,11 +4334,11 @@ class ArtifactStore:
     def list_name_reads(self, tenant: str | None = None) -> list[tuple[str | None, str, str]]:
         """Return ``(tenant, artifact_id, reference)`` for each ready artifact that read a name.
 
-        ``reference`` is what follows ``strata://name/`` in its inputs, e.g.
+        ``reference`` is what follows the name-URI prefix in its inputs, e.g.
         ``taxi/model@champion``. The returned tenant is ``None`` for the default tenant.
         ``tenant`` of ``None`` reads every tenant.
         """
-        prefix = "strata://name/"
+        prefix = uris.name_uri_prefix()
         query = (
             "SELECT id, tenant, input_versions FROM artifact_versions "
             "WHERE state = 'ready' AND input_versions LIKE ?"
@@ -4717,7 +4721,7 @@ class ArtifactStore:
             for uri, recorded in json.loads(recorded_inputs).items():
                 # Parsed as the lineage walk parses it, so that what GC protects
                 # and what a publication's chain will follow cannot drift apart:
-                # a "strata://name/" edge records the concrete version it read
+                # a name-URI edge records the concrete version it read
                 # in its value, and that ancestor is as reachable as any other.
                 # Anything else is a table or an external leaf.
                 ancestor = _ancestor_of(uri, recorded)

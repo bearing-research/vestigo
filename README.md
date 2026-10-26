@@ -32,6 +32,12 @@ implements, `ArtifactLifecycle.tla` and `BuildLease.tla`, with the
 configurations that found and then closed their bugs. `formal/README.md`
 says how to run them.
 
+Artifact and name URIs are ``{scheme}://artifact/{id}@v={n}`` and
+``{scheme}://name/{name}``; the scheme is ``vestigo`` unless the consumer calls
+``vestigo.uris.set_uri_scheme`` once at import (Strata uses ``strata``). The
+scheme is persisted in ``input_versions`` rows, so a store keeps the scheme it
+was written under.
+
 ## Install
 
 ```bash

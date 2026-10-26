@@ -23,5 +23,8 @@ history; its version matches the Strata release that pins it.
   node's payload.
 - **Blobs.** Local disk, S3, GCS and Azure backends behind one interface,
   with presigned URLs.
+- **URIs.** Artifact and name URIs carry a per-process scheme
+  (`vestigo.uris.set_uri_scheme`, default `vestigo`); a consumer sets its own
+  once at import.
 - **Formal models.** TLA+ models of the artifact and build lifecycles with
   the configurations that found and then closed their bugs.
