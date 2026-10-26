@@ -12,33 +12,24 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  lint:
-    name: Lint
+  pre-commit:
+    name: pre-commit
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           python-version: "3.12"
           version: "latest"
-      # The same ruff as .pre-commit-config.yaml and the dev group.
-      - run: uvx ruff@0.17.1 check --no-cache .
-      - run: uvx ruff@0.17.1 format --check .
-
-  type-check:
-    name: Type check
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
-        with:
-          python-version: "3.12"
-          version: "latest"
+      # ty resolves the extras' SDKs through the project venv, so the full sync.
       - run: uv sync --all-extras --locked
-      # The shipped code only; see [tool.ty] in pyproject.toml.
-      - run: uv run ty check
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit|${{ hashFiles('.pre-commit-config.yaml') }}
+      # Every check but the test suite lives in .pre-commit-config.yaml.
+      - run: uv run --frozen pre-commit run --all-files --show-diff-on-failure --color=always
 
   tests:
     name: Tests (Python ${{ matrix.python-version }})

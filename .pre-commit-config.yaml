@@ -1,3 +1,6 @@
+# Every check runs here; CI runs this file (ci.yml's pre-commit job) plus the
+# test matrix. `pre-commit run --all-files` is the commit-time set;
+# `pre-commit run --hook-stage manual --all-files` adds the test suite.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.1
@@ -5,3 +8,27 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+  - repo: local
+    hooks:
+      # `uv run --frozen` keeps the lock as committed; the next hook checks it.
+      - id: ty
+        name: ty
+        entry: uv run --frozen ty check
+        language: system
+        pass_filenames: false
+        files: ^(src/.*\.py|pyproject\.toml)$
+      - id: uv-lock
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock)$
+      # Minutes, and Docker for the Postgres and object-store suites, so it
+      # is never a git hook; CI's matrix runs the same suite per Python.
+      - id: pytest
+        name: pytest
+        entry: uv run --frozen pytest -p no:cacheprovider
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]
