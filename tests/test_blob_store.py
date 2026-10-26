@@ -1,6 +1,7 @@
 """Tests for blob storage backends."""
 
 import io
+import json
 import os
 import shutil
 import stat
@@ -592,6 +593,18 @@ class TestS3BlobStore:
 
         assert get_object_store_errors().snapshot()["head"] == before + 3
 
+    def test_a_missing_bucket_on_read_is_an_error(self, s3_store):
+        """A 404 is not always a missing object: a misnamed bucket must not read as empty."""
+        from botocore.exceptions import ClientError
+
+        def no_bucket(**kwargs):
+            raise _client_error(404, "NoSuchBucket", "GetObject")
+
+        s3_store._client.get_object = no_bucket
+
+        with pytest.raises(ClientError, match="NoSuchBucket"):
+            s3_store.read_blob("artifact-1", 1)
+
     def test_an_absent_object_is_not_an_error(self, s3_store):
         before = get_object_store_errors().snapshot()
 
@@ -646,15 +659,15 @@ class _FakeGcsBlob:
             raise self._absent()
         self.size = self._path.stat().st_size
 
-    def open(self, mode: str):
-        assert mode == "rb"
+    def open(self, mode: str, chunk_size: int | None = None):
+        assert mode == "rb" and chunk_size is not None
         return open(self._path, "rb")
 
-    def upload_from_file(self, src, retry=None) -> None:
+    def upload_from_file(self, src, size=None, retry=None) -> None:
         if self._error is not None:
             raise self._error
-        self._record.append("upload")
-        self._path.write_bytes(src.read())
+        self._record.append(f"upload:size={size}")
+        self._path.write_bytes(src.read(size))
 
     def exists(self) -> bool:
         if self._error is not None:
@@ -715,6 +728,28 @@ class TestGCSBlobStore:
 
         assert store._client._connection.API_BASE_URL == "https://localhost:4443"
 
+    def test_a_workload_identity_credentials_file_is_accepted(self, tmp_path: Path):
+        """The setting takes any file ``GOOGLE_APPLICATION_CREDENTIALS`` would, not only a key."""
+        from google.auth.identity_pool import Credentials
+
+        info = {
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": "https://sts.googleapis.com/v1/token",
+            "credential_source": {"file": str(tmp_path / "token")},
+        }
+        key_file = tmp_path / "wif.json"
+        key_file.write_text(json.dumps(info))
+
+        for given in (json.dumps(info), str(key_file)):
+            store = GCSBlobStore(bucket="bkt", credentials_json=given)
+            assert isinstance(store._client._credentials, Credentials)
+
+    def test_an_unknown_credentials_type_is_refused(self):
+        with pytest.raises(ValueError, match="Unsupported GCS credentials type 'oauth1'"):
+            GCSBlobStore(bucket="bkt", credentials_json='{"type": "oauth1"}')
+
     def test_without_credentials_or_anonymous_there_is_no_store(self, monkeypatch):
         """A store that could neither read nor write fails at construction, not at first use."""
         import google.auth
@@ -746,7 +781,7 @@ class TestGCSBlobStore:
         source.write_bytes(b"published")
         store.publish_blob_from_path("artifact-1", 1, source)
         assert store.read_blob("artifact-1", 1) == b"published"
-        assert store._client.record == ["upload", "upload"]
+        assert store._client.record == ["upload:size=8", "upload:size=9"]
 
         assert store.delete_blob("artifact-1", 1) is True
         assert store.blob_exists("artifact-1", 1) is False

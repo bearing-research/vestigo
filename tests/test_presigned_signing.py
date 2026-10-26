@@ -172,8 +172,8 @@ def test_a_key_file_path_signs_like_the_key_itself(rsa_key, tmp_path):
 # S3 role
 
 
-def test_s3_role_credentials_sign_with_their_session_token(monkeypatch, tmp_path):
-    with role_credentials(monkeypatch, tmp_path, "ASIAROLE", "role-secret", "role-token") as seen:
+def test_s3_role_credentials_sign_with_their_session_token(monkeypatch):
+    with role_credentials(monkeypatch, "ASIAROLE", "role-secret", "role-token") as seen:
         store = S3BlobStore(bucket="bkt", prefix="artifacts", region="us-east-1")
         url = store.presign_get("fig", 1, ttl_seconds=60)
         signed = store.presign_post("out", 1, max_bytes=16, ttl_seconds=60)
