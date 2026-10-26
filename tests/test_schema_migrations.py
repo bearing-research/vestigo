@@ -112,8 +112,8 @@ class TestExistingDatabase:
         assert artifact is not None
         assert artifact.state == "ready"
 
-    def test_a_store_a_newer_strata_migrated_is_refused(self, tmp_path):
-        """An older Strata on a migrated store would write rows the newer one does not expect."""
+    def test_a_store_a_newer_vestigo_migrated_is_refused(self, tmp_path):
+        """An older vestigo on a migrated store would write rows the newer one does not expect."""
         db_path = ArtifactStore(tmp_path / "s").db_path
         conn = sqlite3.connect(db_path)
         conn.execute(
@@ -123,7 +123,7 @@ class TestExistingDatabase:
         conn.commit()
         conn.close()
 
-        with pytest.raises(RuntimeError, match="newer than this Strata supports"):
+        with pytest.raises(RuntimeError, match="newer than this vestigo supports"):
             ArtifactStore(tmp_path / "s")
 
 
@@ -169,7 +169,7 @@ class TestAReadOnlyOpen:
         conn.commit()
         conn.close()
 
-        with pytest.raises(StoreSchemaMismatch, match="newer than this Strata supports"):
+        with pytest.raises(StoreSchemaMismatch, match="newer than this vestigo supports"):
             ArtifactStore(tmp_path / "s", read_only=True)
 
     def test_a_current_database_opens(self, tmp_path):

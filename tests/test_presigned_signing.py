@@ -59,7 +59,7 @@ def _verify_v4_url(rsa_key, url: str) -> None:
 
 @pytest.fixture
 def gcs_key_store(rsa_key, monkeypatch):
-    """A GCS store holding a service-account key, as STRATA_GCS_CREDENTIALS_JSON gives it."""
+    """A GCS store holding a service-account key, as a consumer's credentials setting gives it."""
     pem = rsa_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,

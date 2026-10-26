@@ -1,6 +1,6 @@
-"""Pure parsing for Strata artifact and name URIs (no store or server access).
+"""Pure parsing for artifact and name URIs (no store access).
 
-Store-backed resolution lives in ``server._resolve_artifact_uri``.
+Store-backed resolution belongs to the consumer.
 
 URI grammar:
     strata://artifact/{id}@v={version}   -> pinned version
