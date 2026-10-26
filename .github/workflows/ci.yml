@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: "3.12"
+          version: "latest"
+      - run: uvx ruff check --no-cache .
+      - run: uvx ruff format --check .
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          version: "latest"
+      - run: uv sync --all-extras --locked
+
+      # The ledger stands on its own: nothing of its first consumer may be
+      # installed, or a test could pass by reaching into it.
+      - name: Assert Strata is absent
+        run: |
+          uv run python - <<'PY'
+          import importlib.util
+          for mod in ("strata", "strata_client", "fastapi", "pyiceberg", "duckdb"):
+              assert importlib.util.find_spec(mod) is None, f"{mod} unexpectedly installed"
+          PY
+
+      # The Postgres suite starts a container through Docker on the runner.
+      - run: uv run pytest -v -p no:cacheprovider

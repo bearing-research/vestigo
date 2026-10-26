@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 
 import pytest
+
 from vestigo.build_store import BuildStore
 from vestigo.graph import Edge, NodeSpec
 from vestigo.operations import (

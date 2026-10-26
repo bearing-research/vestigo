@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
+
 from vestigo.store import (
     _BASELINE_SCHEMA_VERSION,
     _LATEST_SCHEMA_VERSION,

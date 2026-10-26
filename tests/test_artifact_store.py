@@ -4,6 +4,7 @@ import json
 
 import pytest
 from conftest import race_after_pending_read
+
 from vestigo.provenance import (
     TransformSpec,
     compute_provenance_hash,

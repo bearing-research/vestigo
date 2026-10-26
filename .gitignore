@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TLC writes its state space beside the models.
+formal/tla/states/

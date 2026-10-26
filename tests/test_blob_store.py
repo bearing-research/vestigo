@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from vestigo import blob_store as blob_store_module
 from vestigo.blob_store import (
     BlobStore,

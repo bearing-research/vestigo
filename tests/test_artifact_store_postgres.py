@@ -16,6 +16,7 @@ import pytest
 from conftest import race_after_pending_read
 from gate2 import Gate2
 from testcontainers.community.postgres import PostgresContainer
+
 from vestigo.provenance import TransformSpec
 from vestigo.sql_backend import SERVER_THREAD_LIMIT, PostgresDialect, advisory_lock_id
 from vestigo.store import ArtifactStore
