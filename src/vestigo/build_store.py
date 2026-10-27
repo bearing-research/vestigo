@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS artifact_builds (
     occurrence TEXT,  -- Which instance of a repeated site this is (a sweep's variant)
     attempt TEXT,  -- The attempt holding the lease; a release from any other is rejected
     computation_key TEXT,  -- The bound computation this build runs (a resume finds it by this)
+    -- 'runner' is offered to the consumer's runner; 'external' the consumer runs itself
+    dispatch TEXT NOT NULL DEFAULT 'runner',
     FOREIGN KEY (artifact_id, version) REFERENCES artifact_versions(id, version)
 );
 
@@ -122,6 +124,7 @@ class BuildState:
     occurrence: str | None = None
     attempt: str | None = None
     computation_key: str | None = None
+    dispatch: str = "runner"
 
     # Used by auth checks.
     @property
@@ -185,6 +188,7 @@ _BUILD_FIELDS = (
     "occurrence",
     "attempt",
     "computation_key",
+    "dispatch",
 )
 _BUILD_COLUMNS = ", ".join(_BUILD_FIELDS)
 
@@ -197,9 +201,12 @@ def _row_to_build_state(row: Any) -> BuildState:
     return BuildState(**values)
 
 
-# How create_build's json.dumps writes the mark a notebook puts on a build its own
-# worker runs (see the notebook executor's signed transport), as a ``LIKE`` literal:
-# a bare ``_`` matches any character, so ``xdispatch_mode`` would match too.
+# What a build's ``dispatch`` may be.
+DISPATCHES = ("runner", "external")
+
+# Before the ``dispatch`` column, a consumer marked a build its own worker runs with
+# this key in ``params``; the column is backfilled from it once, as a ``LIKE``
+# literal (a bare ``_`` matches any character).
 _EXTERNAL_DISPATCH_LIKE = json.dumps({"_dispatch_mode": "external"})[1:-1].replace("_", "\\_")
 
 
@@ -296,20 +303,27 @@ class BuildStore:
             conn.close()
 
     def _add_release_columns(self, conn: StoreConnection) -> None:
-        """The columns ADR 002 §7.2 added, on a database from before them (either dialect)."""
-        columns = (
-            ("artifact_builds", "occurrence"),
-            ("artifact_builds", "attempt"),
-            ("artifact_builds", "computation_key"),
-            ("build_attempts", "resumed_from"),
-        )
+        """The columns added since the first schema, on a database from before them."""
+        columns = {
+            ("artifact_builds", "occurrence"): "TEXT",
+            ("artifact_builds", "attempt"): "TEXT",
+            ("artifact_builds", "computation_key"): "TEXT",
+            ("build_attempts", "resumed_from"): "TEXT",
+            ("artifact_builds", "dispatch"): "TEXT NOT NULL DEFAULT 'runner'",
+        }
         if all(self._dialect.column_exists(conn, table, column) for table, column in columns):
             return
         self._dialect.begin_write(conn, "__build_schema__")
         # Re-checked under the lock: another node starting at once may have added them.
-        for table, column in columns:
+        for (table, column), declaration in columns.items():
             if not self._dialect.column_exists(conn, table, column):
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+                if column == "dispatch":
+                    conn.execute(
+                        "UPDATE artifact_builds SET dispatch = 'external' "
+                        "WHERE params LIKE ? ESCAPE '\\'",
+                        (f"%{_EXTERNAL_DISPATCH_LIKE}%",),
+                    )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_build_computation ON artifact_builds(computation_key)"
         )
@@ -329,6 +343,7 @@ class BuildStore:
         name: str | None = None,
         occurrence: str | None = None,
         computation_key: str | None = None,
+        dispatch: str = "runner",
     ) -> BuildState:
         """Create a build record in ``pending`` state.
 
@@ -337,7 +352,15 @@ class BuildStore:
         builds of one structure at one site stay distinct executions.
         ``computation_key`` is the bound computation the build runs; with the
         occurrence, it is what :meth:`find_open_build` looks a resume up by.
+        ``dispatch`` says who runs it: ``"runner"`` offers it through
+        :meth:`list_runnable_builds`; ``"external"`` is a build the consumer runs
+        itself, which nothing here picks up.
+
+        Raises:
+            ValueError: If ``dispatch`` is not one of :data:`DISPATCHES`.
         """
+        if dispatch not in DISPATCHES:
+            raise ValueError(f"dispatch must be one of {DISPATCHES}, not {dispatch!r}")
         conn = self._get_connection()
         try:
             created_at = self._clock()
@@ -349,8 +372,8 @@ class BuildStore:
                 INSERT INTO artifact_builds
                     (build_id, artifact_id, version, state, executor_ref,
                      executor_url, tenant_id, principal_id, created_at,
-                     input_uris, params, name, occurrence, computation_key)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     input_uris, params, name, occurrence, computation_key, dispatch)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     build_id,
@@ -366,6 +389,7 @@ class BuildStore:
                     name,
                     occurrence,
                     computation_key,
+                    dispatch,
                 ),
             )
             conn.commit()
@@ -1004,13 +1028,13 @@ class BuildStore:
                         PARTITION BY tenant_id ORDER BY created_at ASC
                     ) AS tenant_rank
                     FROM artifact_builds
-                    WHERE state = 'pending' AND (params IS NULL OR params NOT LIKE ? ESCAPE '\\')
+                    WHERE state = 'pending' AND dispatch = 'runner'
                 ) ranked
                 WHERE tenant_rank <= ?
                 ORDER BY created_at ASC
                 LIMIT ?
                 """,
-                (f"%{_EXTERNAL_DISPATCH_LIKE}%", per_tenant, limit),
+                (per_tenant, limit),
             )
 
             return [_row_to_build_state(row) for row in cursor.fetchall()]

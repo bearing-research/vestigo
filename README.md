@@ -56,7 +56,8 @@ The package exports nothing at its top level; a consumer imports each module.
   `GCSBlobStore`, `AzureBlobStore`.
 - `vestigo.build_store`: `BuildStore(db_path, dialect=None)`, the builds with
   their leases and attempts (`create_build`, `open_attempt`, `renew_lease`,
-  `find_open_build`, `complete_attempt_within`); `BuildState`, `AttemptState`.
+  `find_open_build`, `complete_attempt_within`, `list_runnable_builds` for the
+  builds whose `dispatch` is `runner`); `BuildState`, `AttemptState`, `DISPATCHES`.
 - `vestigo.releases`: `ReleaseStore(artifacts, builds)`, a build's checkpoint
   and final releases (`prepare`, `attach`, `accept`, `abandon`, `resume`,
   `latest_accepted`, `reference`, `authority`); `Release`, `ReleaseBundle` and

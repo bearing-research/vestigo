@@ -693,7 +693,7 @@ class TestRunnableBuilds:
         created = iter(range(1000, 2000))
         return BuildStore(tmp_path / "artifacts.sqlite", clock=lambda: float(next(created)))
 
-    def _queue(self, store, tenant, *, version=1, params=None) -> str:
+    def _queue(self, store, tenant, *, version=1, params=None, dispatch="runner") -> str:
         build_id = str(uuid.uuid4())
         store.create_build(
             build_id=build_id,
@@ -702,6 +702,7 @@ class TestRunnableBuilds:
             executor_ref="duckdb_sql@v1",
             tenant_id=tenant,
             params=params,
+            dispatch=dispatch,
         )
         return build_id
 
@@ -715,17 +716,32 @@ class TestRunnableBuilds:
 
     def test_a_build_a_notebook_dispatches_itself_is_never_picked_up(self, store):
         """Nor does it take its tenant's place, or one stuck row would block the tenant."""
-        self._queue(store, "t", params={"source": "x", "_dispatch_mode": "external"})
+        external = self._queue(store, "t", dispatch="external")
         runnable = [self._queue(store, "t", version=v) for v in (2, 3)]
 
         listed = store.list_runnable_builds(limit=50, per_tenant=2)
 
         assert [b.build_id for b in listed] == runnable
+        assert store.get_build(external).dispatch == "external"
 
-    def test_a_key_that_only_looks_like_the_mark_is_picked_up(self, store):
-        """``_`` in the mark is literal, not LIKE's any-one-character."""
-        lookalike = self._queue(store, "t", params={"xdispatch_mode": "external"})
+    def test_a_dispatch_the_ledger_does_not_know_is_refused(self, store):
+        with pytest.raises(ValueError, match="dispatch"):
+            self._queue(store, "t", dispatch="worker")
 
-        listed = store.list_runnable_builds(limit=50, per_tenant=2)
+    def test_the_params_mark_of_an_older_database_becomes_the_column(self, tmp_path, clock):
+        """A build marked ``_dispatch_mode: external`` before the column stays unlisted."""
+        seed_build_targets(tmp_path)
+        store = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+        marked = self._queue(store, "t", params={"source": "x", "_dispatch_mode": "external"})
+        # ``_`` in the mark is literal, not LIKE's any-one-character.
+        lookalike = self._queue(store, "t", version=2, params={"xdispatch_mode": "external"})
+        with closing(store._get_connection()) as conn:
+            conn.execute("ALTER TABLE artifact_builds DROP COLUMN dispatch")
+            conn.commit()
 
-        assert [b.build_id for b in listed] == [lookalike]
+        reopened = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+
+        assert reopened.get_build(marked).dispatch == "external"
+        assert [b.build_id for b in reopened.list_runnable_builds(limit=50, per_tenant=2)] == [
+            lookalike
+        ]

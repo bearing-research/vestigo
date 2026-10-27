@@ -1008,7 +1008,7 @@ class TestBuildStoreSharesTheBackend:
                 tmp_path / "x.sqlite", dialect=dialect, clock=lambda: float(next(created))
             )
 
-            def queue(build_id, tenant, params=None):
+            def queue(build_id, tenant, params=None, dispatch="runner"):
                 version = artifacts.create_artifact(build_id, f"prov-{build_id}", _spec())
                 builds.create_build(
                     build_id=build_id,
@@ -1017,9 +1017,11 @@ class TestBuildStoreSharesTheBackend:
                     executor_ref="x",
                     tenant_id=tenant,
                     params=params,
+                    dispatch=dispatch,
                 )
 
-            queue("external", "busy", params={"_dispatch_mode": "external"})
+            queue("external", "busy", dispatch="external")
+            queue("marked", "busy", params={"_dispatch_mode": "external"})
             # ``_`` in the mark is literal, not LIKE's any-one-character.
             queue("lookalike", "other", params={"xdispatch_mode": "external"})
             for i in range(4):
@@ -1028,7 +1030,21 @@ class TestBuildStoreSharesTheBackend:
 
             listed = builds.list_runnable_builds(limit=50, per_tenant=2)
 
-            assert [b.build_id for b in listed] == ["lookalike", "busy-0", "busy-1", "quiet-0"]
+            assert [b.build_id for b in listed] == ["marked", "lookalike", "busy-0", "quiet-0"]
+
+            # A database from before the column: the mark becomes the column, once.
+            conn = dialect.connect()
+            conn.execute("ALTER TABLE artifact_builds DROP COLUMN dispatch")
+            conn.commit()
+            conn.close()
+            reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+
+            assert reopened.get_build("marked").dispatch == "external"
+            assert reopened.get_build("lookalike").dispatch == "runner"
+            # The drop reset "external" too; only the mark survives, which is the point.
+            listed = reopened.list_runnable_builds(limit=50, per_tenant=2)
+            assert "marked" not in [b.build_id for b in listed]
+            assert "lookalike" in [b.build_id for b in listed]
         finally:
             dialect.close()
 
