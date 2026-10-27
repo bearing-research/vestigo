@@ -3,22 +3,18 @@
 All notable changes to vestigo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
-
-### Changed
-
-- The suite: Gate 2 is `tests/test_releases.py`, its tests grouped by what they prove
-  and run on both backends through a `backend_store` fixture; one Postgres container
-  serves the session instead of one per module; helpers live in the module that uses
-  them and `conftest.py` holds fixtures only; every import is at module level (#21).
-
-## 0.2.0 - 2026-10-26
+## 0.2.0 - 2026-10-27
 
 Schema changes, all applied on open: `artifact_builds` gains `dispatch`
 (backfilled from the old params mark), `build_attempts` gains `principal`,
 and `node_links` is a new table (migration 15), so the table inventory
-Strata's contract tests pin grows by one. Strata moves its pin to this
-version with its own dispatch, principal and link changes.
+Strata's contract tests pin grows by one. Migration 16 rebuilds
+`idx_node_links_target` and migration 17 keys `retention_roots` by tenant.
+Strata moves its pin to this version with its own dispatch, principal, link,
+import and tenant changes.
+
+The release also carries every fix from an audit of the whole package at this
+version (#23 to #26).
 
 ### Added
 
@@ -37,6 +33,8 @@ version with its own dispatch, principal and link changes.
   of each building build, so a latest-k policy is the same read with a deeper
   bound; `accept` states that an empty `final` release ends a build without a
   product (#15, friction log 5 and 2).
+- `ArtifactImportInProgress`, an `ArtifactImportConflict` raised when an import
+  meets a version still building at its `id@v` (#26).
 
 ### Changed
 
@@ -53,6 +51,35 @@ version with its own dispatch, principal and link changes.
 - `versions_lacking_definition` documents that it lists every tenant's
   versions, the read of a store-wide upgrade, with each version's tenant for
   the `set_definitions` call that follows; a test pins it (#9).
+- `list_expired_leases` and `reclaim_expired_build` take only
+  `dispatch = 'runner'` builds unless passed `dispatch=` (`None` for any) (#23).
+- A build row's deletion takes its console chunks; its attempts and releases
+  outlive it, and `collectable_checkpoints` still reports its checkpoints
+  (#23, #26).
+- Object-store writers stage under `BlobStore.staging_dir` (a constructor and
+  `from_settings` argument), which `remove_stale_temp_files` sweeps; a store
+  over a remote blob store sets it to `artifact_dir/staging` when unset
+  (#24, #26).
+- The object-store error metric drops the never-recorded `list` operation (#24).
+- `idx_node_links_target` covers `(scope, target_node_id, relation)`, so
+  `linked_from` without a relation uses it (#25).
+- `GraphStore(connect)` no longer takes a dialect (#25).
+- `retention_roots` is keyed by tenant: two tenants holding one shared version
+  under one holder hold two roots, each its own to list and release (#26).
+- `fail_artifact`, `retire_ready` and `record_use` take `tenant` and raise
+  `ArtifactNotFoundError` for a missing version or another tenant's (#26).
+- `reset_artifact_store` closes the store, and `get_artifact_store` raises
+  `ValueError` for a different `artifact_dir` (#26).
+- `create_artifact` and `import_artifact` refuse an empty id or one containing
+  `@` (#26).
+- `set_definitions` returns the number of versions it recorded (#26).
+- The suite: Gate 2 is `tests/test_releases.py`, its tests grouped by what they
+  prove and run on both backends through a `backend_store` fixture; one
+  Postgres container serves the session instead of one per module; helpers live
+  in the module that uses them and `conftest.py` holds fixtures only; every
+  import is at module level (#21). A test pins the table inventory against a
+  fresh database, and the release workflow runs the suite on the tagged commit
+  before it builds (#22).
 
 ### Fixed
 
@@ -64,6 +91,90 @@ version with its own dispatch, principal and link changes.
   Azurite and fake-gcs-server (where a missing bucket is the one documented
   exception, the GCS API answering one `NotFound` for both).
 - The PostgreSQL row shim accepts a slice, as `sqlite3.Row` does (#9).
+
+From the audit at this version:
+
+Builds and releases (#23):
+
+- A runner can open an attempt on the build it claimed or reclaimed: the
+  claim's own `lease_owner` gets through its live lease.
+- A new attempt replaces the lease owner, NULL when none is given, so a runner
+  that lost the build can no longer renew, fail or complete it.
+- Opening a new attempt abandons the other attempts' unsettled releases, so a
+  dead attempt's release no longer blocks every later checkpoint.
+- `create_build` returns the dispatch it stored.
+- `AdvanceReference` to a release that is not an accepted release of the
+  tenant fails with `OperationFailed` instead of moving the reference and
+  dropping the old head's roots.
+- A re-opened attempt keeps the later lease deadline and records a new
+  `resumed_from`.
+- `attach` refuses a settled release and runs under the build's key.
+- `collectable_checkpoints` keeps the checkpoint the current attempt resumed
+  from, and reports the checkpoints of a build whose row is gone.
+- A rejection after a rollback no longer overwrites a retry's acceptance.
+- `accept` sizes outputs before taking the build's key, which on SQLite is the
+  database's write lock.
+- `formal/README.md` lists only the invariant each unpatched BuildLease
+  configuration violates, with counts from a fresh TLC run.
+
+SQL and blob backends (#24):
+
+- A nested Postgres connection is refused while the outer transaction holds an
+  advisory lock (`begin_write`), a row lock or an uncommitted write, including
+  a write in a data-modifying CTE, so an inner commit or rollback can no longer
+  release what the outer holds.
+- SQLite connections can be closed or used from another thread, as Postgres
+  ones can; a closed Postgres connection raises `RuntimeError` on use, and a
+  cross-thread close racing the owner's no longer leaks a pooled connection.
+- Postgres rows hash, and compare only to rows, like `sqlite3.Row`.
+- Postgres `column_exists` and `schema_exists` look only at the current schema.
+- `create_tables` runs its DDL once per database on SQLite too.
+- `LocalBlobStore.open_blob_reader` returns None when the blob is deleted
+  between its check and its open.
+- GCS presigning returns None for workload-identity credentials without
+  impersonation instead of raising `AttributeError`.
+- S3 and GCS POST policies accept an empty upload.
+- A read that fails mid-stream counts as a failed `get` in the object-store
+  error metric.
+
+Graph and provenance (#25):
+
+- `parse_transform_spec` reads a stored spec it cannot rebuild (NaN or
+  Infinity in params) as unrecorded instead of raising.
+- Graph walks on SQLite probe the index once per reached node instead of
+  scanning the scope's edges at every step.
+- `GraphStore.inputs` reads back a stored role that is not an identifier.
+- `put_batch`, `topological_order` and the walks bind at most 500 ids per
+  query, so wide graphs no longer hit SQLite's variable limit.
+- `artifact_uri` refuses an empty id or one containing `@`, which
+  `parse_artifact_uri` would not read back.
+- `NodeSpec` refuses a non-`bytes` payload with `ValueError`, and `Traversal`
+  refuses `max_nodes` below 0.
+
+Artifact store (#26):
+
+- A duplicate's finalize locks its canonical before pointing at it, and
+  `delete_artifact` re-reads pointers under its row lock, so no superseded
+  version is left without bytes.
+- A hold or use landing on a lower version mid-sweep keeps the id's top
+  version, so a version number is never reused.
+- On Postgres a pin or publication landing on a version a sweep has claimed
+  waits, or is refused, instead of being deleted with it.
+- `import_artifact` refuses a ready or superseded record without bytes unless
+  the version is already here with its bytes; it fills in a failed row at the
+  same `id@v` (`written=True`) and raises `ArtifactImportInProgress` for a
+  building one; it checks `state` and that `input_versions` is a JSON object.
+- `promote_version` no longer copies `release_id`.
+- `set_alias`, `set_tag`, `request_alias_change` and `set_name` lock their
+  target, so a concurrent delete cannot leave a dangling pointer; `set_name`
+  raises `ArtifactNotFoundError` instead of the driver's foreign-key error.
+- A finalize retry on a version a refresh superseded returns it, and two racing
+  builds of one id and computation leave the newer one ready.
+- On Postgres a use note skips a locked row instead of waiting.
+- `cleanup_failed` spares failed versions held by a root or a publication.
+- `verify_artifacts` streams the digest of blobs no validator reads, and a spec
+  that does not parse no longer aborts it.
+- A read-only open creates no directory.
 
 ### Verified
 
