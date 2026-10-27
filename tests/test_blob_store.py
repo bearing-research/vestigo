@@ -21,6 +21,7 @@ from moto import mock_aws
 from vestigo import blob_store as blob_store_module
 from vestigo.blob_store import (
     AzureBlobStore,
+    BlobSettings,
     BlobStore,
     GCSBlobStore,
     LocalBlobStore,
@@ -130,6 +131,21 @@ class TestLocalBlobStore:
 
         assert store.delete_blob("artifact-1", 1) is False
         assert not store.blob_exists("artifact-1", 1)
+
+    def test_a_reader_that_loses_a_delete_race_reports_absent(self, tmp_path: Path, monkeypatch):
+        """A sweep between the check and the open: absent, as on the object stores."""
+        store = LocalBlobStore(tmp_path / "blobs")
+        store.write_blob("artifact-1", 1, b"x")
+        path = store._blob_path("artifact-1", 1)
+
+        def open_after_the_sweep(file, *args, **kwargs):
+            if Path(file) == path:
+                path.unlink(missing_ok=True)
+            return open(file, *args, **kwargs)
+
+        monkeypatch.setattr(blob_store_module, "open", open_after_the_sweep, raising=False)
+
+        assert store.open_blob_reader("artifact-1", 1) is None
 
     @pytest.mark.skipif(sys.platform == "win32", reason="directories cannot be fsynced there")
     def test_the_directory_is_fsynced_once_the_blob_is_in_place(self, tmp_path: Path, monkeypatch):
@@ -378,6 +394,53 @@ class TestStagedLocalWriter:
         assert observed_state["reread_len"] == len(b"payload-bytes")
 
 
+class TestStagingDir:
+    """Object-store writers stage under ``staging_dir``, which the temp-file sweep covers."""
+
+    def test_a_streamed_write_stages_under_the_staging_dir(self, s3_store, tmp_path, monkeypatch):
+        staging = tmp_path / "staging"
+        s3_store.staging_dir = staging
+        staged_in: list[Path] = []
+        monkeypatch.setattr(
+            s3_store, "_upload_from_path", lambda key, staged: staged_in.append(staged.parent)
+        )
+
+        s3_store.write_blob("artifact-1", 1, b"bytes")
+
+        assert staged_in == [staging]
+        assert list(staging.iterdir()) == []
+        if sys.platform != "win32":
+            assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+
+    def test_the_sweep_removes_a_killed_writes_staged_file_only(self, tmp_path: Path):
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        stale = staging / "vestigo_s3_blob_dead.tmp"
+        live = staging / "vestigo_s3_blob_live.tmp"
+        stale.write_bytes(b"x")
+        live.write_bytes(b"x")
+        os.utime(stale, (1, 1))
+        store = S3BlobStore(bucket="b", anonymous=True, staging_dir=staging)
+
+        assert store.remove_stale_temp_files(3600) == 1
+        assert sorted(p.name for p in staging.iterdir()) == [live.name]
+        assert S3BlobStore(bucket="b", anonymous=True).remove_stale_temp_files(0) == 0
+
+    def test_every_object_store_takes_it_from_settings(self, tmp_path: Path):
+        staging = tmp_path / "staging"
+        settings = BlobSettings(
+            gcs_anonymous=True, azure_account_name="acct", azure_account_key="a2V5"
+        )
+
+        stores = [
+            S3BlobStore.from_settings(settings, "b", staging_dir=staging),
+            GCSBlobStore.from_settings(settings, "b", staging_dir=staging),
+            AzureBlobStore.from_settings(settings, "c", staging_dir=staging),
+        ]
+
+        assert [store.staging_dir for store in stores] == [staging] * 3
+
+
 class TestPublishBlobFromPath:
     def test_round_trip_via_local_backend(self, tmp_path: Path):
         """The default implementation publishes a staged file atomically."""
@@ -575,6 +638,13 @@ class TestS3BlobStore:
             s3_store.open_blob_reader("artifact-1", 1)
 
         assert get_object_store_errors().snapshot()["get"] == before + 2
+
+    def test_a_read_that_fails_mid_stream_counts(self, s3_store, monkeypatch):
+        body = _BodyThatDies(b"first")
+        monkeypatch.setattr(s3_store._client, "get_object", lambda **kwargs: {"Body": body})
+
+        _assert_a_mid_stream_failure_counts(s3_store)
+        assert body.closed
 
     def test_exists_size_and_delete_propagate_a_backend_error(self, s3_store):
         """``delete_blob`` matters most: the caller removes the metadata row regardless, so a
@@ -801,6 +871,15 @@ class TestGCSBlobStore:
 
         assert get_object_store_errors().snapshot()["get"] == before + 2
 
+    def test_a_read_that_fails_mid_stream_counts(self, tmp_path: Path, monkeypatch):
+        store = self._store(tmp_path)
+        store.write_blob("artifact-1", 1, b"first")
+        body = _BodyThatDies(b"first")
+        monkeypatch.setattr(_FakeGcsBlob, "open", lambda self, mode, chunk_size=None: body)
+
+        _assert_a_mid_stream_failure_counts(store)
+        assert body.closed
+
     def test_exists_size_and_delete_propagate_a_backend_error(self, tmp_path: Path):
         store = self._store(tmp_path, ServiceUnavailable("backend"))
 
@@ -935,6 +1014,55 @@ class TestAzureBackendOverAFakeClient:
 
         assert store._client.record == []
         assert store.blob_exists("artifact-1", 1) is False
+
+    def test_a_read_that_fails_mid_stream_counts(self, tmp_path: Path, monkeypatch):
+        def chunks():
+            yield b"first"
+            raise ConnectionResetError("connection reset mid-stream")
+
+        store = self._store(tmp_path)
+        store.write_blob("artifact-1", 1, b"first")
+        monkeypatch.setattr(
+            _FakeBlobClient, "download_blob", lambda self: SimpleNamespace(chunks=chunks)
+        )
+
+        _assert_a_mid_stream_failure_counts(store)
+
+
+class _BodyThatDies:
+    """An SDK response body whose connection drops after ``good``."""
+
+    def __init__(self, good: bytes) -> None:
+        self._good = good
+        self.closed = False
+
+    def read(self, size: int = -1) -> bytes:
+        if self._good:
+            good, self._good = self._good, b""
+            return good
+        raise ConnectionResetError("connection reset mid-stream")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _assert_a_mid_stream_failure_counts(store: BlobStore) -> None:
+    """The bytes flow after the call that opened the read; their failure counts as a ``get``."""
+    before = get_object_store_errors().snapshot()["get"]
+    reader = store.open_blob_reader("artifact-1", 1)
+    assert reader is not None
+
+    with reader as f:
+        assert f.read(5) == b"first"
+        with pytest.raises(ConnectionResetError, match="mid-stream"):
+            f.read(5)
+
+    assert get_object_store_errors().snapshot()["get"] == before + 1
+
+
+def test_the_error_metric_names_only_operations_a_store_makes():
+    # No store lists, so a ``list`` series could never move.
+    assert set(get_object_store_errors().snapshot()) == {"put", "get", "head", "delete"}
 
 
 class TestAzureDownloadReader:

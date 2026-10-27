@@ -2,7 +2,8 @@
 
 A GCS V4 signature is verified against the key's public half, and the IAM signBlob path is
 faked at the HTTP boundary; the S3 and Azure URLs are checked for the credential, token and
-permissions they carry. No test here or in the suite submits a URL to a store or emulator.
+permissions they carry. Nothing here submits a URL: test_blob_store_emulators.py submits S3
+URLs and POST policies to MinIO and Azure SAS URLs to Azurite, which check the signatures.
 """
 
 from __future__ import annotations
@@ -196,6 +197,26 @@ def test_gcs_credentials_with_no_service_account_do_not_presign(monkeypatch):
 
     assert store.presign_get("fig", 1, 60) is None
     assert store.presign_post("fig", 1, 16, 60) is None
+
+
+def test_workload_identity_without_impersonation_does_not_presign(monkeypatch):
+    """Its credentials have ``service_account_email``, set to None: no account IAM signs as."""
+    federated = _keyless_credentials(service_account_email=None)
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (federated, "proj"))
+    store = GCSBlobStore(bucket="bkt")
+
+    assert store.presign_get("fig", 1, 60) is None
+    assert store.presign_post("fig", 1, 16, 60) is None
+
+
+def test_post_policies_admit_an_empty_upload(gcs_key_store):
+    # "At most max_bytes", as Azure's PUT takes an empty body.
+    s3 = S3BlobStore(bucket="b", region="us-east-1", access_key="k", secret_key="s")
+    for store in (s3, gcs_key_store):
+        signed = store.presign_post("out", 1, max_bytes=16, ttl_seconds=60)
+        assert signed is not None
+        policy = json.loads(base64.b64decode(signed[1]["policy"]))
+        assert ["content-length-range", 0, 16] in policy["conditions"]
 
 
 def test_an_anonymous_gcs_store_does_not_presign():

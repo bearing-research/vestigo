@@ -38,7 +38,7 @@ the blob-store streams without extra copying.
 """
 
 
-OBJECT_STORE_OPERATIONS = ("put", "get", "head", "list", "delete")
+OBJECT_STORE_OPERATIONS = ("put", "get", "head", "delete")
 
 GCS_READ_CHUNK_BYTES = 8 * 1024 * 1024
 """What a GCS reader fetches per request; the SDK's default of 40 MiB is what a reader
@@ -70,7 +70,10 @@ class BlobSettings:
 
 
 class ObjectStoreErrors:
-    """Failed object-store calls by operation, for the consumer's error metric."""
+    """Failed object-store calls by operation, for the consumer's error metric.
+
+    A read that fails mid-stream counts under ``get`` as the call that opened it does.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -95,6 +98,11 @@ def get_object_store_errors() -> ObjectStoreErrors:
 
 class BlobStore(ABC):
     """Abstract base for blob storage backends, keyed by ``(artifact_id, version)``."""
+
+    staging_dir: Path | None = None
+    """Where an object-store writer stages a blob whole before uploading it, and what
+    ``remove_stale_temp_files`` sweeps; ``None`` is the system temp dir, which nothing
+    sweeps. The local store stages beside its blobs instead."""
 
     @abstractmethod
     def open_blob_reader(
@@ -159,10 +167,11 @@ class BlobStore(ABC):
     def remove_stale_temp_files(self, idle_seconds: float) -> int:
         """Remove partial writes a killed process left, untouched for ``idle_seconds``.
 
-        Returns how many went. Only the local store stages writes beside its blobs; the
-        others stage in the system temp dir.
+        Returns how many went: those in ``staging_dir``, none when it is unset.
         """
-        return 0
+        if self.staging_dir is None:
+            return 0
+        return _remove_stale_temp_files(self.staging_dir, idle_seconds)
 
     def presign_get(self, artifact_id: str, version: int, ttl_seconds: int) -> str | None:
         """Return a URL that reads this blob straight from the object store, or ``None``.
@@ -175,7 +184,7 @@ class BlobStore(ABC):
     def presign_post(
         self, artifact_id: str, version: int, max_bytes: int, ttl_seconds: int
     ) -> tuple[str, dict[str, str]] | None:
-        """Return ``(url, fields)`` for a form upload of at most ``max_bytes``, or ``None``.
+        """Return ``(url, fields)`` for a form upload of 0 to ``max_bytes`` bytes, or ``None``.
 
         POST the fields plus the body as the ``file`` part. A POST policy rather than a
         presigned PUT because it lets the object store refuse an oversized upload.
@@ -210,14 +219,20 @@ class BlobStore(ABC):
         commit: Callable[[Path], None],
         *,
         prefix: str = "vestigo_blob_",
+        staging_dir: Path | None = None,
     ) -> Generator[BinaryIO]:
         """Stage writes through a local tempfile and pass it to ``commit(path)`` on clean exit.
 
+        The tempfile is in ``staging_dir`` (created owner-only), else the system temp dir.
         On exception the tempfile is removed and ``commit`` never runs, so a partial
         write is never observable. The handle is closed before ``commit`` so backends
         can reopen the file on Windows.
         """
-        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp")
+        if staging_dir is not None:
+            from vestigo.file_modes import private_dir
+
+            private_dir(staging_dir)
+        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=staging_dir)
         tmp_path = Path(tmp_name)
         handle = os.fdopen(fd, "w+b")
         try:
@@ -264,9 +279,10 @@ class LocalBlobStore(BlobStore):
     ) -> AbstractContextManager[BinaryIO] | None:
         """Open a streaming reader for a local blob."""
         path = self._blob_path(artifact_id, version)
-        if not path.exists():
-            return None
-        return open(path, "rb")
+        try:
+            return open(path, "rb")
+        except FileNotFoundError:
+            return None  # absent, or a concurrent delete got there first
 
     def open_blob_writer(self, artifact_id: str, version: int) -> AbstractContextManager[BinaryIO]:
         """Open a streaming writer for a local blob with atomic commit."""
@@ -324,17 +340,23 @@ class LocalBlobStore(BlobStore):
 
     def remove_stale_temp_files(self, idle_seconds: float) -> int:
         """Remove the ``*.tmp`` files of writes that died, untouched for ``idle_seconds``."""
-        cutoff = time.time() - idle_seconds
-        removed = 0
-        for path in self.blobs_dir.glob("*.tmp"):
-            try:
-                # A live write keeps touching its file, so an old mtime means nobody is writing.
-                if path.stat().st_mtime < cutoff:
-                    path.unlink()
-                    removed += 1
-            except FileNotFoundError:
-                continue  # its writer finished or gave up meanwhile
-        return removed
+        return _remove_stale_temp_files(self.blobs_dir, idle_seconds)
+
+
+def _remove_stale_temp_files(directory: Path, idle_seconds: float) -> int:
+    """Remove the ``*.tmp`` files in ``directory`` untouched for ``idle_seconds``."""
+    cutoff = time.time() - idle_seconds
+    removed = 0
+    for path in directory.glob("*.tmp"):
+        try:
+            # A live write keeps touching its file, so an old mtime means nobody is writing.
+            # An upload still reading one keeps its open handle (POSIX) and ignores the unlink.
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue  # its writer finished or gave up meanwhile
+    return removed
 
 
 def _fsync_dir(path: Path) -> None:
@@ -372,6 +394,37 @@ def _object_store_call(
         raise
 
 
+class _CountedReader(io.RawIOBase):
+    """Raw stream over an SDK's body whose failed reads count as failed ``get`` calls.
+
+    The bytes flow after the call that opened the read; wrapped in ``io.BufferedReader``
+    it behaves as a real binary file.
+    """
+
+    def __init__(self, body: Any) -> None:
+        self._body = body
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Buffer, /) -> int:
+        view = memoryview(buffer).cast("B")
+        with _object_store_call("get"):
+            data = self._body.read(len(view))
+        n = len(data)
+        view[:n] = data
+        return n
+
+    def readall(self) -> bytes:
+        with _object_store_call("get"):
+            return self._body.read()
+
+    def close(self) -> None:
+        if not self.closed:
+            self._body.close()
+        super().close()
+
+
 def _s3_absent(exc: BaseException) -> bool:
     """Whether a botocore error says the object is not there.
 
@@ -398,12 +451,13 @@ class S3BlobStore(BlobStore):
         access_key: str | None = None,
         secret_key: str | None = None,
         anonymous: bool = False,
+        staging_dir: Path | None = None,
     ):
         """Initialize the S3 store.
 
         Without ``access_key``/``secret_key`` credentials come from boto3's chain (the
         environment, a profile, a role); ``endpoint_url`` targets an S3-compatible
-        service, addressed path-style.
+        service, addressed path-style. ``staging_dir`` is ``BlobStore.staging_dir``.
 
         Raises:
             ValueError: only one of ``access_key`` and ``secret_key`` was given, which
@@ -422,6 +476,7 @@ class S3BlobStore(BlobStore):
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._anonymous = anonymous
+        self.staging_dir = staging_dir
 
         session: dict[str, Any] = {}
         if region:
@@ -463,7 +518,7 @@ class S3BlobStore(BlobStore):
         signed = self._client.generate_presigned_post(
             self.bucket,
             self._object_key(artifact_id, version),
-            Conditions=[["content-length-range", 1, int(max_bytes)]],
+            Conditions=[["content-length-range", 0, int(max_bytes)]],
             ExpiresIn=int(ttl_seconds),
         )
         return signed["url"], signed["fields"]
@@ -478,7 +533,7 @@ class S3BlobStore(BlobStore):
                 response = self._client.get_object(Bucket=self.bucket, Key=key)
         except FileNotFoundError:
             return None
-        return response["Body"]  # a file-like that closes itself on context exit
+        return io.BufferedReader(_CountedReader(response["Body"]))
 
     def _upload_from_path(self, key: str, source_path: Path) -> None:
         """Upload a local file to ``key``, in parts past the SDK's threshold.
@@ -495,6 +550,7 @@ class S3BlobStore(BlobStore):
         return self._staged_local_writer(
             lambda staged: self._upload_from_path(key, staged),
             prefix="vestigo_s3_blob_",
+            staging_dir=self.staging_dir,
         )
 
     def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
@@ -529,7 +585,11 @@ class S3BlobStore(BlobStore):
 
     @classmethod
     def from_settings(
-        cls, settings: BlobSettings, bucket: str, prefix: str = "artifacts"
+        cls,
+        settings: BlobSettings,
+        bucket: str,
+        prefix: str = "artifacts",
+        staging_dir: Path | None = None,
     ) -> S3BlobStore:
         """An S3BlobStore on the ``s3_*`` fields of *settings*."""
         return cls(
@@ -540,6 +600,7 @@ class S3BlobStore(BlobStore):
             access_key=settings.s3_access_key,
             secret_key=settings.s3_secret_key,
             anonymous=settings.s3_anonymous,
+            staging_dir=staging_dir,
         )
 
 
@@ -645,12 +706,13 @@ class GCSBlobStore(BlobStore):
         credentials_json: str | None = None,
         anonymous: bool = False,
         endpoint_override: str | None = None,
+        staging_dir: Path | None = None,
     ):
         """Initialize the GCS store.
 
         ``credentials_json`` is a service-account key: a file path, or the key's JSON
         itself, which is what a container's environment holds. ``endpoint_override``
-        is an emulator's URL.
+        is an emulator's URL. ``staging_dir`` is ``BlobStore.staging_dir``.
 
         Raises:
             google.auth.exceptions.DefaultCredentialsError: see ``_gcs_credentials``.
@@ -665,6 +727,7 @@ class GCSBlobStore(BlobStore):
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._anonymous = anonymous
+        self.staging_dir = staging_dir
 
         options = {"api_endpoint": _endpoint_url(endpoint_override)} if endpoint_override else None
         self._client = storage.Client(
@@ -691,16 +754,15 @@ class GCSBlobStore(BlobStore):
             return {}
         # Workload identity and the GCE metadata server hold no key; IAM signs as the
         # attached service account (it needs roles/iam.serviceAccountTokenCreator on itself).
-        if not hasattr(credentials, "service_account_email"):
+        # Workload identity without impersonation has the attribute, set to None: no account.
+        email = getattr(credentials, "service_account_email", None)
+        if not email:
             return None
         if not credentials.valid:
             from google.auth.transport.requests import Request
 
             credentials.refresh(Request())
-        return {
-            "service_account_email": credentials.service_account_email,
-            "access_token": credentials.token,
-        }
+        return {"service_account_email": email, "access_token": credentials.token}
 
     def presign_get(self, artifact_id: str, version: int, ttl_seconds: int) -> str | None:
         from datetime import timedelta
@@ -724,7 +786,7 @@ class GCSBlobStore(BlobStore):
             self.bucket,
             self._object_name(artifact_id, version),
             expiration=timedelta(seconds=int(ttl_seconds)),
-            conditions=[["content-length-range", 1, int(max_bytes)]],
+            conditions=[["content-length-range", 0, int(max_bytes)]],
             **signing,
         )
         return policy["url"], policy["fields"]
@@ -743,7 +805,7 @@ class GCSBlobStore(BlobStore):
                 blob.reload()
         except FileNotFoundError:
             return None
-        return blob.open("rb", chunk_size=GCS_READ_CHUNK_BYTES)
+        return io.BufferedReader(_CountedReader(blob.open("rb", chunk_size=GCS_READ_CHUNK_BYTES)))
 
     def _upload_from_path(self, name: str, source_path: Path) -> None:
         """Upload a local file to ``name``: one request to 8 MiB, resumable past it.
@@ -764,6 +826,7 @@ class GCSBlobStore(BlobStore):
         return self._staged_local_writer(
             lambda staged: self._upload_from_path(name, staged),
             prefix="vestigo_gcs_blob_",
+            staging_dir=self.staging_dir,
         )
 
     def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
@@ -796,7 +859,11 @@ class GCSBlobStore(BlobStore):
 
     @classmethod
     def from_settings(
-        cls, settings: BlobSettings, bucket: str, prefix: str = "artifacts"
+        cls,
+        settings: BlobSettings,
+        bucket: str,
+        prefix: str = "artifacts",
+        staging_dir: Path | None = None,
     ) -> GCSBlobStore:
         """A GCSBlobStore on the ``gcs_*`` fields of *settings*."""
         return cls(
@@ -805,6 +872,7 @@ class GCSBlobStore(BlobStore):
             credentials_json=settings.gcs_credentials_json,
             anonymous=settings.gcs_anonymous,
             endpoint_override=settings.gcs_endpoint_override,
+            staging_dir=staging_dir,
         )
 
 
@@ -820,7 +888,8 @@ def _azure_absent(exc: BaseException) -> bool:
 class _AzureDownloadReader(io.RawIOBase):
     """Raw stream over an Azure ``StorageStreamDownloader``'s chunks.
 
-    Wrapped in ``io.BufferedReader`` it behaves as a real binary file.
+    Wrapped in ``io.BufferedReader`` it behaves as a real binary file. A failed chunk
+    fetch counts as a failed ``get`` call.
     """
 
     def __init__(self, downloader: StorageStreamDownloader) -> None:
@@ -834,7 +903,8 @@ class _AzureDownloadReader(io.RawIOBase):
 
     def readinto(self, buffer: Buffer, /) -> int:
         while not self._buffer:
-            chunk = next(self._chunks, None)
+            with _object_store_call("get"):
+                chunk = next(self._chunks, None)
             if chunk is None:
                 return 0
             self._buffer = memoryview(chunk)
@@ -847,7 +917,8 @@ class _AzureDownloadReader(io.RawIOBase):
     def readall(self) -> bytes:
         # ``BufferedReader.read()`` lands here; the inherited loop would copy
         # through a 128 KiB buffer, so join the chunks instead.
-        rest = [self._buffer, *self._chunks]
+        with _object_store_call("get"):
+            rest = [self._buffer, *self._chunks]
         self._buffer = memoryview(b"")
         return b"".join(rest)
 
@@ -870,8 +941,12 @@ class AzureBlobStore(BlobStore):
         sas_token: str | None = None,
         use_default_credential: bool = False,
         endpoint_url: str | None = None,
+        staging_dir: Path | None = None,
     ):
-        """Initialize the Azure store; ``endpoint_url`` targets the Azurite emulator."""
+        """Initialize the Azure store; ``endpoint_url`` targets the Azurite emulator.
+
+        ``staging_dir`` is ``BlobStore.staging_dir``.
+        """
         try:
             from azure.storage.blob import ContainerClient
         except ImportError as e:
@@ -883,6 +958,7 @@ class AzureBlobStore(BlobStore):
         self.account_name = account_name
         self.container_name = container_name
         self.prefix = prefix.strip("/")
+        self.staging_dir = staging_dir
         # ``endpoint_url`` is the blob host with the account as the first path segment
         # (Azurite's form); the lake path derives its connection string the same way.
         if endpoint_url and account_name:
@@ -1032,6 +1108,7 @@ class AzureBlobStore(BlobStore):
         return self._staged_local_writer(
             lambda staged: self._upload_from_path(key, staged),
             prefix="vestigo_azure_blob_",
+            staging_dir=self.staging_dir,
         )
 
     def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
@@ -1079,7 +1156,11 @@ class AzureBlobStore(BlobStore):
 
     @classmethod
     def from_settings(
-        cls, settings: BlobSettings, container_name: str, prefix: str = "artifacts"
+        cls,
+        settings: BlobSettings,
+        container_name: str,
+        prefix: str = "artifacts",
+        staging_dir: Path | None = None,
     ) -> AzureBlobStore:
         """An AzureBlobStore on the ``azure_*`` fields of *settings*."""
         return cls(
@@ -1091,4 +1172,5 @@ class AzureBlobStore(BlobStore):
             sas_token=settings.azure_sas_token,
             use_default_credential=settings.azure_use_default_credential,
             endpoint_url=settings.azure_endpoint_url,
+            staging_dir=staging_dir,
         )

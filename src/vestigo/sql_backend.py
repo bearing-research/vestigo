@@ -20,7 +20,7 @@ import logging
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -64,38 +64,39 @@ def translate_placeholders(sql: str) -> str:
     identifiers and ``--``/``/* */`` comments, where a ``?`` is data. Every ``%`` is
     doubled, because the driver scans the whole string for substitutions.
     """
-    out: list[str] = []
-    i = 0
-    n = len(sql)
+    return "".join(
+        text.replace("%", "%%").replace("?", "%s") if is_code else text.replace("%", "%%")
+        for text, is_code in _regions(sql)
+    )
 
+
+def _regions(sql: str) -> Iterator[tuple[str, bool]]:
+    """Split ``sql`` into ``(text, is_code)`` runs.
+
+    A run that is not code is a single-quoted literal, a double-quoted identifier or a
+    ``--``/``/* */`` comment.
+    """
+    i = start = 0
+    n = len(sql)
     while i < n:
         ch = sql[i]
-
         if ch == _SINGLE_QUOTE or ch == _DOUBLE_QUOTE:
             end = _scan_quoted(sql, i, ch)
-            out.append(sql[i:end].replace("%", "%%"))
-            i = end
         elif sql.startswith("--", i):
             end = sql.find("\n", i)
             end = n if end == -1 else end
-            out.append(sql[i:end].replace("%", "%%"))
-            i = end
         elif sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
             end = n if end == -1 else end + 2
-            out.append(sql[i:end].replace("%", "%%"))
-            i = end
-        elif ch == "?":
-            out.append("%s")
-            i += 1
-        elif ch == "%":
-            out.append("%%")
-            i += 1
         else:
-            out.append(ch)
             i += 1
-
-    return "".join(out)
+            continue
+        if start < i:
+            yield sql[start:i], True
+        yield sql[i:end], False
+        i = start = end
+    if start < n:
+        yield sql[start:], True
 
 
 def _scan_quoted(sql: str, start: int, quote: str) -> int:
@@ -261,7 +262,9 @@ class SqliteDialect:
         self.db_path = db_path
 
     def connect(self) -> StoreConnection:
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        # Handed across threads (acquired on one, closed on another) as on Postgres; never
+        # used from two at once.
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -333,7 +336,8 @@ class _Row(Mapping):
     """A psycopg row that behaves like ``sqlite3.Row``.
 
     Supports ``row["col"]``, ``row[0]`` and ``row[1:3]``; implementing ``Mapping`` makes
-    ``dict(row)`` work.
+    ``dict(row)`` work. Like ``sqlite3.Row`` it hashes, and equals only a row with the
+    same columns and values, never a dict.
     """
 
     __slots__ = ("_columns", "_values")
@@ -357,6 +361,15 @@ class _Row(Mapping):
     def __len__(self) -> int:
         return len(self._columns)
 
+    # Mapping's would make a row unhashable and equal to a dict of its items.
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _Row):
+            return NotImplemented
+        return (self._columns, self._values) == (other._columns, other._values)
+
+    def __hash__(self) -> int:
+        return hash((self._columns, self._values))
+
     def __repr__(self) -> str:
         return f"_Row({dict(zip(self._columns, self._values, strict=True))!r})"
 
@@ -370,25 +383,46 @@ def _row_factory(cursor: Any) -> Any:
     return lambda values: _Row(columns, tuple(values))
 
 
-# Command tags of statements that leave no row uncommitted. ``SELECT`` covers the advisory
-# lock and ``setval``, which hold no write of their own; anything else counts as a write.
+# Command tags of statements that leave no row uncommitted; anything else counts as a write.
+# A ``SELECT`` can still write or lock: ``_holds_transaction_state``.
 _READ_TAGS = frozenset({"SELECT", "SHOW", "EXPLAIN", "SET", "SAVEPOINT", "RELEASE", "ROLLBACK"})
+
+# What makes a statement tagged ``SELECT`` hold something its transaction's end releases.
+_TRANSACTION_STATE_WORDS = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|MERGE|SHARE|pg_(?:try_)?advisory_xact_lock(?:_shared)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _holds_transaction_state(sql: str) -> bool:
+    """Whether a statement the server tagged ``SELECT`` wrote or locked.
+
+    A data-modifying CTE (``WITH w AS (INSERT ...) SELECT ...``), ``FOR UPDATE`` or
+    ``FOR SHARE``, or a transaction-scoped advisory lock (``begin_write``). Words inside
+    literals and comments do not count.
+    """
+    if _TRANSACTION_STATE_WORDS.search(sql) is None:
+        return False
+    code = " ".join(text for text, is_code in _regions(sql) if is_code)
+    return _TRANSACTION_STATE_WORDS.search(code) is not None
 
 
 class _Lease:
     """A thread's checked-out raw connection, with how many wrappers hold it.
 
-    ``dirty`` is whether a write ran since the last commit or rollback. Wrappers on
-    any thread release through this record, so a close from another thread still
-    returns the connection.
+    ``dirty`` is whether a write ran or a transaction-scoped lock was taken since the
+    last commit or rollback. Wrappers on any thread release through this record, so a
+    close from another thread still returns the connection; ``lock`` keeps that close
+    from racing the owner's on ``depth``.
     """
 
-    __slots__ = ("depth", "dirty", "raw")
+    __slots__ = ("depth", "dirty", "lock", "raw")
 
     def __init__(self, raw: Any) -> None:
         self.raw = raw
         self.depth = 1
         self.dirty = False
+        self.lock = threading.Lock()
 
 
 class _PostgresConnection:
@@ -396,7 +430,9 @@ class _PostgresConnection:
 
     ``execute`` translates qmark to pyformat; ``executescript`` (absent in psycopg)
     runs the store's own multi-statement DDL. Usable as a context manager; one
-    dropped without ``close()`` releases itself when collected, with a warning.
+    dropped without ``close()`` releases itself when collected, with a warning. Once
+    closed it raises ``RuntimeError`` on use, where ``sqlite3`` raises its own error: the
+    raw connection may be another thread's by then.
     """
 
     def __init__(self, lease: _Lease, release: Callable[[_Lease], None]) -> None:
@@ -405,24 +441,31 @@ class _PostgresConnection:
         self._release = release
         self._closed = False
 
+    def _raw(self) -> Any:
+        if self._closed:
+            raise RuntimeError("this artifact-store connection is closed")
+        return self._inner
+
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
-        cursor = self._inner.execute(translate_placeholders(sql), params)
-        # The server's command tag says what ran, so no SQL is parsed here.
-        if (cursor.statusmessage or "").split(" ", 1)[0] not in _READ_TAGS:
+        cursor = self._raw().execute(translate_placeholders(sql), params)
+        # The server's command tag says what ran; only a SELECT's text is looked at.
+        tag = (cursor.statusmessage or "").split(" ", 1)[0]
+        if tag not in _READ_TAGS or (tag == "SELECT" and _holds_transaction_state(sql)):
             self._lease.dirty = True
         return cursor
 
     def executescript(self, sql: str) -> Any:
+        raw = self._raw()
         # No parameters, so skip translate_placeholders' percent-escaping.
         self._lease.dirty = True
-        return self._inner.execute(sql)
+        return raw.execute(sql)
 
     def commit(self) -> None:
-        self._inner.commit()
+        self._raw().commit()
         self._lease.dirty = False
 
     def rollback(self) -> None:
-        self._inner.rollback()
+        self._raw().rollback()
         self._lease.dirty = False
 
     def close(self) -> None:
@@ -448,6 +491,23 @@ class _PostgresConnection:
             return
         logger.warning("an artifact-store connection was dropped without close(); releasing it")
         self.close()
+
+
+def _refuse_nesting(lease: _Lease) -> None:
+    """Raise if a nested wrapper on ``lease`` could decide what its outer holds."""
+    from psycopg.pq import TransactionStatus
+
+    status = lease.raw.info.transaction_status
+    if status == TransactionStatus.INERROR:
+        raise RuntimeError(
+            "this thread's artifact-store connection is in a failed transaction; "
+            "roll it back or close it before acquiring another"
+        )
+    if lease.dirty and status == TransactionStatus.INTRANS:
+        raise RuntimeError(
+            "this thread's artifact-store connection has uncommitted writes or a "
+            "transaction-scoped lock; commit or roll back before acquiring a nested connection"
+        )
 
 
 class PostgresDialect:
@@ -506,40 +566,32 @@ class PostgresDialect:
         several places, so without this a bounded pool deadlocks.
 
         A nested call joins the outer transaction, so its commit or rollback would decide
-        the outer's uncommitted writes (SQLite's independent connections cannot). It is
-        refused while the outer holds a write it has not committed or rolled back, and
-        while the outer transaction has failed, where no statement could run anyway.
+        the outer's uncommitted writes and end its locks (SQLite's independent connections
+        cannot). It is refused while the outer holds a write it has not committed or rolled
+        back, or a transaction-scoped lock (``begin_write``, ``FOR UPDATE``), and while the
+        outer transaction has failed, where no statement could run anyway.
 
         Raises:
-            RuntimeError: the thread's connection has uncommitted writes or a failed
-                transaction.
+            RuntimeError: the thread's connection has uncommitted writes, a lock, or a
+                failed transaction.
         """
         lease = getattr(self._local, "lease", None)
-        if lease is not None and lease.depth > 0:
-            from psycopg.pq import TransactionStatus
-
-            status = lease.raw.info.transaction_status
-            if status == TransactionStatus.INERROR:
-                raise RuntimeError(
-                    "this thread's artifact-store connection is in a failed transaction; "
-                    "roll it back or close it before acquiring another"
-                )
-            if lease.dirty and status == TransactionStatus.INTRANS:
-                raise RuntimeError(
-                    "this thread's artifact-store connection has uncommitted writes; "
-                    "commit or roll them back before acquiring a nested connection"
-                )
-            lease.depth += 1
-            return _PostgresConnection(lease, self._release)
+        if lease is not None:
+            with lease.lock:
+                if lease.depth > 0:
+                    _refuse_nesting(lease)
+                    lease.depth += 1
+                    return _PostgresConnection(lease, self._release)
 
         lease = _Lease(self._get_pool().getconn())
         self._local.lease = lease
         return _PostgresConnection(lease, self._release)
 
     def _release(self, lease: _Lease) -> None:
-        lease.depth -= 1
-        if lease.depth > 0:
-            return
+        with lease.lock:
+            lease.depth -= 1
+            if lease.depth > 0:
+                return
 
         raw = lease.raw
         if getattr(self._local, "lease", None) is lease:
@@ -576,16 +628,22 @@ class PostgresDialect:
                 self._pool.close()
                 self._pool = None
 
+    # Both ask the schema unqualified DDL creates in, not every schema on the search path.
     def column_exists(self, conn: StoreConnection, table: str, column: str) -> bool:
         row = conn.execute(
-            "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?",
             (table, column),
         ).fetchone()
         return row is not None
 
     def schema_exists(self, conn: StoreConnection, table: str = "artifact_versions") -> bool:
-        row = conn.execute("SELECT to_regclass(?)", (table,)).fetchone()
-        return row is not None and row[0] is not None
+        row = conn.execute(
+            "SELECT 1 FROM pg_catalog.pg_tables "
+            "WHERE schemaname = current_schema() AND tablename = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
 
     def adapt_ddl(self, sql: str) -> str:
         for pattern, attribute in _DDL_TYPE_REWRITES:
@@ -644,10 +702,13 @@ class PostgresDialect:
         """Serialize writers with a transaction-scoped advisory lock keyed on ``key``.
 
         Preferred over ``SERIALIZABLE``: no retry loop, released at commit or rollback,
-        and keyed so unrelated artifacts do not queue. It is weaker than SQLite's
-        whole-file lock: ``finalize_canonical_together`` can still race writers on other
-        ids sharing a provenance hash, which ``idx_tenant_provenance_unique`` rejects and
-        the caller resolves by catching :attr:`integrity_error`.
+        and keyed so unrelated artifacts do not queue. Until then the thread can take no
+        nested connection, whose commit or rollback would release the lock.
+
+        It is weaker than SQLite's whole-file lock: ``finalize_canonical_together`` can
+        still race writers on other ids sharing a provenance hash, which
+        ``idx_tenant_provenance_unique`` rejects and the caller resolves by catching
+        :attr:`integrity_error`.
         """
         conn.execute("SELECT pg_advisory_xact_lock(?)", (advisory_lock_id(key),))
 
@@ -655,20 +716,21 @@ class PostgresDialect:
 def create_tables(dialect: SqlDialect, table: str, ddl: str) -> None:
     """Create a consumer's own tables beside the ledger's, once per database.
 
-    ``table`` is the one whose presence means ``ddl`` already ran. CREATE TABLE IF NOT
-    EXISTS races in Postgres when every node runs this at startup, so creation is
-    serialized under a lock keyed on the table, then skipped.
+    ``table`` is the one whose presence means ``ddl`` already ran, on either backend.
+    CREATE TABLE IF NOT EXISTS races in Postgres when every node runs this at startup,
+    so there creation is serialized under a lock keyed on the table. SQLite takes no
+    such lock: two processes creating at once still need ``IF NOT EXISTS``.
     """
     conn = dialect.connect()
     try:
-        if not dialect.supports_legacy_migration:
-            if not dialect.schema_exists(conn, table):
-                dialect.begin_write(conn, f"__{table}_schema__")
-                # Another node may have created it while this one waited for the lock.
-                if not dialect.schema_exists(conn, table):
-                    conn.executescript(dialect.adapt_ddl(ddl))
-                conn.commit()
+        if dialect.schema_exists(conn, table):
             return
+        if not dialect.supports_legacy_migration:
+            dialect.begin_write(conn, f"__{table}_schema__")
+            # Another node may have created it while this one waited for the lock.
+            if dialect.schema_exists(conn, table):
+                conn.commit()
+                return
         conn.executescript(dialect.adapt_ddl(ddl))
         conn.commit()
     finally:
