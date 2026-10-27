@@ -304,6 +304,43 @@ def test_a_presigned_post_uploads_within_the_bound_and_minio_refuses_beyond_it(m
     assert b"EntityTooLarge" in body
 
 
+def test_a_presigned_post_uploads_an_empty_blob(minio):
+    signed = minio.presign_post("empty", 1, max_bytes=16, ttl_seconds=60)
+    assert signed is not None
+
+    status, _ = _post_form(*signed, b"")
+
+    assert status == 204
+    assert minio.read_blob("empty", 1) == b""
+
+
+def test_a_presigned_put_and_get_go_through_azurite(azurite):
+    """Azurite checks an account-key SAS as Azure does, its permissions included."""
+    artifact = f"sas-{uuid.uuid4().hex[:8]}"
+    put = azurite.presign_put(artifact, 1, ttl_seconds=60)
+    get_url = azurite.presign_get(artifact, 1, ttl_seconds=60)
+    assert put is not None and get_url is not None
+    put_url, headers = put
+
+    assert _put(put_url, headers, b"put through a SAS") == 201
+    assert azurite.read_blob(artifact, 1) == b"put through a SAS"
+    with urllib.request.urlopen(get_url) as response:
+        assert response.read() == b"put through a SAS"
+    # The read SAS grants no write.
+    assert _put(get_url, headers, b"overwritten") == 403
+    assert azurite.read_blob(artifact, 1) == b"put through a SAS"
+
+
+def _put(url: str, headers: dict[str, str], payload: bytes) -> int:
+    request = urllib.request.Request(url, data=payload, headers=headers, method="PUT")
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code
+
+
 def _post_form(url: str, fields: dict[str, str], payload: bytes) -> tuple[int, bytes]:
     """POST ``fields`` and ``payload`` as the ``file`` part of a multipart form."""
     boundary = uuid.uuid4().hex

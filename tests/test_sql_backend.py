@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import gc
 import logging
+import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import psycopg
 import pytest
+from psycopg.pq import TransactionStatus
 
 from vestigo import sql_backend
 from vestigo.sql_backend import (
@@ -19,6 +22,7 @@ from vestigo.sql_backend import (
     _PostgresConnection,
     _Row,
     advisory_lock_id,
+    create_tables,
     translate_placeholders,
 )
 
@@ -131,6 +135,19 @@ class TestSqliteDialectPreservesTodaysBehavior:
         # SQLite is the only backend with deployed history to upgrade.
         assert SqliteDialect(Path("x.sqlite")).supports_legacy_migration is True
 
+    def test_a_connection_acquired_on_one_thread_is_used_and_closed_on_another(self, tmp_path):
+        # The same consumer code runs on Postgres, whose wrappers release from any thread.
+        dialect = SqliteDialect(tmp_path / "artifacts.sqlite")
+        box: dict[str, object] = {}
+        thread = threading.Thread(target=lambda: box.__setitem__("conn", dialect.connect()))
+        thread.start()
+        thread.join()
+        conn = box["conn"]
+        assert isinstance(conn, sqlite3.Connection)
+
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+        conn.close()
+
 
 class _FakeInner:
     """Records what the wrapper would send to psycopg, so no server is needed."""
@@ -138,11 +155,13 @@ class _FakeInner:
     def __init__(self):
         self.executed: list[tuple[str, tuple]] = []
         self.statusmessage = None
+        # The server's tag where the statement's verb is not it (a CTE is tagged SELECT).
+        self.tag: str | None = None
 
     def execute(self, sql, params=()):
         self.executed.append((sql, tuple(params)))
         # The command tag psycopg exposes on the cursor, from the statement's verb.
-        self.statusmessage = sql.split(None, 1)[0].upper()
+        self.statusmessage = self.tag or sql.split(None, 1)[0].upper()
         return self
 
     def commit(self):
@@ -218,10 +237,10 @@ class TestPostgresConnectionAdapter:
         assert any("without close()" in r.getMessage() for r in caplog.records)
 
     def test_writes_mark_the_lease_dirty_until_commit_or_rollback(self):
-        # Decided by the server's command tag: the advisory lock is a SELECT and not a write.
+        # Decided by the server's command tag: a plain read is not a write.
         conn, _, _ = self._wrap()
         with conn:
-            conn.execute("SELECT pg_advisory_xact_lock(?)", (1,))
+            conn.execute("SELECT x FROM t WHERE x = ?", (1,))
             assert conn._lease.dirty is False
             conn.execute("INSERT INTO t VALUES (?)", (1,))
             assert conn._lease.dirty is True
@@ -231,6 +250,115 @@ class TestPostgresConnectionAdapter:
             assert conn._lease.dirty is True
             conn.rollback()
             assert conn._lease.dirty is False
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "WITH w AS (INSERT INTO t VALUES (1) RETURNING x) SELECT x FROM w",
+            "with w as (delete from t returning x) select count(*) from w",
+            "SELECT x FROM t FOR UPDATE",
+            "SELECT x FROM t FOR NO KEY UPDATE",
+            "SELECT x FROM t FOR KEY SHARE",
+            "SELECT pg_advisory_xact_lock(?)",
+            "SELECT pg_try_advisory_xact_lock_shared(?)",
+        ],
+    )
+    def test_a_select_that_writes_or_locks_marks_the_lease_dirty(self, sql):
+        # Postgres tags each of these SELECT; a nested commit or rollback would end what it holds.
+        conn, inner, _ = self._wrap()
+        inner.tag = "SELECT 1"
+        with conn:
+            conn.execute(sql, (1,) if "?" in sql else ())
+            assert conn._lease.dirty is True
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT 'DELETE FROM t' AS s",
+            'SELECT 1 AS "update"',
+            "SELECT 1 -- FOR UPDATE",
+            "SELECT 1 /* INSERT */",
+            "SELECT updated_at, shared, deleted FROM t",
+        ],
+    )
+    def test_those_words_as_data_or_inside_a_name_mark_nothing(self, sql):
+        conn, inner, _ = self._wrap()
+        inner.tag = "SELECT 1"
+        with conn:
+            conn.execute(sql)
+            assert conn._lease.dirty is False
+
+    def test_a_closed_wrapper_refuses_use(self):
+        # Its raw connection is back in the pool and may be another thread's.
+        conn, inner, _ = self._wrap()
+        conn.close()
+        for use in (
+            lambda: conn.execute("SELECT 1"),
+            lambda: conn.executescript("SELECT 1"),
+            conn.commit,
+            conn.rollback,
+        ):
+            with pytest.raises(RuntimeError, match="closed"):
+                use()
+        assert inner.executed == []
+
+
+class _FakePool:
+    """Hands out idle raw connections and counts how many are out."""
+
+    def __init__(self):
+        self.out = 0
+
+    def getconn(self):
+        self.out += 1
+        return SimpleNamespace(info=SimpleNamespace(transaction_status=TransactionStatus.IDLE))
+
+    def putconn(self, raw):
+        self.out -= 1
+
+    def close(self):
+        return None
+
+
+class _LockWatchingDepth(int):
+    """A lease depth that records, at each change, whether the lease's lock is held."""
+
+    def __new__(cls, value: int, lease: _Lease, seen: list[bool]):
+        depth = super().__new__(cls, value)
+        depth.lease = lease
+        depth.seen = seen
+        return depth
+
+    def _changed(self, value: int) -> _LockWatchingDepth:
+        self.seen.append(self.lease.lock.locked())
+        return _LockWatchingDepth(value, self.lease, self.seen)
+
+    def __add__(self, other):
+        return self._changed(int(self) + other)
+
+    def __sub__(self, other):
+        return self._changed(int(self) - other)
+
+
+class TestLeaseDepth:
+    def test_depth_changes_under_the_lease_lock(self):
+        # Unlocked, a close on another thread racing the owner's loses a decrement and the
+        # connection never returns to the pool.
+        dialect = PostgresDialect("postgresql:///x")
+        pool = _FakePool()
+        dialect._pool = pool
+        outer = dialect.connect()
+        lease = dialect._local.lease
+        seen: list[bool] = []
+        lease.depth = _LockWatchingDepth(lease.depth, lease, seen)
+
+        inner = dialect.connect()
+        inner.close()
+        outer.close()
+
+        assert seen == [True, True, True]
+        assert pool.out == 0
+        dialect.close()
 
 
 class TestRowBehavesLikeSqliteRow:
@@ -263,6 +391,25 @@ class TestRowBehavesLikeSqliteRow:
     def test_membership_test_does_not_raise(self):
         assert "principal" not in self._row()
         assert "tenant" in self._row()
+
+    def test_hashes_and_compares_by_columns_and_values(self):
+        # A consumer's set of rows or dict keyed by row works on SQLite.
+        assert self._row() == self._row()
+        assert len({self._row(), self._row()}) == 1
+        assert self._row() != _Row(("id", "tenant"), ("a1", "other"))
+        assert self._row() != _Row(("id", "owner"), ("a1", "acme"))
+
+    def test_never_equals_a_dict_as_sqlite3_row_does_not(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            sqlite_row = conn.execute("SELECT 'a1' AS id, 'acme' AS tenant").fetchone()
+        finally:
+            conn.close()
+        as_dict = {"id": "a1", "tenant": "acme"}
+
+        assert (sqlite_row == as_dict) is False
+        assert (self._row() == as_dict) is False
 
 
 class TestPostgresDialectRendering:
@@ -341,6 +488,41 @@ def _count(dialect) -> int:
         return conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
 
 
+def _lock_is_free(dsn: str, key: str) -> bool:
+    """Whether another session could take ``begin_write``'s lock on ``key`` now."""
+    with psycopg.connect(dsn) as other:
+        free = other.execute(
+            "SELECT pg_try_advisory_xact_lock(%s)", (advisory_lock_id(key),)
+        ).fetchone()[0]
+        other.rollback()
+        return free
+
+
+def test_create_tables_runs_its_ddl_once_per_database(backend_store):
+    # No IF NOT EXISTS, and a seed row: a second run would fail or seed twice.
+    dialect = backend_store._dialect
+    ddl = (
+        "CREATE TABLE consumer_things (x INTEGER); "
+        "CREATE INDEX idx_consumer_things ON consumer_things (x); "
+        "INSERT INTO consumer_things VALUES (1);"
+    )
+    try:
+        create_tables(dialect, "consumer_things", ddl)
+        create_tables(dialect, "consumer_things", ddl)
+        conn = dialect.connect()
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM consumer_things").fetchone()[0] == 1
+        finally:
+            conn.close()
+    finally:
+        conn = dialect.connect()
+        try:
+            conn.executescript("DROP TABLE IF EXISTS consumer_things")
+            conn.commit()
+        finally:
+            conn.close()
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 class TestPooledConnectionLifecycle:
@@ -397,11 +579,80 @@ class TestPooledConnectionLifecycle:
             outer.close()
         assert _count(dialect) == 1
 
+    def test_a_nested_connect_over_a_held_advisory_lock_is_refused(self, dialect, postgres_dsn):
+        # Joined, the inner's commit or rollback would release the lock while the outer goes
+        # on as if it still serialized writers on the key.
+        outer = dialect.connect()
+        try:
+            dialect.begin_write(outer, "a1")
+            with pytest.raises(RuntimeError, match="transaction-scoped lock"):
+                dialect.connect()
+            assert _lock_is_free(postgres_dsn, "a1") is False
+            outer.rollback()
+            assert _lock_is_free(postgres_dsn, "a1") is True
+            with dialect.connect() as inner:
+                assert inner.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            outer.close()
+
+    def test_a_nested_connect_over_a_row_lock_is_refused(self, dialect):
+        outer = dialect.connect()
+        try:
+            outer.execute("SELECT x FROM t FOR UPDATE").fetchall()
+            with pytest.raises(RuntimeError, match="transaction-scoped lock"):
+                dialect.connect()
+        finally:
+            outer.rollback()
+            outer.close()
+
+    def test_a_nested_connect_over_a_write_in_a_cte_is_refused(self, dialect):
+        # Postgres tags the statement SELECT; joined, the inner's rollback would discard the row.
+        outer = dialect.connect()
+        try:
+            cursor = outer.execute(
+                "WITH w AS (INSERT INTO t VALUES (1) RETURNING x) SELECT x FROM w"
+            )
+            assert cursor.statusmessage.startswith("SELECT")
+            with pytest.raises(RuntimeError, match="uncommitted writes"):
+                dialect.connect()
+            outer.commit()
+        finally:
+            outer.close()
+        assert _count(dialect) == 1
+
+    def test_a_closed_wrapper_on_a_live_connection_refuses_use(self, dialect):
+        conn = dialect.connect()
+        conn.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            conn.execute("SELECT 1")
+
+    def test_schema_questions_ask_the_current_schema_only(self, dialect):
+        # A second copy of a table on the search path must not make a migration skip its
+        # ALTER, or stamp a version the current schema's table does not have.
+        with dialect.connect() as conn:
+            conn.executescript(
+                "DROP SCHEMA IF EXISTS other_ledger CASCADE; CREATE SCHEMA other_ledger; "
+                "CREATE TABLE other_ledger.elsewhere (only_there INT); "
+                "CREATE TABLE other_ledger.t (x INT, only_there INT)"
+            )
+            conn.commit()
+            try:
+                conn.execute("SET LOCAL search_path TO public, other_ledger")
+                assert conn.execute("SELECT current_schema()").fetchone()[0] == "public"
+                assert dialect.schema_exists(conn, "elsewhere") is False
+                assert dialect.column_exists(conn, "elsewhere", "only_there") is False
+                assert dialect.column_exists(conn, "t", "only_there") is False
+                assert dialect.schema_exists(conn, "t") is True
+                assert dialect.column_exists(conn, "t", "x") is True
+            finally:
+                conn.rollback()
+                conn.executescript("DROP SCHEMA other_ledger CASCADE")
+                conn.commit()
+
     def test_a_nested_connect_after_reads_shares_the_connection(self, dialect):
         outer = dialect.connect()
         try:
             outer.execute("SELECT 1").fetchone()
-            dialect.begin_write(outer, "a1")
             inner = dialect.connect()
             try:
                 assert inner._inner is outer._inner
