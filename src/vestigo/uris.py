@@ -63,12 +63,15 @@ def uri_scheme() -> str:
 
 
 def artifact_uri(artifact_id: str, version: int) -> str:
-    """The pinned URI of one version.
+    """The pinned URI of one version; :func:`parse_artifact_uri` reads it back.
 
     Raises:
-        ValueError: *version* is negative; ``LATEST_VERSION`` is a parse result,
-            not a version, and the unpinned form has no ``@v=``.
+        ValueError: *artifact_id* is empty or holds ``@``, which would end the id
+            early on the way back; or *version* is negative: ``LATEST_VERSION`` is a
+            parse result, not a version, and the unpinned form has no ``@v=``.
     """
+    if not artifact_id or "@" in artifact_id:
+        raise ValueError(f"artifact id {artifact_id!r} is empty or holds '@'")
     if version < 0:
         raise ValueError(f"version {version} is not a pinned version")
     return f"{_scheme}://artifact/{artifact_id}@v={version}"

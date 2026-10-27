@@ -20,11 +20,12 @@ from vestigo.graph import (
     Traversal,
     canonical_role,
     cgd1_envelope,
+    graph_definition_id,
     identity_scope,
     node_id,
 )
 from vestigo.provenance import TransformSpec
-from vestigo.store import ArtifactStore
+from vestigo.store import _MIGRATIONS, ArtifactStore
 
 
 @pytest.fixture
@@ -85,6 +86,56 @@ def recording(store):
 
 
 GLIBC_ORDER = ["a", "b", "\u00e9", "_x", "Z"]
+
+
+class _Capturing:
+    """A connection that records every statement it runs, with its parameters."""
+
+    def __init__(self, inner, statements: list[tuple[str, tuple]]):
+        self._inner = inner
+        self._statements = statements
+
+    def __getattr__(self, attr):
+        return getattr(self._inner, attr)
+
+    def execute(self, sql, params=()):
+        self._statements.append((sql, tuple(params)))
+        return self._inner.execute(sql, params)
+
+
+@pytest.fixture
+def captured(store):
+    """The store's graph on capturing connections; yields the statements they ran."""
+    statements: list[tuple[str, tuple]] = []
+    connect = store.graph._connect
+    store.graph._connect = lambda: _Capturing(connect(), statements)
+    yield statements
+    store.graph._connect = connect
+
+
+def _plan(store: ArtifactStore, sql: str, params: tuple) -> list[str]:
+    """SQLite's plan of *sql*, one detail line per step, on a store without ANALYZE."""
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        return [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+
+
+# SQLite before 3.32 bound at most 999 variables; a build may still ship that limit.
+OLD_VARIABLE_LIMIT = 999
+
+
+@pytest.fixture
+def few_variables(store):
+    """The store's graph on connections that bind at most ``OLD_VARIABLE_LIMIT`` variables."""
+    connect = store.graph._connect
+
+    def limited():
+        conn = connect()
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, OLD_VARIABLE_LIMIT)
+        return conn
+
+    store.graph._connect = limited
+    yield
+    store.graph._connect = connect
 
 
 class TestPutBatch:
@@ -186,6 +237,40 @@ class TestPutBatch:
 
         assert [p.role for p in store.graph.inputs(mixed)] == ["Z", "_x", "a", "b", "\u00e9"]
 
+    def test_a_stored_role_that_is_not_an_identifier_still_reads_back(self, store):
+        # A row from before roles were checked, or one copied in from such a store.
+        leaf, cell = store.graph.put_batch([LEAF, NodeSpec("test/cell", b"c")])
+        with closing(sqlite3.connect(store.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO node_inputs (scope, node_id, role, position, target_node_id) "
+                "VALUES (?, ?, 'left-table', 0, ?), (?, ?, 'Left', 0, ?)",
+                (identity_scope(None).hex(), cell, leaf) * 2,
+            )
+            conn.commit()
+
+        ports = store.graph.inputs(cell)
+
+        assert [(p.role, p.target_node_id) for p in ports] == [("Left", leaf), ("left-table", leaf)]
+
+    def test_a_payload_is_bytes(self):
+        with pytest.raises(ValueError, match="payload is a str, not bytes"):
+            NodeSpec("test/cell", "text")  # type: ignore[arg-type]
+        assert NodeSpec("test/cell", b"").payload == b""
+
+    def test_a_batch_may_name_more_stored_nodes_than_sqlite_binds(self, store, few_variables):
+        leaves = store.graph.put_batch(
+            [NodeSpec("test/table", f"t{i}".encode()) for i in range(OLD_VARIABLE_LIMIT + 1)]
+        )
+        edges = tuple(Edge("input", i, leaf) for i, leaf in enumerate(leaves))
+
+        (wide,) = store.graph.put_batch([NodeSpec("test/cell", b"wide", edges)])
+
+        assert len(store.graph.inputs(wide)) == len(leaves)
+        with pytest.raises(ValueError, match="not in the store"):
+            store.graph.put_batch(
+                [NodeSpec("test/cell", b"x", (*edges, Edge("input", len(edges), _hex(7))))]
+            )
+
     def test_nodes_are_inserted_in_id_order(self, store, recording):
         leaves = [NodeSpec("test/table", bytes([i])) for i in range(6)]
         ids = store.graph.put_batch(leaves)
@@ -206,6 +291,66 @@ class TestEncoders:
             cgd1_envelope(self.SCOPE, "test", 1, [("\u00e9", b"", self.A, True)], [], [self.A])
         with pytest.raises(ValueError, match="not lowercase ASCII"):
             cgd1_envelope(self.SCOPE, "test", 1, [], [("\u00e9", b"", self.A)], [self.A])
+
+    # A stored id is an identity (ADR 002): these bytes must never change.
+    PIN_SCOPE = bytes.fromhex("024a721fd5146ce80515a80ae9da71c8")
+    ZERO_TO_31 = bytes(range(32))
+    B = b"\xbb" * 32
+    C = b"\xcc" * 32
+
+    def test_the_identity_scope_is_pinned(self):
+        assert identity_scope("pin") == self.PIN_SCOPE
+        assert identity_scope(None).hex() == "5614ea74b489e754cf2dc8bc79dffe65"
+        assert identity_scope("") == identity_scope(None)
+
+    def test_a_node_id_is_pinned(self):
+        edges = [("right", 0, self.C), ("left", 1, self.ZERO_TO_31), ("left", 0, self.B)]
+        assert node_id(self.PIN_SCOPE, "test/cell", 1, b"payload", edges).hex() == (
+            "2f3aeb48c2e2b28b60da18f9ea80b067763f09566d46b0251788f43ad63831a5"
+        )
+
+    def test_the_cgd1_envelope_and_definition_id_are_pinned(self):
+        args = (
+            self.PIN_SCOPE,
+            "test/graph",
+            2,
+            [("rows", b"table", self.ZERO_TO_31, True), ("limit", b"int", self.B, False)],
+            [("out", b"table", self.C)],
+            [self.C, self.ZERO_TO_31],
+            b"pure",
+            b"",
+        )
+        # Little-endian lengths; ports sorted by name bytes, roots by their bytes.
+        expected = (
+            b"CGD1"
+            + b"\x01\x00"
+            + self.PIN_SCOPE
+            + b"\x0a\x00\x00\x00test/graph"
+            + b"\x02\x00\x00\x00"
+            + b"\x02\x00\x00\x00"
+            + b"\x05\x00limit"
+            + b"\x03\x00\x00\x00int"
+            + self.B
+            + b"\x00"
+            + b"\x04\x00rows"
+            + b"\x05\x00\x00\x00table"
+            + self.ZERO_TO_31
+            + b"\x01"
+            + b"\x01\x00\x00\x00"
+            + b"\x03\x00out"
+            + b"\x05\x00\x00\x00table"
+            + self.C
+            + b"\x02\x00\x00\x00"
+            + self.ZERO_TO_31
+            + self.C
+            + b"\x04\x00\x00\x00pure"
+            + b"\x00\x00\x00\x00"
+        )
+
+        assert cgd1_envelope(*args) == expected
+        assert graph_definition_id(*args).hex() == (
+            "176fad2b06211cf347a992b8cfda9db54d34d480a33c3179e3f569d1bd5e43ec"
+        )
 
 
 class TestTraversal:
@@ -236,6 +381,35 @@ class TestTraversal:
             with pytest.raises(ValueError, match="below 1"):
                 Traversal(max_depth=depth)
         assert Traversal(max_depth=1).max_depth == 1
+
+    def test_a_size_bound_below_zero_is_refused(self, store):
+        with pytest.raises(ValueError, match="max_nodes -1 is below 0"):
+            Traversal(max_nodes=-1)
+        leaf, _, second = store.graph.put_batch(THREE)
+        assert store.graph.ancestors([leaf], traversal=Traversal(max_nodes=0)) == []
+        with pytest.raises(ValueError, match="more than 0 nodes"):
+            store.graph.ancestors([second], traversal=Traversal(max_nodes=0))
+
+    @pytest.mark.parametrize(
+        ("walk", "probe"),
+        [
+            ("ancestors", "sqlite_autoindex_node_inputs_1 (scope=? AND node_id=?)"),
+            ("dependents", "idx_node_inputs_target (scope=? AND target_node_id=?)"),
+        ],
+    )
+    def test_each_step_of_a_walk_probes_the_index_for_the_nodes_it_reached(
+        self, store, captured, walk, probe
+    ):
+        leaf, _, second = store.graph.put_batch(THREE)
+        captured.clear()
+
+        getattr(store.graph, walk)([second] if walk == "ancestors" else leaf)
+
+        ((sql, params),) = [(s, p) for s, p in captured if "WITH RECURSIVE" in s]
+        plan = _plan(store, sql, params)
+        step = plan[plan.index("RECURSIVE STEP") + 1 :][:2]
+        # The reached nodes outside, one index probe each: not a scan of the scope's edges.
+        assert step == ["SCAN w", f"SEARCH i USING INDEX {probe}"]
 
     def test_a_root_the_store_lacks_is_refused(self, store):
         leaf, first, second = store.graph.put_batch(THREE)
@@ -275,6 +449,42 @@ class TestTraversal:
 
         assert set(store.graph.dependents(leaf)) == {first, second, other}
         assert store.graph.topological_order([second, other])[0] == leaf
+
+    def test_a_wide_graph_walks_and_orders_past_sqlites_variable_limit(self, store, few_variables):
+        n = OLD_VARIABLE_LIMIT + 1
+        star = [NodeSpec("test/table", f"t{i}".encode()) for i in range(n)]
+        star.append(NodeSpec("test/cell", b"root", tuple(Edge("input", i, i) for i in range(n))))
+        *leaves, root = store.graph.put_batch(star)
+        wide = Traversal(max_nodes=n)
+
+        assert store.graph.ancestors([root], traversal=wide) == sorted(leaves)
+        assert store.graph.topological_order([root], traversal=wide) == [*sorted(leaves), root]
+        # Every leaf a root too: the walk's starts no longer fit one query.
+        assert store.graph.topological_order([*leaves, root], traversal=wide) == [
+            *sorted(leaves),
+            root,
+        ]
+
+    def test_a_walk_from_more_starts_than_one_query_binds_keeps_its_bounds(
+        self, store, few_variables
+    ):
+        n = OLD_VARIABLE_LIMIT + 1
+        pairs = []
+        for i in range(n):
+            pairs += [
+                NodeSpec("test/table", f"t{i}".encode()),
+                NodeSpec("test/cell", f"c{i}".encode(), (Edge("rows", 0, 2 * i),)),
+            ]
+        ids = store.graph.put_batch(pairs)
+        leaves, cells = ids[0::2], ids[1::2]
+
+        # A start another start reaches is still not in the answer.
+        reached = store.graph.ancestors([*cells, leaves[0]], traversal=Traversal(max_nodes=n))
+        assert reached == sorted(leaves[1:])
+        assert store.graph.ancestors(cells, traversal=Traversal(max_nodes=n)) == sorted(leaves)
+        # Each query reaches fewer than the bound; together they reach more.
+        with pytest.raises(ValueError, match=f"more than {n - 1} nodes"):
+            store.graph.ancestors(cells, traversal=Traversal(max_nodes=n - 1))
 
 
 class TestDefinitions:
@@ -406,6 +616,32 @@ class TestLinks:
             store.graph.link(new, "Reconstructed From", old)
         assert store.graph.links(new) == []
 
+    def test_links_to_a_node_without_a_relation_probe_the_target_index(self, store, captured):
+        _, old, new = store.graph.put_batch(THREE)
+        store.graph.link(new, "reconstructed_from", old)
+        captured.clear()
+
+        assert len(store.graph.linked_from(old)) == 1
+
+        ((sql, params),) = captured
+        assert _plan(store, sql, params)[0] == (
+            "SEARCH node_links USING INDEX idx_node_links_target (scope=? AND target_node_id=?)"
+        )
+
+
+def _link_target_index_columns(store: ArtifactStore) -> list[str]:
+    conn = store._get_connection()
+    try:
+        if store.dialect.name == "sqlite":
+            rows = conn.execute("PRAGMA index_info(idx_node_links_target)").fetchall()
+            return [r["name"] for r in rows]
+        (row,) = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_node_links_target'"
+        ).fetchall()
+    finally:
+        conn.close()
+    return row["indexdef"].rsplit("(", 1)[1].rstrip(")").split(", ")
+
 
 class TestMigration:
     def test_an_old_store_gains_node_links_on_open(self, tmp_path):
@@ -421,6 +657,26 @@ class TestMigration:
         reopened.graph.link(new, "reconstructed_from", old)
 
         assert reopened.graph.links(new)[0].target_node_id == old
+
+    def test_an_old_store_rebuilds_the_link_target_index_on_open(self, backend_store, tmp_path):
+        (step,) = [m.version for m in _MIGRATIONS if "idx_node_links_target" in m.description]
+        _, old, new = backend_store.graph.put_batch(THREE)
+        backend_store.graph.link(new, "reconstructed_from", old)
+        conn = backend_store._get_connection()
+        try:
+            conn.execute("DROP INDEX idx_node_links_target")
+            conn.execute(
+                "CREATE INDEX idx_node_links_target ON node_links(scope, relation, target_node_id)"
+            )
+            conn.execute("DELETE FROM schema_version WHERE version >= ?", (step,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "artifacts", dialect=backend_store.dialect)
+
+        assert _link_target_index_columns(reopened) == ["scope", "target_node_id", "relation"]
+        assert reopened.graph.linked_from(old)[0].node_id == new
 
     def test_an_old_store_gains_the_graph_on_open(self, tmp_path):
         store = ArtifactStore(tmp_path / "old")

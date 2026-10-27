@@ -24,6 +24,7 @@ from vestigo import uris
 from vestigo.graph import (
     GRAPH_DDL,
     LINK_DDL,
+    LINK_TARGET_INDEX,
     GraphStore,
     NodeId,
     NodeSpec,
@@ -739,6 +740,13 @@ def _add_node_links(conn: StoreConnection, dialect: SqlDialect) -> None:
         conn.execute(dialect.adapt_ddl(statement))
 
 
+def _reorder_link_target_index(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """``idx_node_links_target`` led with the relation, so ``linked_from`` without one
+    probed only the scope; rebuilt to lead with the target."""
+    conn.execute("DROP INDEX IF EXISTS idx_node_links_target")
+    conn.execute(dialect.adapt_ddl(LINK_TARGET_INDEX))
+
+
 _MIGRATIONS: list[_Migration] = [
     _Migration(1, "artifact_versions.content_sha256", _add_content_sha256),
     _Migration(2, "artifact_publications.authors + external_ids", _add_publication_credits),
@@ -757,6 +765,9 @@ _MIGRATIONS: list[_Migration] = [
         14, "build_releases + references + authorities; release_id, computation_key", _add_releases
     ),
     _Migration(15, "node_links", _add_node_links),
+    _Migration(
+        16, "idx_node_links_target on (scope, target_node_id, relation)", _reorder_link_target_index
+    ),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1399,7 +1410,7 @@ class ArtifactStore:
     @cached_property
     def graph(self) -> GraphStore:
         """The structural graph this ledger holds (ADR 002 §6)."""
-        return GraphStore(self._get_connection, self._dialect)
+        return GraphStore(self._get_connection)
 
     def definition_of(
         self, artifact_id: str, version: int, *, tenant: str | None = None

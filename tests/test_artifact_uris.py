@@ -79,6 +79,16 @@ class TestUriScheme:
             uris.artifact_uri("abc", -7)
         assert uris.artifact_uri("abc", 0) == "vestigo://artifact/abc@v=0"
 
+    @pytest.mark.parametrize("artifact_id", ["", "a@b", "@", "abc@v=1"])
+    def test_an_id_the_parser_would_not_read_back_is_refused(self, artifact_id):
+        with pytest.raises(ValueError, match="empty or holds '@'"):
+            uris.artifact_uri(artifact_id, 1)
+
+    def test_a_written_uri_reads_back(self):
+        for artifact_id in ("abc", "nb_42_cell_x-1", "team/report.v2"):
+            uri = uris.artifact_uri(artifact_id, 7)
+            assert parse_artifact_uri(uri) == (artifact_id, 7)
+
     def test_the_default_is_vestigo(self):
         assert uris.uri_scheme() == "vestigo"
         assert uris.artifact_uri("abc", 3) == "vestigo://artifact/abc@v=3"
