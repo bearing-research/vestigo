@@ -21,7 +21,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from vestigo import uris
-from vestigo.graph import GRAPH_DDL, GraphStore, NodeId, NodeSpec, _checked_id, identity_scope
+from vestigo.graph import (
+    GRAPH_DDL,
+    LINK_DDL,
+    GraphStore,
+    NodeId,
+    NodeSpec,
+    _checked_id,
+    identity_scope,
+)
 from vestigo.provenance import TransformSpec, parse_transform_spec
 from vestigo.releases import RELEASE_DDL
 from vestigo.sql_backend import SqlDialect, SqliteDialect, StoreConnection
@@ -725,6 +733,12 @@ def _add_releases(conn: StoreConnection, dialect: SqlDialect) -> None:
     )
 
 
+def _add_node_links(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Links between nodes (ADR 002 §6.3 ``reconstructed_from``); outside every id."""
+    for statement in LINK_DDL:
+        conn.execute(dialect.adapt_ddl(statement))
+
+
 _MIGRATIONS: list[_Migration] = [
     _Migration(1, "artifact_versions.content_sha256", _add_content_sha256),
     _Migration(2, "artifact_publications.authors + external_ids", _add_publication_credits),
@@ -742,6 +756,7 @@ _MIGRATIONS: list[_Migration] = [
     _Migration(
         14, "build_releases + references + authorities; release_id, computation_key", _add_releases
     ),
+    _Migration(15, "node_links", _add_node_links),
 ]
 
 RETENTION_SCHEMA_VERSION = 12

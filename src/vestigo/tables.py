@@ -24,6 +24,7 @@ LEDGER_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("store_upgrades", ("name",)),
     ("nodes", ("scope", "node_id")),
     ("node_inputs", ("scope", "node_id", "role", "position")),
+    ("node_links", ("scope", "node_id", "relation", "target_node_id")),
     ("build_releases", ("release_id",)),
     ("release_references", ("tenant", "name")),
     ("release_authorities", ("tenant", "target")),

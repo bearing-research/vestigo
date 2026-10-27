@@ -364,12 +364,70 @@ class TestDefinitions:
         assert store.definition_of("old", 1) is None
 
 
+class TestLinks:
+    def test_a_complete_node_says_what_it_was_reconstructed_from(self, store):
+        leaf, old, new = store.graph.put_batch(THREE)
+
+        store.graph.link(new, "reconstructed_from", old)
+        store.graph.link(new, "reconstructed_from", old)  # idempotent
+
+        (link,) = store.graph.links(new)
+        assert (link.node_id, link.relation, link.target_node_id) == (
+            new,
+            "reconstructed_from",
+            old,
+        )
+        assert store.graph.links(new, "reconstructed_from") == [link]
+        assert store.graph.links(new, "other") == []
+        assert store.graph.linked_from(old, "reconstructed_from") == [link]
+        assert store.graph.linked_from(new) == []
+        assert store.graph.links(old) == []
+        # Outside both identities: the nodes are what they were.
+        assert store.graph.put_batch(THREE) == [leaf, old, new]
+
+    def test_links_are_scoped_to_the_tenant(self, store):
+        _, old, new = store.graph.put_batch(THREE)
+        _, old_t, new_t = store.graph.put_batch(THREE, tenant="acme")
+
+        store.graph.link(new_t, "reconstructed_from", old_t, tenant="acme")
+
+        assert store.graph.links(new) == []
+        assert store.graph.links(new_t, tenant="acme")[0].target_node_id == old_t
+        with pytest.raises(ValueError, match="not in the store"):
+            store.graph.link(new, "reconstructed_from", old_t)
+
+    def test_a_link_names_only_stored_nodes_and_a_charset_relation(self, store):
+        _, old, new = store.graph.put_batch(THREE)
+        with pytest.raises(ValueError, match="not in the store"):
+            store.graph.link(new, "reconstructed_from", _hex(7))
+        with pytest.raises(ValueError, match="not in the store"):
+            store.graph.link(_hex(7), "reconstructed_from", old)
+        with pytest.raises(ValueError):
+            store.graph.link(new, "Reconstructed From", old)
+        assert store.graph.links(new) == []
+
+
 class TestMigration:
+    def test_an_old_store_gains_node_links_on_open(self, tmp_path):
+        store = ArtifactStore(tmp_path / "old")
+        _, old, new = store.graph.put_batch(THREE)
+        store.close()
+        conn = sqlite3.connect(store.db_path)
+        conn.executescript("DROP TABLE node_links; DELETE FROM schema_version WHERE version >= 15;")
+        conn.commit()
+        conn.close()
+
+        reopened = ArtifactStore(tmp_path / "old")
+        reopened.graph.link(new, "reconstructed_from", old)
+
+        assert reopened.graph.links(new)[0].target_node_id == old
+
     def test_an_old_store_gains_the_graph_on_open(self, tmp_path):
         store = ArtifactStore(tmp_path / "old")
         conn = sqlite3.connect(store.db_path)
         conn.executescript(
-            "DROP TABLE nodes; DROP TABLE node_inputs; DROP INDEX idx_versions_definition; "
+            "DROP TABLE nodes; DROP TABLE node_inputs; DROP TABLE node_links; "
+            "DROP INDEX idx_versions_definition; "
             "ALTER TABLE artifact_versions DROP COLUMN definition_id; "
             "DELETE FROM schema_version WHERE version >= 13;"
         )

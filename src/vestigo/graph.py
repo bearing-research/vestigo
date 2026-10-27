@@ -266,6 +266,20 @@ class InputEdge:
 
 
 @dataclass(frozen=True)
+class Link:
+    """A relation between two stored nodes that is inside neither identity.
+
+    ``reconstructed_from`` (ADR 002 §6.3): a complete node names the historical node
+    rebuilt for the rows before roles were recorded. Relations use the domain charset.
+    """
+
+    node_id: NodeId
+    relation: str
+    target_node_id: NodeId
+    created_at: float
+
+
+@dataclass(frozen=True)
 class Traversal:
     """How far a walk may go; both bounds are the caller's statement of cost.
 
@@ -305,8 +319,23 @@ GRAPH_DDL: tuple[str, ...] = (
         PRIMARY KEY (scope, node_id, role, position)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_node_inputs_target ON node_inputs(scope, target_node_id)",
+    *(
+        LINK_DDL := (
+            """CREATE TABLE IF NOT EXISTS node_links (
+        scope TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        target_node_id TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (scope, node_id, relation, target_node_id)
+    )""",
+            "CREATE INDEX IF NOT EXISTS idx_node_links_target "
+            "ON node_links(scope, relation, target_node_id)",
+        )
+    ),
 )
-"""The graph's tables; also the tail of a fresh store's schema (``store._SCHEMA_SQL``)."""
+"""The graph's tables; also the tail of a fresh store's schema (``store._SCHEMA_SQL``).
+``LINK_DDL`` is the part a store from before links gains on open (migration 15)."""
 
 
 @dataclass(frozen=True)
@@ -432,6 +461,78 @@ class GraphStore:
             (scope_hex, *ids),
         ).fetchall()
         return {r["node_id"] for r in rows}
+
+    # --- Links ---
+
+    def link(
+        self, node_id: NodeId, relation: str, target: NodeId, *, tenant: str | None = None
+    ) -> None:
+        """Record that *node_id* stands in *relation* to *target*; idempotent.
+
+        Both nodes must be in the tenant's scope. A link changes neither id: it is
+        what a node says about another after both exist.
+
+        Raises:
+            ValueError: a node is not in the store, or *relation* is not in the
+                domain charset.
+        """
+        canonical_domain(relation)
+        ids = {_checked_id(node_id), _checked_id(target)}
+        scope_hex = identity_scope(tenant).hex()
+        conn = self._connect()
+        try:
+            missing = ids - self._held(conn, scope_hex, ids)
+            if missing:
+                raise ValueError(f"node {sorted(missing)[0]} is not in the store")
+            conn.execute(
+                "INSERT INTO node_links (scope, node_id, relation, target_node_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (scope, node_id, relation, target_node_id) DO NOTHING",
+                (scope_hex, node_id, relation, target, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def links(
+        self, node_id: NodeId, relation: str | None = None, *, tenant: str | None = None
+    ) -> list[Link]:
+        """What *node_id* says about other nodes, oldest first; one relation or all."""
+        return self._links("node_id", node_id, relation, tenant)
+
+    def linked_from(
+        self, target: NodeId, relation: str | None = None, *, tenant: str | None = None
+    ) -> list[Link]:
+        """Every link that names *target*, oldest first: the complete nodes that say
+        they were ``reconstructed_from`` a historical one, say."""
+        return self._links("target_node_id", target, relation, tenant)
+
+    def _links(
+        self, column: str, node_id: NodeId, relation: str | None, tenant: str | None
+    ) -> list[Link]:
+        sql = (
+            "SELECT node_id, relation, target_node_id, created_at FROM node_links "
+            f"WHERE scope = ? AND {column} = ?"
+        )
+        params: tuple = (identity_scope(tenant).hex(), _checked_id(node_id))
+        if relation is not None:
+            sql += " AND relation = ?"
+            params += (relation,)
+        conn = self._connect()
+        try:
+            rows = conn.execute(sql + " ORDER BY created_at, node_id, target_node_id", params)
+            rows = rows.fetchall()
+        finally:
+            conn.close()
+        return [
+            Link(
+                node_id=r["node_id"],
+                relation=r["relation"],
+                target_node_id=r["target_node_id"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
 
     # --- Reading ---
 
