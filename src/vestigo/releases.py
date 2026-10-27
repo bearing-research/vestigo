@@ -307,7 +307,9 @@ class ReleaseStore:
 
         Fenced on the attempt's lease; ordered after every earlier release of the
         build's kind; refused while an output's bytes are not at their declared size.
-        A ``final`` release completes the build. Accepting an accepted release again
+        A ``final`` release completes the build; one with no outputs ends it without a
+        product (the build's placeholder row fails, nothing becomes current), which is
+        how a run that stores nothing finishes. Accepting an accepted release again
         returns it unchanged, so a caller whose response was lost can retry.
 
         Raises:
@@ -539,13 +541,18 @@ class ReleaseStore:
             conn.close()
         return None if row is None else _release_from_row(row)
 
-    def collectable_checkpoints(self, *, tenant: str | None = None) -> list[tuple[str, int]]:
+    def collectable_checkpoints(
+        self, *, tenant: str | None = None, keep: int = 1
+    ) -> list[tuple[str, int]]:
         """The checkpoint outputs nothing but a retention root may still need.
 
-        Every output of an accepted ``checkpoint`` release, except the newest accepted
-        checkpoint of each build still ``building`` (what a resume starts from). Roots
+        Every output of an accepted ``checkpoint`` release, except the newest *keep*
+        accepted checkpoints of each build still ``building`` (what a resume starts
+        from, and the ones before it a consumer keeps as its latest-k policy). Roots
         are the collector's to honor; this only says which rows are not current values.
         """
+        if keep < 1:
+            raise ValueError(f"keep {keep} is below 1")
         conn = self._connect()
         try:
             rows = conn.execute(
@@ -558,15 +565,15 @@ class ReleaseStore:
                   AND COALESCE(av.tenant, '') = COALESCE(?, '')
                   AND NOT (
                     b.state = 'building'
-                    AND r.sequence = (
-                      SELECT MAX(sequence) FROM build_releases
+                    AND (
+                      SELECT COUNT(*) FROM build_releases
                       WHERE build_id = r.build_id AND kind = 'checkpoint'
-                        AND state = 'accepted'
-                    )
+                        AND state = 'accepted' AND sequence > r.sequence
+                    ) < ?
                   )
                 ORDER BY av.id, av.version
                 """,
-                (tenant,),
+                (tenant, keep),
             ).fetchall()
         finally:
             conn.close()
