@@ -5,30 +5,35 @@ import json
 import sqlite3
 import threading
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
 from vestigo import uris
-from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES
+from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES, S3BlobStore
 from vestigo.build_store import BuildStore
 from vestigo.graph import NodeSpec
 from vestigo.provenance import (
     TransformSpec,
+    checkpoint_output_key,
     compute_provenance_hash,
     parse_transform_spec,
 )
+from vestigo.releases import ReleaseStore
 from vestigo.sql_backend import SqlDialect, SqliteDialect
 from vestigo.store import (
     _VERSION_FIELDS,
+    IMPORT_STAGING_TTL_SECONDS,
     ArtifactIdTaken,
     ArtifactImportConflict,
+    ArtifactImportInProgress,
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
     StagedVersion,
+    get_artifact_store,
     reset_artifact_store,
 )
 
@@ -777,9 +782,10 @@ class TestVersionPromotion:
         assert store.read_blob("art-1", promoted.version) == payload
         assert promoted.byte_size == len(payload)
 
-    def test_promotion_carries_requirements_minted_and_keys(self, store):
+    def test_promotion_carries_requirements_minted_and_computation(self, store):
         """A promoted folder manifest requires its files, or a sweep takes them from
-        under the current value; the copy stays minted and keeps its computation."""
+        under the current value; the copy stays minted and keeps its computation, but
+        names no release: the promote is not part of one (audit SL-3)."""
         store.create_artifact("file-1", "prov-f", minted=True)
         store.blob_store.write_blob("file-1", 1, b"file")
         store.finalize_artifact("file-1", 1, "{}", 1, 4)
@@ -798,7 +804,7 @@ class TestVersionPromotion:
 
         assert (promoted.version, promoted.release_id, promoted.computation_key) == (
             3,
-            "rel-1",
+            None,
             "comp-1",
         )
         conn = store._get_connection()
@@ -1011,15 +1017,23 @@ class TestRefreshSupersede:
         assert store.get_artifact("art-2", 1).state == "superseded"
         resolved = store.resolve_name("model")
         assert (resolved.id, resolved.version) == ("art-1", 1)
-        # A version superseded by a refresh of its own id was never diverted: still refused.
+        # A version a refresh of its own id superseded was finalized too: it comes back
+        # as it is, readable (audit SL-5).
         store.create_artifact("art-3", "prov-y")
         store.write_blob("art-3", 1, _ipc_bytes(10))
         store.finalize_artifact("art-3", 1, "{}", 10, 100)
         store.create_artifact("art-3", "prov-y")
         store.write_blob("art-3", 2, _ipc_bytes(10))
         store.finalize_artifact("art-3", 2, "{}", 10, 100)
+        retried = store.finalize_artifact("art-3", 1, "{}", 10, 100)
+        assert (retried.id, retried.version, retried.state) == ("art-3", 1, "superseded")
+        assert store.read_blob("art-3", 1) == _ipc_bytes(10)
+        assert store.get_artifact("art-3", 2).state == "ready"
+        # Only a failed version is refused.
+        store.create_artifact("art-4", "prov-z")
+        store.fail_artifact("art-4", 1)
         with pytest.raises(ValueError, match="not in building state"):
-            store.finalize_artifact("art-3", 1, "{}", 10, 100)
+            store.finalize_artifact("art-4", 1, "{}", 10, 100)
 
     def test_the_integrity_branch_returns_the_winner(self, store, monkeypatch):
         """The unique index rejects a second ready row the lookup missed: the loser is
@@ -2522,3 +2536,658 @@ class TestUriScheme:
         uris.set_uri_scheme(uris.DEFAULT_URI_SCHEME)
         assert store.list_name_reads() == []
         assert store.ancestor_transform_specs(store.get_artifact("top", 1), max_depth=10) == []
+
+
+# --- Audit 0.2.0, store lane ---------------------------------------------------------
+
+_OCTETS = TransformSpec(
+    executor="t@v1", params={"content_type": "application/octet-stream"}, inputs=[]
+)
+
+
+def _finished(store, artifact_id: str, provenance: str, data: bytes | None = None, **kwargs) -> int:
+    """A ready version holding *data* (one Arrow row by default)."""
+    version = store.create_artifact(artifact_id, provenance, **kwargs)
+    store.write_blob(artifact_id, version, _ipc_bytes(1) if data is None else data)
+    store.finalize_artifact(artifact_id, version, "{}", None, 10)
+    return version
+
+
+def _row(store, artifact_id: str, version: int):
+    conn = store._get_connection()
+    try:
+        return conn.execute(
+            "SELECT state, superseded_by, last_used_at FROM artifact_versions "
+            "WHERE id = ? AND version = ?",
+            (artifact_id, version),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _record(artifact_id: str, version: int, provenance: str, state: str = "ready", **kwargs):
+    return ArtifactVersion(
+        id=artifact_id,
+        version=version,
+        state=state,
+        provenance_hash=provenance,
+        transform_spec=_OCTETS.canonical_json,
+        created_at=1.0,
+        **kwargs,
+    )
+
+
+class _Racing:
+    """A store on each backend, and a competitor on its database that never waits."""
+
+    @pytest.fixture
+    def store(self, backend_store):
+        return backend_store
+
+    @pytest.fixture
+    def competitor(self, store):
+        competitor = _no_wait_store(store)
+        yield competitor
+        competitor.dialect.close()
+
+
+class TestDeleteAgainstADuplicateFinalize(_Racing):
+    """A duplicate's finalize and a delete of its canonical, in every order, leave the
+    duplicate reading bytes (audit SR-B)."""
+
+    def test_a_delete_waits_while_the_duplicate_points_at_the_canonical(
+        self, store, competitor, monkeypatch
+    ):
+        _finished(store, "c1", "dup")
+        version = store.create_artifact("p1", "dup")
+        store.write_blob("p1", version, _ipc_bytes(1))
+        refused = []
+        supersede = ArtifactStore._supersede_duplicate
+
+        def delete_meanwhile(self, conn, *args):
+            try:
+                competitor.delete_artifact("c1", 1)
+            except competitor.dialect.operational_error as exc:
+                refused.append(exc)
+            return supersede(self, conn, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_supersede_duplicate", delete_meanwhile)
+        overtaken = store.finalize_artifact("p1", version, "{}", None, 10)
+        monkeypatch.undo()
+
+        assert (overtaken.id, overtaken.version) == ("c1", 1)
+        assert len(refused) == 1, "the canonical was not locked"
+        assert store.delete_artifact("c1", 1)
+        assert store.read_blob("p1", version) == _ipc_bytes(1)
+        assert store.verify_artifacts() == []
+
+    def test_a_canonical_deleted_after_the_lookup_leaves_the_duplicate_ready(
+        self, store, competitor, monkeypatch
+    ):
+        _finished(store, "c1", "dup")
+        version = store.create_artifact("p1", "dup")
+        store.write_blob("p1", version, _ipc_bytes(1))
+        find = store.find_by_provenance
+
+        def found_then_deleted(*args, **kwargs):
+            found = find(*args, **kwargs)
+            if found is not None and found.id == "c1":
+                competitor.delete_artifact("c1", 1)
+            return found
+
+        monkeypatch.setattr(store, "find_by_provenance", found_then_deleted)
+        result = store.finalize_artifact("p1", version, "{}", None, 10)
+        monkeypatch.undo()
+
+        assert (result.id, result.version, result.state) == ("p1", version, "ready")
+        assert store.read_blob("p1", version) == _ipc_bytes(1)
+        assert store.verify_artifacts() == []
+
+    def test_a_pointer_landing_during_the_copies_gets_a_copy_too(
+        self, store, competitor, monkeypatch
+    ):
+        _finished(store, "c1", "dup")
+        _finished(store, "p1", "dup")
+        assert _row(store, "p1", 1)["superseded_by"] == "c1@v=1"
+        version = store.create_artifact("p2", "dup")
+        store.write_blob("p2", version, _ipc_bytes(1))
+        reclaim = ArtifactStore._reclaim_blob
+        landed = []
+
+        def land_another(self, *args):
+            if not landed:
+                landed.append(competitor.finalize_artifact("p2", version, "{}", None, 10))
+            return reclaim(self, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_reclaim_blob", land_another)
+        assert store.delete_artifact("c1", 1)
+        monkeypatch.undo()
+
+        assert landed[0].id == "c1"
+        assert store.read_blob("p1", 1) == _ipc_bytes(1)
+        assert store.read_blob("p2", version) == _ipc_bytes(1)
+        assert store.verify_artifacts() == []
+
+
+class TestTheGapRuleMidSweep(_Racing):
+    """A name or a use landing on a lower version during a sweep keeps the id's top
+    version too, so no version number is reused (audit SR-A)."""
+
+    @pytest.mark.parametrize("landing", ["name", "read"])
+    def test_the_top_version_stays_with_the_lower_one(
+        self, store, competitor, monkeypatch, landing
+    ):
+        _finished(store, "x", "prov-1")
+        _finished(store, "x", "prov-2")
+        _idle_everything(store)
+        gaps = ArtifactStore._without_version_gaps
+        landed = []
+
+        def land(conn, chosen):
+            if not landed:
+                landed.append(True)
+                if landing == "name":
+                    competitor.set_name("keep", "x", 1)
+                else:
+                    competitor.read_blob("x", 1)
+            return gaps(conn, chosen)
+
+        monkeypatch.setattr(ArtifactStore, "_without_version_gaps", staticmethod(land))
+        result = store.garbage_collect(max_idle_days=30, collect_latest=True)
+        monkeypatch.undo()
+
+        assert landed and result["deleted_count"] == 0
+        assert store.get_artifact("x", 2) is not None
+        assert store.create_artifact("x", "prov-3") == 3
+
+
+class TestAHoldAfterTheClaim(_Racing):
+    """A pin or a publication reaching a version the sweep claimed is refused, not
+    deleted with it (audit SR-E)."""
+
+    @pytest.mark.parametrize("hold", ["retain", "publish"])
+    def test_the_hold_is_refused_while_the_claim_holds_the_row(self, store, competitor, hold):
+        _finished(store, "gone", "prov-gone")
+        _idle_everything(store)
+        children = store._delete_version_children
+        refused = []
+
+        def hold_meanwhile(conn, artifact_id, version):
+            try:
+                if hold == "retain":
+                    competitor.retain(artifact_id, version, kind="pin", holder="review")
+                else:
+                    competitor.publish_artifact(artifact_id, version)
+            except competitor.dialect.operational_error as exc:
+                refused.append(exc)
+            children(conn, artifact_id, version)
+
+        store._delete_version_children = hold_meanwhile
+        result = store.garbage_collect(max_idle_days=0, collect_latest=True)
+
+        assert result["deleted_count"] == 1
+        assert len(refused) == 1, "the hold landed on a claimed version"
+        assert store.retention_roots() == []
+        assert store.list_publications(include_revoked=True) == []
+
+
+_POINTER_WRITERS = {
+    "alias": lambda s: s.set_alias("m", "champion", "d", 1),
+    "tag": lambda s: s.set_tag("d", 1, "stage", "prod"),
+    "request": lambda s: s.request_alias_change("m", "champion", "set", artifact_id="d", version=1),
+    "name": lambda s: s.set_name("n", "d", 1),
+}
+
+
+class TestPointersLockTheirTarget(_Racing):
+    """A delete between a pointer's state check and its write waits, so no pointer
+    dangles (audit SL-4)."""
+
+    @pytest.mark.parametrize("writer", sorted(_POINTER_WRITERS))
+    def test_a_delete_in_between_is_refused(self, store, competitor, monkeypatch, writer):
+        _finished(store, "d", "prov-d")
+        audit = ArtifactStore._audit_in_connection
+        outcome = []
+
+        def delete_meanwhile(self, conn, **kwargs):
+            if not outcome:
+                try:
+                    outcome.append(competitor.delete_artifact("d", 1))
+                except competitor.dialect.operational_error as exc:
+                    outcome.append(exc)
+            return audit(self, conn, **kwargs)
+
+        monkeypatch.setattr(ArtifactStore, "_audit_in_connection", delete_meanwhile)
+        _POINTER_WRITERS[writer](store)
+        monkeypatch.undo()
+
+        assert isinstance(outcome[0], competitor.dialect.operational_error), outcome
+        assert store.get_artifact("d", 1) is not None
+
+    def test_a_name_on_a_version_gone_after_the_lock_is_not_found(self, store, monkeypatch):
+        """The names foreign key has the last word; it reads as the writers' error."""
+        monkeypatch.setattr(
+            ArtifactStore,
+            "_lock_target",
+            lambda self, conn, *args, **kwargs: {"state": "ready", "tenant": ""},
+        )
+
+        with pytest.raises(ArtifactNotFoundError):
+            store.set_name("n", "nowhere", 1)
+
+
+class TestASameIdRaceIsARefresh:
+    """Two builds of one id and computation racing: the newer wins, as a refresh does
+    (audit SL-6)."""
+
+    def test_the_newer_version_wins_the_integrity_branch(self, backend_store, monkeypatch):
+        store = backend_store
+        v1 = store.create_artifact("a", "prov-4")
+        v2 = store.create_artifact("a", "prov-4")
+        store.write_blob("a", v1, _ipc_bytes(1))
+        store.write_blob("a", v2, _ipc_bytes(2))
+        store.finalize_artifact("a", v1, "{}", None, 10)
+        find = store.find_by_provenance
+        calls = []
+
+        def stale_once(*args, **kwargs):
+            calls.append(True)
+            return None if len(calls) == 1 else find(*args, **kwargs)
+
+        monkeypatch.setattr(store, "find_by_provenance", stale_once)
+        result = store.finalize_artifact("a", v2, "{}", None, 10)
+        monkeypatch.undo()
+
+        assert len(calls) == 2
+        assert (result.version, result.state) == (v2, "ready")
+        older = _row(store, "a", v1)
+        assert (older["state"], older["superseded_by"]) == ("superseded", None)
+        assert store.read_blob("a", v2) == _ipc_bytes(2)
+        assert store.find_by_provenance("prov-4").version == v2
+
+
+class TestCleanupFailedSparesAHold:
+    def test_a_held_failed_version_stays_until_released(self, backend_store):
+        """A hold is a promise someone was given (audit SR-C)."""
+        store = backend_store
+        version = store.create_artifact("b", "prov-b")
+        store.retain("b", version, kind="pin", holder="review")
+        store.fail_artifact("b", version)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("b", version).state == "failed"
+        assert len(store.retention_roots("b", version)) == 1
+        assert store.release("b", version, kind="pin", holder="review")
+        assert store.cleanup_failed(max_age_seconds=-10) == 1
+
+
+class TestRootsAreEachTenants:
+    def test_two_tenants_hold_one_shared_version_under_one_holder(self, backend_store):
+        """Each tenant lists and releases its own root (audit SR-D)."""
+        store = backend_store
+        version = _finished(store, "shared", "prov-shared")
+
+        store.retain("shared", version, kind="pin", holder="review", tenant="a")
+        claimed = store.retain("shared", version, kind="pin", holder="review", tenant="b")
+
+        assert claimed["tenant"] == "b"
+        assert [r["tenant"] for r in store.retention_roots("shared", version, tenant="b")] == ["b"]
+        assert store.release("shared", version, kind="pin", holder="review", tenant="b")
+        assert [r["tenant"] for r in store.retention_roots("shared", version)] == ["a"]
+
+
+class TestImportOverALocalFailure:
+    """A result arriving for a version that failed here fills it in (audit SL-1)."""
+
+    def test_a_result_fills_a_failed_row_in(self, backend_store):
+        store = backend_store
+        version = store.create_artifact("cell-out", "prov-1", _OCTETS)
+        store.write_blob("cell-out", version, b"partial")
+        store.fail_artifact("cell-out", version)
+
+        landed = store.import_artifact(_record("cell-out", version, "prov-1"), b"good bytes")
+
+        assert (landed.version, landed.written) == (version, True)
+        assert store.get_artifact("cell-out", version).state == "ready"
+        assert store.find_by_provenance("prov-1").version == version
+        assert store.read_blob("cell-out", version) == b"good bytes"
+        assert not store.blob_store.blob_exists("cell-out", version), "the failed run's bytes"
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.read_blob("cell-out", version) == b"good bytes"
+        assert store.verify_artifacts() == []
+
+    def test_a_build_in_progress_is_a_conflict_to_retry(self, backend_store):
+        store = backend_store
+        version = store.create_artifact("cell-out", "prov-1", _OCTETS)
+
+        with pytest.raises(ArtifactImportInProgress):
+            store.import_artifact(_record("cell-out", version, "prov-1"), b"good bytes")
+
+        assert store.get_artifact("cell-out", version).state == "building"
+        assert not store.blob_exists("cell-out", version)
+
+    def test_a_failed_record_leaves_a_failed_row_as_it_is(self, backend_store):
+        store = backend_store
+        version = store.create_artifact("cell-out", "prov-1", _OCTETS)
+        store.fail_artifact("cell-out", version)
+
+        landed = store.import_artifact(_record("cell-out", version, "prov-1", "failed"), None)
+
+        assert not landed.written
+        assert store.get_artifact("cell-out", version).state == "failed"
+
+
+class TestImportWithoutBytes:
+    """A result without bytes would be served as a cache hit (audit SL-2)."""
+
+    def test_a_result_without_bytes_is_refused(self, backend_store):
+        store = backend_store
+        with pytest.raises(ValueError, match="carries no bytes"):
+            store.import_artifact(_record("ghost", 1, "prov-g"), None)
+
+        assert store.get_artifact("ghost", 1) is None
+        assert store.find_by_provenance("prov-g") is None
+
+    def test_a_result_already_here_needs_none(self, backend_store):
+        store = backend_store
+        version = _finished(store, "here", "prov-h", b"x", transform_spec=_OCTETS)
+
+        landed = store.import_artifact(_record("here", version, "prov-h"), None)
+
+        assert (landed.id, landed.version, landed.written) == ("here", version, False)
+
+    def test_a_row_here_without_bytes_is_refused_too(self, backend_store):
+        store = backend_store
+        version = store.create_artifact("hollow", "prov-x", _OCTETS)
+        store.finalize_artifact("hollow", version, "{}", None, 0)
+
+        with pytest.raises(ValueError, match="has none either"):
+            store.import_artifact(_record("hollow", version, "prov-x"), None)
+
+    def test_a_failed_record_needs_none(self, backend_store):
+        store = backend_store
+
+        landed = store.import_artifact(_record("bad", 1, "prov-b", "failed"), None)
+
+        assert landed.written
+        assert store.get_artifact("bad", 1).state == "failed"
+
+
+class TestImportChecksWhatItStores:
+    """Only the import path writes a state and ``input_versions`` as given (audit SL-8)."""
+
+    @pytest.mark.parametrize("state", ["bogus", "building"])
+    def test_a_state_no_stored_version_arrives_in_is_refused(self, store, state):
+        with pytest.raises(ValueError, match="cannot import a version in state"):
+            store.import_artifact(_record("s", 1, "prov-s", state), b"b")
+
+        assert store.get_artifact("s", 1) is None
+
+    @pytest.mark.parametrize("text", ["not json", "[1, 2]", "NaN"])
+    def test_input_versions_must_be_a_json_object(self, store, text):
+        with pytest.raises(ValueError, match="input_versions"):
+            store.import_artifact(_record("bad", 1, "prov-b", input_versions=text), b"b")
+
+        assert store.list_name_reads() == []
+
+    def test_input_versions_are_stored_as_the_store_writes_them(self, store):
+        store.import_artifact(_record("ok", 1, "prov-o", input_versions='{ "a" : "b@v=1" }'), b"b")
+
+        assert store.get_artifact("ok", 1).input_versions == json.dumps({"a": "b@v=1"})
+
+
+class TestPromotionIsNotARelease:
+    def test_a_promoted_checkpoint_output_is_neither_output_nor_collectable(self, store):
+        """The promote is no part of the release its source came from (audit SL-3)."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        parent = hashlib.sha256(b"train").hexdigest()
+        target = store.create_artifact(
+            "final-b1", f"{parent}-final", _OCTETS, computation_key=parent, minted=True
+        )
+        builds.create_build("b1", "final-b1", target, executor_ref="train@v1")
+        assert builds.open_attempt("b1", "a1", writable_until=4e9, lease_owner="r1")
+        bundles = []
+        for _ in range(2):
+            release = releases.prepare("b1", "a1", "checkpoint")
+            artifact_id = f"model-{release.sequence}"
+            data = b"weights" + bytes([release.sequence])
+            version = store.create_artifact(
+                artifact_id,
+                checkpoint_output_key(parent, "b1", release.sequence, "model"),
+                _OCTETS,
+                computation_key=parent,
+                minted=True,
+                release_id=release.release_id,
+            )
+            store.write_blob(artifact_id, version, data)
+            staged = StagedVersion(
+                artifact_id, version, "{}", None, len(data), hashlib.sha256(data).hexdigest()
+            )
+            bundles.append(releases.accept(release.release_id, [staged], []))
+
+        promoted = store.promote_version("model-1", 1)
+
+        assert (promoted.version, promoted.release_id) == (2, None)
+        first = bundles[0].release.release_id
+        assert [(o.id, o.version) for o in releases.bundle(first).outputs] == [("model-1", 1)]
+        assert ("model-1", 2) not in releases.collectable_checkpoints(keep=1)
+
+
+class TestAReadThroughAPointer:
+    def test_both_uses_are_noted_after_every_read(self, store):
+        """The note turns SQLite's busy handler off for what follows (audit SL-9)."""
+        _finished(store, "c1", "dup")
+        _finished(store, "p1", "dup")
+        _idle_everything(store)
+        statements: list[str] = []
+        connect = store._get_connection
+
+        def traced():
+            conn = connect()
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        store._get_connection = traced
+        assert store.read_blob("p1", 1) == _ipc_bytes(1)
+
+        after = statements[statements.index("PRAGMA busy_timeout = 0") + 1 :]
+        assert after and not any(s.lstrip().upper().startswith("SELECT") for s in after), after
+        assert _row(store, "p1", 1)["last_used_at"] > 0
+        assert _row(store, "c1", 1)["last_used_at"] > 0
+
+
+class TestAnObjectStoreStagesBesideTheLedger:
+    """A remote store's streamed writes stage under the artifact dir, where the sweep looks."""
+
+    def test_an_unset_staging_dir_is_the_artifact_dirs(self, tmp_path):
+        blobs = S3BlobStore(bucket="b", anonymous=True)
+        ArtifactStore(tmp_path, blob_store=blobs)
+        assert blobs.staging_dir == tmp_path / "staging"
+
+    def test_a_given_staging_dir_is_kept(self, tmp_path):
+        blobs = S3BlobStore(bucket="b", anonymous=True, staging_dir=tmp_path / "elsewhere")
+        ArtifactStore(tmp_path, blob_store=blobs)
+        assert blobs.staging_dir == tmp_path / "elsewhere"
+
+
+class TestTheStoreSingleton:
+    """One store per process, and a reset releases it (audit SL-10)."""
+
+    def test_another_directory_is_refused(self, tmp_path):
+        first = get_artifact_store(tmp_path / "a")
+
+        assert get_artifact_store(tmp_path / "a") is first
+        with pytest.raises(ValueError, match="singleton is open at"):
+            get_artifact_store(tmp_path / "b")
+        assert get_artifact_store() is first
+
+    def test_a_reset_closes_the_store(self, tmp_path, monkeypatch):
+        held = get_artifact_store(tmp_path / "a")
+        closed = []
+        monkeypatch.setattr(held, "close", lambda: closed.append(True))
+
+        reset_artifact_store()
+
+        assert closed == [True]
+        assert get_artifact_store() is None
+
+
+class TestTenantScopedLifecycleWrites:
+    """Another tenant's version reads as missing to these writers (audit SL-11)."""
+
+    @pytest.mark.parametrize("call", ["fail_artifact", "retire_ready", "record_use"])
+    def test_another_tenants_version_is_not_found(self, store, call):
+        if call == "fail_artifact":
+            version = store.create_artifact("theirs", "prov-t", tenant="b")
+        else:
+            version = _finished(store, "theirs", "prov-t", tenant="b")
+        _idle_everything(store)
+        before = tuple(_row(store, "theirs", version))
+        act = getattr(store, call)
+
+        with pytest.raises(ArtifactNotFoundError):
+            act("theirs", version, tenant="a")
+        with pytest.raises(ArtifactNotFoundError):
+            act("missing", 1, tenant="b")
+
+        assert tuple(_row(store, "theirs", version)) == before
+        act("theirs", version, tenant="b")
+        assert tuple(_row(store, "theirs", version)) != before
+
+
+class TestVerifyStreams:
+    def test_a_blob_no_validator_reads_is_hashed_as_a_stream(self, store, monkeypatch):
+        """Read whole, a large blob is a large allocation per version (audit SR-G)."""
+        version = _finished(store, "plain", "prov-p", b"plain" * 10_000, transform_spec=_OCTETS)
+
+        def whole(*args, **kwargs):
+            raise AssertionError("read whole")
+
+        monkeypatch.setattr(store.blob_store, "read_blob", whole)
+
+        assert store.verify_artifacts() == []
+        store.blob_store.write_blob("plain", version, b"changed")
+        assert [f["problem"] for f in store.verify_artifacts()] == ["digest_mismatch"]
+
+    def test_a_spec_that_does_not_parse_does_not_end_the_check(self, store):
+        """An imported spec is stored verbatim, and NaN is not JSON (audit G-1)."""
+        nan_spec = '{"executor": "x@v1", "inputs": [], "params": {"w": NaN}}'
+        odd = replace(_record("odd", 1, "prov-odd"), transform_spec=nan_spec)
+        store.import_artifact(odd, _ipc_bytes(2))
+        store.create_artifact("ghost", "prov-ghost")
+        store.finalize_artifact("ghost", 1, "{}", None, 10)
+
+        findings = store.verify_artifacts()
+
+        assert [(f["artifact_id"], f["problem"]) for f in findings] == [("ghost", "missing_blob")]
+
+
+class TestUnaddressableIds:
+    """An id no artifact URI can name has no lineage (audit G-5)."""
+
+    @pytest.mark.parametrize("artifact_id", ["", "a@b"])
+    def test_create_refuses_it(self, store, artifact_id):
+        with pytest.raises(ValueError):
+            store.create_artifact(artifact_id, "prov")
+
+        assert store.stats()["total_versions"] == 0
+
+    @pytest.mark.parametrize("artifact_id", ["", "a@b"])
+    def test_import_refuses_it(self, store, artifact_id):
+        with pytest.raises(ValueError):
+            store.import_artifact(_record(artifact_id, 1, "prov"), b"b")
+
+        assert store.stats()["total_versions"] == 0
+
+
+class TestSetDefinitionsCount:
+    def test_the_count_is_of_the_versions_recorded(self, store):
+        """A pair skipped (missing, or already set) is not counted (audit G-9)."""
+        node = store.graph.put_batch([NodeSpec("test/cell", b"x")])[0]
+        store.create_artifact("out", "prov-1")
+
+        assert store.set_definitions({("out", 1): node, ("missing", 1): node}) == 1
+        assert store.set_definitions({("out", 1): node}) == 0
+
+
+class TestADeletedBuildsChildren:
+    def test_its_console_goes_and_its_attempts_stay_for_the_attempt_sweep(
+        self, backend_store, tmp_path
+    ):
+        """An attempt row is the only record of bytes an unpromoted attempt wrote (BR-5)."""
+        store = backend_store
+        builds = BuildStore(tmp_path / "builds.sqlite", dialect=store.dialect)
+        version = store.create_artifact("built", "prov-built")
+        builds.create_build("build-1", "built", version, "exec@v1")
+        assert builds.start_build("build-1")
+        assert builds.append_console_chunk("build-1", "stdout", 0, "hello")
+        builds.record_attempt("build-1", "built", version, "att-1", writable_until=0)
+
+        assert store.delete_artifact("built", version)
+
+        assert builds.get_build("build-1") is None
+        conn = store._get_connection()
+        try:
+            chunks = conn.execute(
+                "SELECT COUNT(*) AS n FROM build_console_chunks WHERE build_id = 'build-1'"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+        assert chunks == 0
+        assert [a[:4] for a in builds.settled_attempts()] == [
+            ("build-1", "built", version, "att-1")
+        ]
+
+
+class TestPublicCallablesTheSuiteMissed:
+    """Callables nothing else in the suite runs (audit TP-3)."""
+
+    def test_staging_drops_this_tenants_stale_stagings_only(self, store, tmp_path):
+        def stage(tenant, data, now):
+            source = tmp_path / f"{tenant}-{data.decode()}"
+            source.write_bytes(data)
+            digest = hashlib.sha256(data).hexdigest()
+            store.stage_import_blob(tenant, digest, source, len(data), now=now)
+            return digest
+
+        old = stage("t", b"old", 1000.0)
+        theirs = stage("u", b"theirs", 1000.0)
+        new = stage("t", b"new", 1000.0 + IMPORT_STAGING_TTL_SECONDS + 1)
+
+        assert store.open_staged_import("t", old) is None
+        with store.open_staged_import("t", new) as reader:
+            assert reader.read() == b"new"
+        with store.open_staged_import("u", theirs) as reader:
+            assert reader.read() == b"theirs"
+        assert store.open_staged_import("t", theirs) is None
+
+    def test_a_prepared_file_is_published_as_the_blob(self, store, tmp_path):
+        version = store.create_artifact("filed", "prov-f")
+        source = tmp_path / "prepared"
+        source.write_bytes(_ipc_bytes(3))
+
+        store.publish_blob_from_path("filed", version, source)
+
+        assert store.read_blob("filed", version) == _ipc_bytes(3)
+
+    def test_a_revoked_publication_lets_the_version_go(self, store):
+        version = _finished(store, "pub", "prov-pub")
+        publication = store.publish_artifact("pub", version)
+        with pytest.raises(ValueError, match="is published"):
+            store.delete_artifact("pub", version)
+
+        assert store.revoke_publication(publication.token)
+        assert not store.revoke_publication(publication.token)
+        assert store.list_publications() == []
+        assert store.delete_artifact("pub", version)
+
+    def test_tag_and_name_lookups_by_version(self, store):
+        version = _finished(store, "tagged", "prov-tag")
+        store.set_tag("tagged", version, "stage", "prod")
+        store.set_name("best", "tagged", version)
+
+        assert store.list_artifacts_with_tag_key("stage") == [("tagged", version, "prod")]
+        assert store.list_artifacts_with_tag_key("other") == []
+        assert store.get_name_for_artifact("tagged", version) == "best"
+        assert store.get_name_for_artifact("tagged", version + 1) is None

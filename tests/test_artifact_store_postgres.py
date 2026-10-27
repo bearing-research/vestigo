@@ -611,7 +611,7 @@ class TestGarbageCollection:
         assert (held["state"], held["superseded_by"]) == ("superseded", "a1@v=1")
 
     @pytest.mark.parametrize("raced", [1, 2])
-    def test_a_name_landing_mid_sweep_skips_only_that_version(self, store, raced):
+    def test_a_name_landing_mid_sweep_skips_only_that_version(self, store, postgres_dsn, raced):
         """A failed DELETE aborts a Postgres transaction; without a savepoint the closing commit
         rolled back every row while their blobs were still deleted.
         """
@@ -624,11 +624,15 @@ class TestGarbageCollection:
         children = store._delete_version_children
 
         def name_lands(conn, artifact_id, version):
-            # Its own thread, so its own pooled connection; the claim does not block a name.
+            # A raw insert: its foreign-key check does not wait on the claim, while
+            # ``set_name`` takes the row FOR SHARE and would wait behind it.
             if artifact_id == ids[raced]:
-                setter = threading.Thread(target=store.set_name, args=("raced", artifact_id, 1))
-                setter.start()
-                setter.join()
+                with psycopg.connect(postgres_dsn) as other:
+                    other.execute(
+                        "INSERT INTO artifact_names (name, artifact_id, version, updated_at, "
+                        "tenant) VALUES ('raced', %s, 1, 0, '')",
+                        (artifact_id,),
+                    )
             children(conn, artifact_id, version)
 
         store._delete_version_children = name_lands
@@ -1786,3 +1790,122 @@ class TestPromotionOnPostgres:
         finally:
             conn.close()
         assert [e["from_version"] for e in edges] == [1, 3]
+
+
+def _idle_ready(store, artifact_id: str, provenance: str) -> int:
+    """A ready version last used long ago."""
+    version = store.create_artifact(artifact_id, provenance, _spec(), minted=True)
+    store.write_blob(artifact_id, version, b"bytes")
+    store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=5)
+    conn = store._get_connection()
+    try:
+        conn.execute(
+            "UPDATE artifact_versions SET created_at = 0, last_used_at = 0 WHERE id = ?",
+            (artifact_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return version
+
+
+class TestANoteNeverWaits:
+    def test_a_lookup_and_a_read_skip_the_note_on_a_row_another_holds(
+        self, store, postgres_dsn, caplog
+    ):
+        """A sweep or a slow writer on the row must not stall a read (audit SL-7)."""
+        version = _idle_ready(store, "hot", "prov-hot")
+        connect = store._get_connection
+
+        def without_waiting():
+            conn = connect()
+            conn.execute("SET lock_timeout = '1ms'")
+            return conn
+
+        store._get_connection = without_waiting
+        with psycopg.connect(postgres_dsn) as holder:
+            holder.execute("SELECT 1 FROM artifact_versions WHERE id = 'hot' FOR UPDATE")
+            with caplog.at_level(logging.DEBUG, logger="vestigo.store"):
+                found = store.find_by_provenance("prov-hot")
+                data = store.read_blob("hot", version)
+
+        assert (found.id, data) == ("hot", b"bytes")
+        assert "Could not note a use" not in caplog.text, "the note waited for the lock"
+        conn = store._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT last_used_at FROM artifact_versions WHERE id = 'hot'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["last_used_at"] == 0
+
+
+class TestAHoldDuringTheClaimsWait:
+    def test_a_root_committed_after_the_claims_snapshot_keeps_the_version(
+        self, store, postgres_dsn, monkeypatch
+    ):
+        """The claim read the holds before it waited for the row (audit SR-E)."""
+        version = _idle_ready(store, "held", "prov-held")
+        held_now = ArtifactStore._held_now
+
+        def root_committed_meanwhile(conn, artifact_id, held_version):
+            with psycopg.connect(postgres_dsn) as other:
+                other.execute(
+                    "INSERT INTO retention_roots (tenant, kind, holder, artifact_id, version, "
+                    "created_at) VALUES ('', 'pin', 'review', %s, %s, 0)",
+                    (artifact_id, held_version),
+                )
+            return held_now(conn, artifact_id, held_version)
+
+        monkeypatch.setattr(ArtifactStore, "_held_now", staticmethod(root_committed_meanwhile))
+        result = store.garbage_collect(max_idle_days=0, collect_latest=True)
+        monkeypatch.undo()
+
+        assert result["deleted_count"] == 0
+        assert store.read_blob("held", version) == b"bytes"
+        assert len(store.retention_roots("held", version)) == 1
+
+
+class TestRootsKeyedByTenantMigration:
+    def test_the_migration_rekeys_the_constraint_and_keeps_the_rows(
+        self, store, postgres_dsn, tmp_path
+    ):
+        """(audit SR-D) The SQLite half is in ``test_schema_migrations.py``."""
+        version = _idle_ready(store, "shared", "prov-shared")
+        store.retain("shared", version, kind="pin", holder="review", tenant="a")
+        conn = store._get_connection()
+        try:
+            conn.execute("ALTER TABLE retention_roots DROP CONSTRAINT retention_roots_pkey")
+            conn.execute(
+                "ALTER TABLE retention_roots ADD PRIMARY KEY (kind, holder, artifact_id, version)"
+            )
+            conn.execute("DELETE FROM schema_version")
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (16, 0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "again", dialect=PostgresDialect(postgres_dsn))
+        try:
+            conn = reopened._get_connection()
+            try:
+                key = [
+                    row["attname"]
+                    for row in conn.execute(
+                        "SELECT a.attname FROM pg_index i "
+                        "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true "
+                        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                        "WHERE i.indrelid = 'retention_roots'::regclass AND i.indisprimary "
+                        "ORDER BY k.n"
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+            assert key == ["tenant", "kind", "holder", "artifact_id", "version"]
+            assert [r["tenant"] for r in reopened.retention_roots("shared", version)] == ["a"]
+            reopened.retain("shared", version, kind="pin", holder="review", tenant="b")
+            tenants = sorted(r["tenant"] for r in reopened.retention_roots("shared", version))
+            assert tenants == ["a", "b"]
+        finally:
+            reopened.close()

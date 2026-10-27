@@ -4,9 +4,12 @@
 each table's primary key, so a row-by-row copy is idempotent. A consumer adds
 its own tables after these when it migrates a store.
 
-Three tables are deliberately absent: ``schema_version`` is created by the
-target store itself, and ``import_staging`` and ``build_console_chunks`` hold
-only live rows that do not outlive the process that wrote them.
+Three tables are deliberately absent. ``schema_version`` is created by the
+target store itself. ``build_console_chunks`` holds only live rows that do not
+outlive the process that wrote them. ``import_staging`` rows live up to
+``IMPORT_STAGING_TTL_SECONDS`` (a day) and name bytes already in the source's
+blob store: a copy taken while an import is in flight leaves that upload
+unreachable in the target, where the importer must stage it again.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ LEDGER_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("registry_audit", ("seq",)),
     ("registry_pending", ("tenant", "name", "alias")),
     ("artifact_publications", ("token",)),
-    ("retention_roots", ("kind", "holder", "artifact_id", "version")),
+    ("retention_roots", ("tenant", "kind", "holder", "artifact_id", "version")),
     ("retention_edges", ("from_artifact_id", "from_version", "to_artifact_id", "to_version")),
     ("store_upgrades", ("name",)),
     ("nodes", ("scope", "node_id")),
