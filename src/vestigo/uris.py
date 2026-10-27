@@ -29,10 +29,10 @@ LATEST_VERSION = -1
 
 def _patterns(scheme: str) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
     prefix = re.escape(scheme) + "://"
-    # ``@`` cannot appear in an id, so ``[^@]+`` cleanly stops before ``@v=``.
+    # An id may hold ``@`` (``x@iter=3``) but never ``@v=``, so the last ``@v=`` ends it.
     return (
-        re.compile(rf"^{prefix}artifact/([^@]+)@v=(\d+)$"),
-        re.compile(rf"^{prefix}artifact/([^@]+)$"),
+        re.compile(rf"^{prefix}artifact/(.+)@v=(\d+)$"),
+        re.compile(rf"^{prefix}artifact/((?:(?!@v=).)+)$"),
         re.compile(rf"^{prefix}name/(.+)$"),
     )
 
@@ -66,12 +66,12 @@ def artifact_uri(artifact_id: str, version: int) -> str:
     """The pinned URI of one version; :func:`parse_artifact_uri` reads it back.
 
     Raises:
-        ValueError: *artifact_id* is empty or holds ``@``, which would end the id
+        ValueError: *artifact_id* is empty or holds ``@v=``, which would end the id
             early on the way back; or *version* is negative: ``LATEST_VERSION`` is a
             parse result, not a version, and the unpinned form has no ``@v=``.
     """
-    if not artifact_id or "@" in artifact_id:
-        raise ValueError(f"artifact id {artifact_id!r} is empty or holds '@'")
+    if not artifact_id or "@v=" in artifact_id:
+        raise ValueError(f"artifact id {artifact_id!r} is empty or holds '@v='")
     if version < 0:
         raise ValueError(f"version {version} is not a pinned version")
     return f"{_scheme}://artifact/{artifact_id}@v={version}"

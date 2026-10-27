@@ -3086,19 +3086,30 @@ class TestVerifyStreams:
 class TestUnaddressableIds:
     """An id no artifact URI can name has no lineage (audit G-5)."""
 
-    @pytest.mark.parametrize("artifact_id", ["", "a@b"])
+    @pytest.mark.parametrize("artifact_id", ["", "a@v=1"])
     def test_create_refuses_it(self, store, artifact_id):
         with pytest.raises(ValueError):
             store.create_artifact(artifact_id, "prov")
 
         assert store.stats()["total_versions"] == 0
 
-    @pytest.mark.parametrize("artifact_id", ["", "a@b"])
+    @pytest.mark.parametrize("artifact_id", ["", "a@v=1"])
     def test_import_refuses_it(self, store, artifact_id):
         with pytest.raises(ValueError):
             store.import_artifact(_record(artifact_id, 1, "prov"), b"b")
 
         assert store.stats()["total_versions"] == 0
+
+    def test_an_id_holding_another_at_is_a_consumers(self, store):
+        """A loop step or a fan-out variant is ``<id>@iter=3``; its edges still resolve."""
+        version = store.create_artifact("x@iter=3", "prov")
+
+        assert store.get_artifact("x@iter=3", version) is not None
+        uri = uris.artifact_uri("x@iter=3", version)
+        assert uris.parse_artifact_uri(uri) == ("x@iter=3", version)
+        assert store.import_artifact(_record("y@variant=a", 1, "other"), b"b").ref == (
+            "y@variant=a@v=1"
+        )
 
 
 class TestSetDefinitionsCount:
