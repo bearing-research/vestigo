@@ -5,15 +5,18 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
-### Fixed
-
-- The PostgreSQL row shim accepts a slice, as `sqlite3.Row` does (#9).
-
 ### Changed
 
+- One column list and one row mapper build every `ArtifactVersion` the store
+  reads; a new column is one entry in `_VERSION_FIELDS` and one dataclass
+  field, pinned equal by a test (#10, friction log 1).
 - `versions_lacking_definition` documents that it lists every tenant's
   versions, the read of a store-wide upgrade, with each version's tenant for
   the `set_definitions` call that follows; a test pins it (#9).
+
+### Fixed
+
+- The PostgreSQL row shim accepts a slice, as `sqlite3.Row` does (#9).
 
 ## 0.1.0 - 2026-10-26
 

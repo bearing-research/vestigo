@@ -192,25 +192,31 @@ class ArtifactVersion:
         return spec.params if spec is not None else {}
 
 
+_VERSION_FIELDS = (
+    "id",
+    "version",
+    "state",
+    "provenance_hash",
+    "schema_json",
+    "row_count",
+    "byte_size",
+    "created_at",
+    "transform_spec",
+    "input_versions",
+    "tenant",
+    "principal",
+    "content_sha256",
+    "release_id",
+    "computation_key",
+)
+# The SELECT list of an ArtifactVersion; a new column is added here and in the dataclass.
+_VERSION_COLUMNS = ", ".join(_VERSION_FIELDS)
+_VERSION_COLUMNS_AV = ", ".join("av." + field for field in _VERSION_FIELDS)
+
+
 def _version_from_row(row: Any) -> ArtifactVersion:
-    """An ``ArtifactVersion`` from a row holding its thirteen columns, by name."""
-    return ArtifactVersion(
-        id=row["id"],
-        version=row["version"],
-        state=row["state"],
-        provenance_hash=row["provenance_hash"],
-        schema_json=row["schema_json"],
-        row_count=row["row_count"],
-        byte_size=row["byte_size"],
-        created_at=row["created_at"],
-        transform_spec=row["transform_spec"],
-        input_versions=row["input_versions"],
-        tenant=row["tenant"],
-        principal=row["principal"],
-        content_sha256=row["content_sha256"],
-        release_id=row["release_id"],
-        computation_key=row["computation_key"],
-    )
+    """An ``ArtifactVersion`` from a row holding ``_VERSION_FIELDS``, by name."""
+    return ArtifactVersion(**{field: row[field] for field in _VERSION_FIELDS})
 
 
 @dataclass(frozen=True)
@@ -1445,11 +1451,8 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
-            sql = """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+            sql = f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE definition_id IS NULL AND transform_spec IS NOT NULL
                   AND state IN ('ready', 'superseded')
@@ -1526,11 +1529,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE transform_spec LIKE ? ESCAPE '\\'
                   AND state IN ('ready', 'superseded')
@@ -1957,11 +1957,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE id = ? AND provenance_hash = ? AND tenant = ?
                   AND state IN ('ready', 'superseded')
@@ -1973,23 +1970,7 @@ class ArtifactStore:
             row = cursor.fetchone()
             if row is None:
                 return None
-            return ArtifactVersion(
-                id=row["id"],
-                version=row["version"],
-                state=row["state"],
-                provenance_hash=row["provenance_hash"],
-                schema_json=row["schema_json"],
-                row_count=row["row_count"],
-                byte_size=row["byte_size"],
-                created_at=row["created_at"],
-                transform_spec=row["transform_spec"],
-                input_versions=row["input_versions"],
-                tenant=row["tenant"],
-                principal=row["principal"],
-                content_sha256=row["content_sha256"],
-                release_id=row["release_id"],
-                computation_key=row["computation_key"],
-            )
+            return _version_from_row(row)
         finally:
             conn.close()
 
@@ -2245,10 +2226,7 @@ class ArtifactStore:
         """The versions matching a condition, on the caller's connection, oldest first."""
         rows = conn.execute(
             f"""
-            SELECT id, version, state, provenance_hash, schema_json,
-                   row_count, byte_size, created_at, transform_spec,
-                   input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+            SELECT {_VERSION_COLUMNS}
             FROM artifact_versions WHERE {where}
             ORDER BY created_at, id, version
             """,
@@ -2588,11 +2566,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE id = ? AND version = ?
                 """,
@@ -2601,23 +2576,7 @@ class ArtifactStore:
             row = cursor.fetchone()
             if row is None:
                 return None
-            return ArtifactVersion(
-                id=row["id"],
-                version=row["version"],
-                state=row["state"],
-                provenance_hash=row["provenance_hash"],
-                schema_json=row["schema_json"],
-                row_count=row["row_count"],
-                byte_size=row["byte_size"],
-                created_at=row["created_at"],
-                transform_spec=row["transform_spec"],
-                input_versions=row["input_versions"],
-                tenant=row["tenant"],
-                principal=row["principal"],
-                content_sha256=row["content_sha256"],
-                release_id=row["release_id"],
-                computation_key=row["computation_key"],
-            )
+            return _version_from_row(row)
         finally:
             conn.close()
 
@@ -2647,11 +2606,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE id = ? AND state IN ('ready', 'superseded')
                 ORDER BY version DESC
@@ -2662,23 +2618,7 @@ class ArtifactStore:
             row = cursor.fetchone()
             if row is None:
                 return None
-            return ArtifactVersion(
-                id=row["id"],
-                version=row["version"],
-                state=row["state"],
-                provenance_hash=row["provenance_hash"],
-                schema_json=row["schema_json"],
-                row_count=row["row_count"],
-                byte_size=row["byte_size"],
-                created_at=row["created_at"],
-                transform_spec=row["transform_spec"],
-                input_versions=row["input_versions"],
-                tenant=row["tenant"],
-                principal=row["principal"],
-                content_sha256=row["content_sha256"],
-                release_id=row["release_id"],
-                computation_key=row["computation_key"],
-            )
+            return _version_from_row(row)
         finally:
             conn.close()
 
@@ -2690,11 +2630,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                """
-                SELECT id, version, state, provenance_hash, schema_json,
-                       row_count, byte_size, created_at, transform_spec,
-                       input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                f"""
+                SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
                 WHERE id LIKE ? ESCAPE '\\'
                 ORDER BY id, version
@@ -2703,26 +2640,7 @@ class ArtifactStore:
             ).fetchall()
         finally:
             conn.close()
-        return [
-            ArtifactVersion(
-                id=row["id"],
-                version=row["version"],
-                state=row["state"],
-                provenance_hash=row["provenance_hash"],
-                schema_json=row["schema_json"],
-                row_count=row["row_count"],
-                byte_size=row["byte_size"],
-                created_at=row["created_at"],
-                transform_spec=row["transform_spec"],
-                input_versions=row["input_versions"],
-                tenant=row["tenant"],
-                principal=row["principal"],
-                content_sha256=row["content_sha256"],
-                release_id=row["release_id"],
-                computation_key=row["computation_key"],
-            )
-            for row in rows
-        ]
+        return [_version_from_row(row) for row in rows]
 
     def list_latest_by_id_prefix(self, prefix: str) -> list[ArtifactVersion]:
         """Return the current value of each artifact whose id starts with ``prefix``.
@@ -2771,11 +2689,8 @@ class ArtifactStore:
         try:
             if tenant:
                 cursor = conn.execute(
-                    """
-                    SELECT id, version, state, provenance_hash, schema_json,
-                           row_count, byte_size, created_at, transform_spec,
-                           input_versions, tenant, principal, content_sha256,
-                           release_id, computation_key, last_used_at
+                    f"""
+                    SELECT {_VERSION_COLUMNS}, last_used_at
                     FROM artifact_versions
                     WHERE provenance_hash = ? AND state = 'ready' AND tenant = ?
                     ORDER BY created_at DESC
@@ -2785,11 +2700,8 @@ class ArtifactStore:
                 )
             else:
                 cursor = conn.execute(
-                    """
-                    SELECT id, version, state, provenance_hash, schema_json,
-                           row_count, byte_size, created_at, transform_spec,
-                           input_versions, tenant, principal, content_sha256,
-                           release_id, computation_key, last_used_at
+                    f"""
+                    SELECT {_VERSION_COLUMNS}, last_used_at
                     FROM artifact_versions
                     WHERE provenance_hash = ? AND state = 'ready'
                       AND (tenant = '' OR tenant IS NULL)
@@ -2804,23 +2716,7 @@ class ArtifactStore:
             # A hit is the use retention cares most about: the computation
             # was asked for again and did not have to run.
             self._note_use(conn, row["id"], row["version"], row["last_used_at"])
-            return ArtifactVersion(
-                id=row["id"],
-                version=row["version"],
-                state=row["state"],
-                provenance_hash=row["provenance_hash"],
-                schema_json=row["schema_json"],
-                row_count=row["row_count"],
-                byte_size=row["byte_size"],
-                created_at=row["created_at"],
-                transform_spec=row["transform_spec"],
-                input_versions=row["input_versions"],
-                tenant=row["tenant"],
-                principal=row["principal"],
-                content_sha256=row["content_sha256"],
-                release_id=row["release_id"],
-                computation_key=row["computation_key"],
-            )
+            return _version_from_row(row)
         finally:
             conn.close()
 
@@ -4324,11 +4220,8 @@ class ArtifactStore:
         try:
             if tenant is not _AUDIT_ALL_TENANTS:
                 cursor = conn.execute(
-                    """
-                    SELECT id, version, state, provenance_hash, schema_json,
-                           row_count, byte_size, created_at, transform_spec,
-                           input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                    f"""
+                    SELECT {_VERSION_COLUMNS}
                     FROM artifact_versions
                     WHERE state = 'ready'
                       AND tenant = ?
@@ -4343,11 +4236,8 @@ class ArtifactStore:
                 )
             else:
                 cursor = conn.execute(
-                    """
-                    SELECT id, version, state, provenance_hash, schema_json,
-                           row_count, byte_size, created_at, transform_spec,
-                           input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                    f"""
+                    SELECT {_VERSION_COLUMNS}
                     FROM artifact_versions
                     WHERE state = 'ready'
                       AND (input_versions LIKE ? ESCAPE '\\' OR input_versions LIKE ? ESCAPE '\\')
@@ -4358,23 +4248,7 @@ class ArtifactStore:
 
             results = []
             for row in cursor.fetchall():
-                artifact = ArtifactVersion(
-                    id=row["id"],
-                    version=row["version"],
-                    state=row["state"],
-                    provenance_hash=row["provenance_hash"],
-                    schema_json=row["schema_json"],
-                    row_count=row["row_count"],
-                    byte_size=row["byte_size"],
-                    created_at=row["created_at"],
-                    transform_spec=row["transform_spec"],
-                    input_versions=row["input_versions"],
-                    tenant=row["tenant"],
-                    principal=row["principal"],
-                    content_sha256=row["content_sha256"],
-                    release_id=row["release_id"],
-                    computation_key=row["computation_key"],
-                )
+                artifact = _version_from_row(row)
 
                 input_version_used = f"{artifact_id}@v={version}"
                 if artifact.input_versions:
@@ -4476,11 +4350,8 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             if name_prefix is not None:
-                query = """
-                    SELECT DISTINCT av.id, av.version, av.state, av.provenance_hash,
-                           av.schema_json, av.row_count, av.byte_size, av.created_at,
-                           av.transform_spec, av.input_versions, av.tenant, av.principal,
-                           av.content_sha256, av.release_id, av.computation_key
+                query = f"""
+                    SELECT DISTINCT {_VERSION_COLUMNS_AV}
                     FROM artifact_versions av
                     INNER JOIN artifact_names an
                         ON av.id = an.artifact_id AND av.version = an.version
@@ -4505,11 +4376,8 @@ class ArtifactStore:
                 query += f" ORDER BY av.{sort_col} {order_sql} LIMIT ? OFFSET ?"
                 params.extend([limit, offset])
             else:
-                query = """
-                    SELECT id, version, state, provenance_hash, schema_json,
-                           row_count, byte_size, created_at, transform_spec,
-                           input_versions, tenant, principal, content_sha256,
-                   release_id, computation_key
+                query = f"""
+                    SELECT {_VERSION_COLUMNS}
                     FROM artifact_versions
                 """
                 params = []
@@ -4532,26 +4400,7 @@ class ArtifactStore:
                 params.extend([limit, offset])
 
             cursor = conn.execute(query, params)
-            return [
-                ArtifactVersion(
-                    id=row["id"],
-                    version=row["version"],
-                    state=row["state"],
-                    provenance_hash=row["provenance_hash"],
-                    schema_json=row["schema_json"],
-                    row_count=row["row_count"],
-                    byte_size=row["byte_size"],
-                    created_at=row["created_at"],
-                    transform_spec=row["transform_spec"],
-                    input_versions=row["input_versions"],
-                    tenant=row["tenant"],
-                    principal=row["principal"],
-                    content_sha256=row["content_sha256"],
-                    release_id=row["release_id"],
-                    computation_key=row["computation_key"],
-                )
-                for row in cursor.fetchall()
-            ]
+            return [_version_from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
