@@ -10,6 +10,7 @@ All notable changes to vestigo are recorded here. The format follows
 - One column list and one row mapper build every `ArtifactVersion` the store
   reads; a new column is one entry in `_VERSION_FIELDS` and one dataclass
   field, pinned equal by a test (#10, friction log 1).
+  The build store reads a `BuildState` the same way (#11).
 - `versions_lacking_definition` documents that it lists every tenant's
   versions, the read of a store-wide upgrade, with each version's tenant for
   the `set_definitions` call that follows; a test pins it (#9).

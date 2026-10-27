@@ -367,6 +367,17 @@ class TestBuildStore:
         assert "created_at" in d
 
 
+class TestBuildRowMapping:
+    def test_the_select_list_is_the_dataclass(self):
+        # Every SELECT of a build and its constructor read `_BUILD_FIELDS`; a
+        # column added to the dataclass alone would come back as its default.
+        from dataclasses import fields
+
+        from vestigo.build_store import _BUILD_FIELDS, BuildState
+
+        assert _BUILD_FIELDS == tuple(field.name for field in fields(BuildState))
+
+
 class TestSingletons:
     def setup_method(self):
         reset_build_store()

@@ -159,34 +159,42 @@ class AttemptState:
     resumed_from: str | None = None
 
 
+# The SELECT list of a BuildState; a new column is added here and in the dataclass.
+_BUILD_FIELDS = (
+    "build_id",
+    "artifact_id",
+    "version",
+    "state",
+    "executor_ref",
+    "executor_url",
+    "tenant_id",
+    "principal_id",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "error_message",
+    "error_code",
+    "input_byte_count",
+    "output_byte_count",
+    "lease_owner",
+    "lease_expires_at",
+    "input_uris",
+    "params",
+    "name",
+    "logs",
+    "occurrence",
+    "attempt",
+    "computation_key",
+)
+_BUILD_COLUMNS = ", ".join(_BUILD_FIELDS)
+
+
 def _row_to_build_state(row: Any) -> BuildState:
-    """Convert a database row to a BuildState."""
-    return BuildState(
-        build_id=row["build_id"],
-        artifact_id=row["artifact_id"],
-        version=row["version"],
-        state=row["state"],
-        executor_ref=row["executor_ref"],
-        executor_url=row["executor_url"],
-        tenant_id=row["tenant_id"],
-        principal_id=row["principal_id"],
-        created_at=row["created_at"],
-        started_at=row["started_at"],
-        completed_at=row["completed_at"],
-        error_message=row["error_message"],
-        error_code=row["error_code"],
-        input_byte_count=row["input_byte_count"],
-        output_byte_count=row["output_byte_count"],
-        lease_owner=row["lease_owner"],
-        lease_expires_at=row["lease_expires_at"],
-        input_uris=json.loads(row["input_uris"]) if row["input_uris"] else None,
-        params=json.loads(row["params"]) if row["params"] else None,
-        name=row["name"],
-        logs=row["logs"],
-        occurrence=row["occurrence"],
-        attempt=row["attempt"],
-        computation_key=row["computation_key"],
-    )
+    """A ``BuildState`` from a row holding ``_BUILD_FIELDS``, by name."""
+    values = {field: row[field] for field in _BUILD_FIELDS}
+    values["input_uris"] = json.loads(row["input_uris"]) if row["input_uris"] else None
+    values["params"] = json.loads(row["params"]) if row["params"] else None
+    return BuildState(**values)
 
 
 # How create_build's json.dumps writes the mark a notebook puts on a build its own
@@ -508,14 +516,8 @@ class BuildStore:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                """
-                SELECT build_id, artifact_id, version, state, executor_ref,
-                       executor_url, tenant_id, principal_id, created_at,
-                       started_at, completed_at, error_message, error_code,
-                       input_byte_count, output_byte_count,
-                       lease_owner, lease_expires_at,
-                       input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                f"""
+                SELECT {_BUILD_COLUMNS}
                 FROM artifact_builds
                 WHERE computation_key = ? AND state = 'building'
                   AND COALESCE(occurrence, '') = COALESCE(?, '')
@@ -560,14 +562,8 @@ class BuildStore:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
-                SELECT build_id, artifact_id, version, state, executor_ref,
-                       executor_url, tenant_id, principal_id, created_at,
-                       started_at, completed_at, error_message, error_code,
-                       input_byte_count, output_byte_count,
-                       lease_owner, lease_expires_at,
-                       input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                f"""
+                SELECT {_BUILD_COLUMNS}
                 FROM artifact_builds
                 WHERE build_id = ?
                 """,
@@ -726,14 +722,8 @@ class BuildStore:
         try:
             now = self._clock()
             cursor = conn.execute(
-                """
-                SELECT build_id, artifact_id, version, state, executor_ref,
-                       executor_url, tenant_id, principal_id, created_at,
-                       started_at, completed_at, error_message, error_code,
-                       input_byte_count, output_byte_count,
-                       lease_owner, lease_expires_at,
-                       input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                f"""
+                SELECT {_BUILD_COLUMNS}
                 FROM artifact_builds
                 WHERE state = 'building'
                   AND lease_expires_at IS NOT NULL
@@ -1007,14 +997,8 @@ class BuildStore:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
-                SELECT build_id, artifact_id, version, state, executor_ref,
-                       executor_url, tenant_id, principal_id, created_at,
-                       started_at, completed_at, error_message, error_code,
-                       input_byte_count, output_byte_count,
-                       lease_owner, lease_expires_at,
-                       input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                f"""
+                SELECT {_BUILD_COLUMNS}
                 FROM (
                     SELECT *, ROW_NUMBER() OVER (
                         PARTITION BY tenant_id ORDER BY created_at ASC
@@ -1044,14 +1028,8 @@ class BuildStore:
         try:
             if state:
                 cursor = conn.execute(
-                    """
-                    SELECT build_id, artifact_id, version, state, executor_ref,
-                           executor_url, tenant_id, principal_id, created_at,
-                           started_at, completed_at, error_message, error_code,
-                           input_byte_count, output_byte_count,
-                           lease_owner, lease_expires_at,
-                           input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                    f"""
+                    SELECT {_BUILD_COLUMNS}
                     FROM artifact_builds
                     WHERE tenant_id = ? AND state = ?
                     ORDER BY created_at DESC
@@ -1061,14 +1039,8 @@ class BuildStore:
                 )
             else:
                 cursor = conn.execute(
-                    """
-                    SELECT build_id, artifact_id, version, state, executor_ref,
-                           executor_url, tenant_id, principal_id, created_at,
-                           started_at, completed_at, error_message, error_code,
-                           input_byte_count, output_byte_count,
-                           lease_owner, lease_expires_at,
-                           input_uris, params, name, logs, occurrence, attempt,
-                       computation_key
+                    f"""
+                    SELECT {_BUILD_COLUMNS}
                     FROM artifact_builds
                     WHERE tenant_id = ?
                     ORDER BY created_at DESC
