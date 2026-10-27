@@ -66,7 +66,7 @@ containers on the runner. ty checks `src` only.
 | `build_store` | `BuildStore`: builds, leases, attempts, console chunks; `find_open_build` by computation key |
 | `releases` | `ReleaseStore`: a build's checkpoint and final releases, fenced on the attempt's lease, accepted only once every output's bytes are stored |
 | `operations` | the typed operations a release runs in its transaction (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`, `AdvanceReference`, `InsertAuditEvent`) |
-| `graph` | `GraphStore` (reached as `ArtifactStore.graph`), `NodeSpec`, `Edge`, `Traversal`, the `CGN1`/`CGD1` encoders |
+| `graph` | `GraphStore` (reached as `ArtifactStore.graph`), `NodeSpec`, `Edge`, `Link` (a relation outside any id, `reconstructed_from` among them), `Traversal`, the `CGN1`/`CGD1` encoders |
 | `sql_backend` | `SqliteDialect`, `PostgresDialect`, the `SqlDialect` and `StoreConnection` protocols, `begin_write` keyed serialization |
 | `blob_store` | `BlobSettings`, `LocalBlobStore`, `S3BlobStore`, `GCSBlobStore`, `AzureBlobStore`; presigned GET, PUT and POST |
 | `provenance` | `TransformSpec`, `compute_provenance_hash`, `derive_subkey` and the labelled output keys |
