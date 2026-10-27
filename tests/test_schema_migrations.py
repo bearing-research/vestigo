@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from vestigo.build_store import BuildStore
 from vestigo.provenance import TransformSpec
 from vestigo.sql_backend import SqliteDialect
 from vestigo.store import (
@@ -21,6 +22,7 @@ from vestigo.store import (
     ArtifactStore,
     StoreSchemaMismatch,
 )
+from vestigo.tables import LEDGER_TABLES, TRANSIENT_TABLES
 
 
 def _columns(db_path) -> set[str]:
@@ -260,24 +262,215 @@ class TestAReadOnlyOpen:
 
         assert ArtifactStore(tmp_path / "s", read_only=True).stats()["total_versions"] == 0
 
+    def test_a_dialect_without_the_blob_directory_is_refused_creating_nothing(self, tmp_path):
+        """The database is found elsewhere; the default blob store would be created here."""
+        real = ArtifactStore(tmp_path / "real")
+        wrong = tmp_path / "wrong" / "artifacts"
 
-class TestConstantsAndMigrationsAgree:
-    def test_a_migrated_database_matches_a_fresh_one(self, tmp_path):
-        """A column added to the schema constants without a migration breaks only old stores.
+        with pytest.raises(StoreSchemaMismatch, match="No artifact store"):
+            ArtifactStore(wrong, dialect=SqliteDialect(real.db_path), read_only=True)
 
-        Every other test starts from a fresh database, so nothing else would notice.
-        """
-        fresh = ArtifactStore(tmp_path / "fresh")
+        assert not wrong.parent.exists()
 
-        aged = ArtifactStore(tmp_path / "aged")
-        conn = sqlite3.connect(aged.db_path)
-        conn.execute("DROP TABLE schema_version")
-        conn.execute("ALTER TABLE artifact_versions DROP COLUMN content_sha256")
-        conn.commit()
+    def test_both_backends_given_open_creating_nothing(self, tmp_path):
+        real = ArtifactStore(tmp_path / "real")
+        wrong = tmp_path / "wrong" / "artifacts"
+
+        opened = ArtifactStore(
+            wrong, blob_store=real.blob_store, dialect=SqliteDialect(real.db_path), read_only=True
+        )
+
+        assert opened.stats()["total_versions"] == 0
+        assert not wrong.parent.exists()
+
+
+# What each migration added: stripped, a database is back at the baseline the chain starts
+# from. A migration that adds a column, an index or a table lists it here.
+_MIGRATED_COLUMNS = {
+    "artifact_versions": [
+        "content_sha256",
+        "blob_attempt",
+        "last_used_at",
+        "minted",
+        "superseded_by",
+        "definition_id",
+        "release_id",
+        "computation_key",
+    ],
+    "artifact_publications": ["authors", "external_ids"],
+}
+_MIGRATED_INDEXES = [
+    "idx_versions_definition",
+    "idx_versions_release",
+    "idx_versions_computation",
+    "idx_publications_active",
+]
+_MIGRATED_TABLES = [
+    "schema_version",
+    "import_staging",
+    "retention_roots",
+    "retention_edges",
+    "store_upgrades",
+    "nodes",
+    "node_inputs",
+    "node_links",
+    "build_releases",
+    "release_references",
+    "release_authorities",
+]
+
+
+def _shape(db_path) -> dict:
+    """Every table's columns and its explicit indexes, with their keys and predicates."""
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = sorted(
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        )
+        shape = {}
+        for table in tables:
+            columns = sorted(
+                (r[1], r[2].upper(), r[3], r[4], r[5])
+                for r in conn.execute(f"PRAGMA table_info({table})")
+            )
+            indexes = {}
+            for index in conn.execute(f"PRAGMA index_list({table})"):
+                name, unique, origin = index[1], index[2], index[3]
+                if origin != "c":
+                    continue
+                keyed = tuple(r[2] for r in conn.execute(f"PRAGMA index_info({name})"))
+                sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = ?", (name,))
+                indexes[name] = (keyed, bool(unique), "WHERE" in (sql.fetchone()[0] or "").upper())
+            shape[table] = {"columns": columns, "indexes": indexes}
+        return shape
+    finally:
         conn.close()
-        migrated = ArtifactStore(tmp_path / "aged")
 
-        assert _columns(migrated.db_path) == _columns(fresh.db_path)
+
+def _strip_to_baseline(db_path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        for name in _MIGRATED_INDEXES:
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
+        for table, columns in _MIGRATED_COLUMNS.items():
+            for column in columns:
+                conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        for table in _MIGRATED_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _differences(expected: dict, actual: dict) -> dict:
+    return {
+        table: (expected.get(table), actual.get(table))
+        for table in sorted(set(expected) | set(actual))
+        if expected.get(table) != actual.get(table)
+    }
+
+
+class TestMigrationsProduceTheConstantsShape:
+    """A change to the schema constants without its migration breaks only old stores,
+    which every other test, starting fresh, never opens."""
+
+    def test_the_migration_chain_alone_matches_a_fresh_store(self, tmp_path):
+        """What Postgres gets: the migrations, and nothing from the constants."""
+        fresh = ArtifactStore(tmp_path / "fresh")
+        aged = ArtifactStore(tmp_path / "aged")
+        _strip_to_baseline(aged.db_path)
+        conn = aged._get_connection()
+        try:
+            aged._apply_schema_migrations(conn)
+        finally:
+            conn.close()
+
+        assert _differences(_shape(fresh.db_path), _shape(aged.db_path)) == {}
+
+    def test_a_reopen_matches_a_fresh_store(self, tmp_path):
+        """What SQLite gets: the constants' CREATE IF NOT EXISTS, then the migrations."""
+        fresh = ArtifactStore(tmp_path / "fresh")
+        aged = ArtifactStore(tmp_path / "aged")
+        _strip_to_baseline(aged.db_path)
+
+        ArtifactStore(tmp_path / "aged")
+
+        assert _differences(_shape(fresh.db_path), _shape(aged.db_path)) == {}
+
+
+def _primary_key(db_path, table: str) -> tuple[str, ...]:
+    conn = sqlite3.connect(db_path)
+    try:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        conn.close()
+    return tuple(r[1] for r in sorted((r for r in info if r[5]), key=lambda r: r[5]))
+
+
+class TestRootsKeyedByTenant:
+    def test_the_migration_rekeys_an_old_table_and_keeps_its_rows(self, tmp_path):
+        """(audit SR-D) The Postgres half is in ``test_artifact_store_postgres.py``."""
+        store = ArtifactStore(tmp_path / "s")
+        version = store.create_artifact("shared", "prov-1")
+        store.retain("shared", version, kind="pin", holder="review", tenant="a")
+        conn = sqlite3.connect(store.db_path)
+        conn.executescript(
+            """
+            CREATE TABLE old_roots (
+                tenant TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                holder TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                created_by TEXT,
+                PRIMARY KEY (kind, holder, artifact_id, version)
+            );
+            INSERT INTO old_roots SELECT * FROM retention_roots;
+            DROP TABLE retention_roots;
+            ALTER TABLE old_roots RENAME TO retention_roots;
+            DELETE FROM schema_version;
+            INSERT INTO schema_version (version, applied_at) VALUES (16, 0);
+            """
+        )
+        conn.close()
+        assert _primary_key(store.db_path, "retention_roots") == (
+            "kind",
+            "holder",
+            "artifact_id",
+            "version",
+        )
+
+        reopened = ArtifactStore(tmp_path / "s")
+
+        assert _primary_key(store.db_path, "retention_roots") == (
+            "tenant",
+            "kind",
+            "holder",
+            "artifact_id",
+            "version",
+        )
+        assert [r["tenant"] for r in reopened.retention_roots("shared", version)] == ["a"]
+        reopened.retain("shared", version, kind="pin", holder="review", tenant="b")
+        tenants = sorted(r["tenant"] for r in reopened.retention_roots("shared", version))
+        assert tenants == ["a", "b"]
+        indexes = {name for name, _ in _schema(store.db_path)}
+        assert {"idx_retention_roots_version", "idx_retention_roots_tenant"} <= indexes
+
+
+class TestTablesListing:
+    def test_the_listing_names_every_table_with_its_key(self, tmp_path):
+        """A copy keyed by the listing is idempotent only if each key is the table's."""
+        store = ArtifactStore(tmp_path / "artifacts")
+        BuildStore(tmp_path / "builds.sqlite", dialect=SqliteDialect(store.db_path))
+        tables = set(_shape(store.db_path))
+        keys = {name: _primary_key(store.db_path, name) for name, _ in LEDGER_TABLES}
+
+        assert {name for name, _ in LEDGER_TABLES} | set(TRANSIENT_TABLES) == tables
+        assert keys == dict(LEDGER_TABLES)
 
 
 def _ready(store, artifact_id, executor, inputs, input_versions=None) -> None:

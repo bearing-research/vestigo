@@ -269,7 +269,7 @@ class TestRequirements:
         theirs = _ready(store, tenant="b")
         mine = _ready(store, tenant="a")
         whole = _ready(store, tenant="a", requires=[theirs, mine])
-        store.record_use(*whole)
+        store.record_use(*whole, tenant="a")
 
         assert _sweep(store) == 1
         assert store.get_artifact(*theirs) is None
