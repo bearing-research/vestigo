@@ -9,17 +9,71 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import json
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import google.auth
 import pytest
-from conftest import role_credentials
+from azure.storage.blob import BlobServiceClient, UserDelegationKey
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from google.auth.credentials import Credentials
+from google.auth.transport import requests as google_requests
 
 from vestigo.blob_store import AzureBlobStore, GCSBlobStore, S3BlobStore
 
 SERVICE_ACCOUNT = "signer@proj.iam.gserviceaccount.com"
+
+
+@contextmanager
+def _serve(handler: type[http.server.BaseHTTPRequestHandler]) -> Iterator[str]:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@contextmanager
+def role_credentials(
+    monkeypatch: pytest.MonkeyPatch, access_key: str, secret_key: str, token: str
+) -> Iterator[list[str]]:
+    """Serve temporary credentials the way an ECS task role does, with no other source.
+
+    Yields the list of requests the endpoint saw, so a test can count resolutions.
+    """
+    seen: list[str] = []
+    body = json.dumps(
+        {
+            "AccessKeyId": access_key,
+            "SecretAccessKey": secret_key,
+            "Token": token,
+            "Expiration": "2099-01-01T00:00:00Z",
+        }
+    ).encode()
+
+    class Role(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            seen.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            return None
+
+    # Every other source is out already: ``_no_ambient_cloud_credentials`` runs first.
+    with _serve(Role) as base:
+        monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", f"{base}/role")
+        yield seen
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +140,6 @@ def gcs_key_store(rsa_key):
 
 def _keyless_credentials(**attributes):
     """Credentials with no private key, like the GCE metadata server's or workload identity's."""
-    from google.auth.credentials import Credentials
 
     class Keyless(Credentials):
         refreshes = 0
@@ -102,9 +155,6 @@ def _keyless_credentials(**attributes):
 
 def test_keyless_gcs_credentials_sign_through_iam_as_the_attached_account(rsa_key, monkeypatch):
     """The IAM signBlob API signs for workload identity; it is faked at the HTTP boundary."""
-    import google.auth
-    from google.auth.transport import requests as google_requests
-
     credentials = _keyless_credentials(service_account_email=SERVICE_ACCOUNT)
     monkeypatch.setattr(google.auth, "default", lambda scopes=None: (credentials, "proj"))
     calls: list[tuple[str, str]] = []
@@ -140,8 +190,6 @@ def test_keyless_gcs_credentials_sign_through_iam_as_the_attached_account(rsa_ke
 
 def test_gcs_credentials_with_no_service_account_do_not_presign(monkeypatch):
     """A person's gcloud login has neither a key nor an account IAM can sign as."""
-    import google.auth
-
     user = _keyless_credentials()
     monkeypatch.setattr(google.auth, "default", lambda scopes=None: (user, "proj"))
     store = GCSBlobStore(bucket="bkt")
@@ -239,8 +287,6 @@ def test_an_azure_sas_token_is_not_handed_to_workers():
 
 
 def test_an_azure_managed_identity_signs_with_a_reused_user_delegation_key(monkeypatch):
-    from azure.storage.blob import BlobServiceClient, UserDelegationKey
-
     requested: list[tuple[float, float]] = []
 
     def get_user_delegation_key(self, key_start_time, key_expiry_time, **kwargs):

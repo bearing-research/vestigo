@@ -1,17 +1,62 @@
 """Tests for build state store (server-mode transforms)."""
 
 import uuid
+from collections.abc import Iterable
 from contextlib import closing
+from dataclasses import fields
+from pathlib import Path
 
 import pytest
-from conftest import seed_build_targets
-from gate2 import Clock
 
 from vestigo.build_store import (
+    _BUILD_FIELDS,
+    BuildState,
     BuildStore,
     get_build_store,
     reset_build_store,
 )
+from vestigo.store import ArtifactStore
+
+
+class Clock:
+    """A clock the tests advance, so a lease can lapse without sleeping."""
+
+    def __init__(self) -> None:
+        self.now = 1_700_000_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+BUILD_TARGET_IDS: tuple[str, ...] = (
+    "a",
+    "art-123",
+    "canonical-artifact",
+    *(f"art-{i}" for i in range(4)),
+    *(f"artifact-{i}" for i in range(1, 4)),
+)
+
+
+def seed_build_targets(
+    artifact_dir: Path,
+    artifact_ids: Iterable[str] = BUILD_TARGET_IDS,
+    versions: Iterable[int] = range(1, 8),
+) -> None:
+    """Create the artifact versions that build rows are allowed to reference.
+
+    ``artifact_builds`` has a foreign key on ``(artifact_id, version)`` and production always
+    creates the version first. Opening the artifact store also creates ``artifact_versions``
+    in the shared database, without which the key cannot resolve.
+    """
+    store = ArtifactStore(artifact_dir)
+    try:
+        for artifact_id in artifact_ids:
+            for version in versions:
+                created = store.create_artifact(artifact_id, f"seed-{artifact_id}-{version}")
+                store.blob_store.write_blob(artifact_id, created, b"seed")
+                store.finalize_artifact(artifact_id, created, "{}", 1, 4)
+    finally:
+        store.close()
 
 
 @pytest.fixture
@@ -31,6 +76,22 @@ def build_store(tmp_path, clock):
 
 
 class TestBuildStore:
+    def test_repeated_invocation_site_gives_distinct_occurrences(self, build_store):
+        """One computation run twice at one site is two builds, told apart by occurrence."""
+        for version, occurrence in ((1, "variant=a"), (2, "variant=b")):
+            build_store.create_build(
+                build_id=f"build-{version}",
+                artifact_id="art-123",
+                version=version,
+                executor_ref="x@v1",
+                occurrence=occurrence,
+                computation_key="k" * 64,
+            )
+        assert {build_store.get_build(f"build-{n}").occurrence for n in (1, 2)} == {
+            "variant=a",
+            "variant=b",
+        }
+
     def test_create_build(self, build_store):
         build_id = str(uuid.uuid4())
         state = build_store.create_build(
@@ -371,9 +432,6 @@ class TestBuildRowMapping:
     def test_the_select_list_is_the_dataclass(self):
         # Every SELECT of a build and its constructor read `_BUILD_FIELDS`; a
         # column added to the dataclass alone would come back as its default.
-        from dataclasses import fields
-
-        from vestigo.build_store import _BUILD_FIELDS, BuildState
 
         assert _BUILD_FIELDS == tuple(field.name for field in fields(BuildState))
 

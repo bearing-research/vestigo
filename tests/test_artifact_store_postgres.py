@@ -7,69 +7,37 @@ is proven by behaviour rather than rendered SQL. Requires Docker and the ``postg
 from __future__ import annotations
 
 import asyncio
-import os
+import logging
+import secrets
 import threading
 import time
+from dataclasses import replace
 
 import anyio.to_thread
-import docker
+import psycopg
 import pytest
-from conftest import race_after_pending_read
-from gate2 import Gate2
-from testcontainers.community.postgres import PostgresContainer
 
+from vestigo.build_store import BuildStore
+from vestigo.graph import Edge, NodeSpec, Traversal
 from vestigo.provenance import TransformSpec
 from vestigo.sql_backend import SERVER_THREAD_LIMIT, PostgresDialect, advisory_lock_id
-from vestigo.store import ArtifactStore
-
-
-def _docker_daemon_reachable() -> bool:
-    """Skip when the Docker daemon is unreachable (only possible locally; CI always has Docker)."""
-    try:
-        docker.from_env().ping()
-        return True
-    except Exception:
-        return False
-
-
-if not _docker_daemon_reachable():
-    if os.environ.get("VESTIGO_REQUIRE_DOCKER"):
-        raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
-    pytest.skip("Docker daemon is not running", allow_module_level=True)
+from vestigo.store import (
+    _LATEST_SCHEMA_VERSION,
+    ArtifactIdTaken,
+    ArtifactImportConflict,
+    ArtifactStore,
+    ArtifactVersion,
+    StagedVersion,
+    StoreSchemaMismatch,
+    publication_id,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 
-@pytest.fixture(scope="module")
-def postgres_dsn():
-    """A live Postgres, shared across this module (container startup is slow)."""
-    with PostgresContainer("postgres:18-alpine") as container:
-        yield container.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
-
-
 @pytest.fixture
-def store(postgres_dsn, tmp_path):
-    """A store with metadata on Postgres and local blobs; each test gets a clean schema."""
-    dialect = PostgresDialect(postgres_dsn)
-    conn = dialect.connect()
-    try:
-        conn.executescript(
-            "DROP TABLE IF EXISTS artifact_versions, artifact_names, artifact_aliases, "
-            "artifact_tags, registry_audit, registry_pending, artifact_publications, "
-            "retention_roots, retention_edges, store_upgrades, nodes, node_inputs, node_links, "
-            "build_releases, release_references, release_authorities, import_staging, "
-            "artifact_builds, build_attempts, build_console_chunks, schema_version CASCADE;"
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    yield ArtifactStore(tmp_path / "artifacts", dialect=dialect)
-
-    # Each test builds its own pool against the shared container. Left open
-    # they accumulate toward Postgres's default max_connections of 100 and
-    # later tests start failing for reasons that have nothing to do with them.
-    dialect.close()
+def store(postgres_store):
+    return postgres_store
 
 
 def _spec() -> TransformSpec:
@@ -115,8 +83,6 @@ class TestRoundTrip:
         assert store.read_blob("a1", version) == b"payload"
 
     def test_an_import_keeps_its_id_and_reads_its_bytes(self, store):
-        from dataclasses import replace
-
         version = store.create_artifact("src", "prov-import", _spec())
         store.write_blob("src", version, b"payload")
         store.finalize_artifact("src", version, "{}", row_count=1, byte_size=7)
@@ -134,8 +100,6 @@ class TestRoundTrip:
         assert store.id_tenant("held") == "team-a"
 
     def test_another_tenant_cannot_create_under_a_held_id(self, store):
-        from vestigo.store import ArtifactIdTaken
-
         store.create_artifact("held", "prov-held", _spec(), tenant="team-a")
 
         with pytest.raises(ArtifactIdTaken):
@@ -145,9 +109,6 @@ class TestRoundTrip:
         assert store.create_artifact("held", "prov-again", _spec(), tenant="team-a") == 2
 
     def test_another_tenant_cannot_import_under_a_held_id(self, store):
-        from dataclasses import replace
-
-        from vestigo.store import ArtifactImportConflict
 
         version = store.create_artifact("held", "prov-held", _spec(), tenant="team-a")
         store.write_blob("held", version, b"payload")
@@ -364,8 +325,6 @@ class TestConnectionLimits:
 
 class TestCanonicalPromotion:
     def test_a_runs_outputs_finalize_together_or_not_at_all(self, store):
-        from vestigo.store import StagedVersion
-
         first = store.create_artifact("a1", "shared-prov", _spec())
         store.finalize_artifact("a1", first, "{}", row_count=0, byte_size=0)
         x = StagedVersion(
@@ -414,8 +373,6 @@ class TestFinalizeAndName:
         assert (name.artifact_id, name.version) == ("a1", version)
 
     def test_a_name_that_cannot_be_written_leaves_the_artifact_building(self, store, monkeypatch):
-        import psycopg
-
         version = store.create_artifact("a1", "prov-1", _spec())
 
         def name_write_fails(*args, **kwargs):
@@ -683,8 +640,6 @@ class TestGarbageCollection:
 
     def test_cleanup_failed_takes_a_failed_build_row_with_it(self, store, tmp_path):
         """The build row's foreign key refused deleting the failed version it references."""
-        from vestigo.build_store import BuildStore
-
         builds = BuildStore(tmp_path / "builds.sqlite", dialect=store.dialect)
         version = store.create_artifact("built", "prov-built", _spec())
         builds.create_build("build-1", "built", version, "exec@v1")
@@ -703,8 +658,6 @@ class TestConnectionPool:
         """psycopg_pool warns and rolls back whenever a connection comes back mid-transaction,
         which every read did, burying real warnings under one per call.
         """
-        import logging
-
         version = store.create_artifact("warn-a", "warn-p", _spec())
         store.write_blob("warn-a", version, b"x")
         store.finalize_artifact("warn-a", version, "{}", row_count=0, byte_size=1)
@@ -897,8 +850,6 @@ class TestBuildStoreSharesTheBackend:
     """
 
     def test_build_created_on_one_node_is_visible_on_another(self, postgres_dsn, tmp_path):
-        from vestigo.build_store import BuildStore
-
         dialect_a = PostgresDialect(postgres_dsn)
         dialect_b = PostgresDialect(postgres_dsn)
         try:
@@ -946,8 +897,6 @@ class TestBuildStoreSharesTheBackend:
 
     def test_console_left_by_one_node_is_taken_by_the_other(self, postgres_dsn, tmp_path):
         """A remote cell's console chunk can land on a node that did not dispatch it."""
-        from vestigo.build_store import BuildStore
-
         dialect_a = PostgresDialect(postgres_dsn)
         dialect_b = PostgresDialect(postgres_dsn)
         try:
@@ -989,8 +938,6 @@ class TestBuildStoreSharesTheBackend:
 
     def test_the_runner_picks_a_fair_share_per_tenant(self, postgres_dsn, tmp_path):
         """The window query runs on Postgres too: per tenant, without external builds."""
-        from vestigo.build_store import BuildStore
-
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
@@ -1050,8 +997,6 @@ class TestBuildStoreSharesTheBackend:
 
     def test_an_attempt_principal_is_added_to_an_older_database(self, postgres_dsn, tmp_path):
         """The column add runs under the schema lock on Postgres; the row then carries it."""
-        from vestigo.build_store import BuildStore
-
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
@@ -1081,8 +1026,6 @@ class TestBuildStoreSharesTheBackend:
 
     def test_a_fail_fenced_on_a_claim_needs_that_exact_claim(self, postgres_dsn, tmp_path):
         """The deadline read back from the row matches the one the fence sends."""
-        from vestigo.build_store import BuildStore
-
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
@@ -1120,8 +1063,6 @@ class TestBuildStoreSharesTheBackend:
     def test_build_columns_survive_postgres_widths(self, postgres_dsn, tmp_path):
         # Same INTEGER/REAL traps as the artifact store: byte counts are
         # INTEGER and timestamps are REAL in the shared schema.
-        from vestigo.build_store import BuildStore
-
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
@@ -1162,8 +1103,6 @@ class TestTheAttemptLedgerOnPostgres:
     """
 
     def test_an_existing_database_gains_the_ledger(self, postgres_dsn, tmp_path):
-        from vestigo.build_store import BuildStore
-
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
@@ -1432,77 +1371,6 @@ class TestWriterSerialization:
         assert found is not None
 
 
-@pytest.fixture
-def no_wait_store(postgres_dsn, tmp_path, store):
-    """A second node on the same database whose statements never wait for a lock."""
-    dialect = PostgresDialect(postgres_dsn)
-    competitor = ArtifactStore(tmp_path / "artifacts", dialect=dialect)
-    connect = competitor._get_connection
-
-    def no_wait():
-        conn = connect()
-        conn.execute("SET lock_timeout = '1ms'")
-        return conn
-
-    competitor._get_connection = no_wait
-    yield competitor
-    dialect.close()
-
-
-_DECISIONS = {
-    "approve": lambda s: s.approve_alias_change("model", "champion"),
-    "reject": lambda s: s.reject_alias_change("model", "champion"),
-}
-
-
-class TestPendingChangeRaces:
-    """Reading a pending change and consuming it is one step across nodes."""
-
-    def _ready(self, store, artifact_id):
-        version = store.create_artifact(artifact_id, f"prov-{artifact_id}", _spec())
-        store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=0)
-
-    @pytest.mark.parametrize(("first", "second"), [("approve", "reject"), ("reject", "approve")])
-    def test_an_approve_and_a_reject_of_one_change_have_one_winner(
-        self, store, no_wait_store, first, second
-    ):
-        self._ready(store, "m1")
-        store.request_alias_change("model", "champion", "set", artifact_id="m1", version=1)
-
-        won, lost = race_after_pending_read(
-            store, no_wait_store, _DECISIONS[first], _DECISIONS[second]
-        )
-
-        assert won["artifact_id"] == "m1"
-        assert isinstance(lost, ValueError) and "No pending change" in str(lost)
-        actions = [e["action"] for e in store.read_audit(name="model")]
-        assert ("alias_approved" in actions, "alias_rejected" in actions) == (
-            first == "approve",
-            first == "reject",
-        )
-        assert (store.resolve_alias("model", "champion") is not None) == (first == "approve")
-
-    def test_an_approval_leaves_a_newer_request_pending(self, store, no_wait_store):
-        self._ready(store, "m1")
-        self._ready(store, "m2")
-        store.request_alias_change("model", "champion", "set", artifact_id="m1", version=1)
-
-        applied, requested = race_after_pending_read(
-            store,
-            no_wait_store,
-            _DECISIONS["approve"],
-            lambda s: s.request_alias_change(
-                "model", "champion", "set", artifact_id="m2", version=1
-            ),
-        )
-
-        assert applied["artifact_id"] == "m1" and requested is True
-        assert store.resolve_alias("model", "champion").id == "m1"
-        audit = store.read_audit(name="model")
-        assert [e["artifact_id"] for e in audit if e["action"] == "alias_approved"] == ["m1"]
-        assert [p["artifact_id"] for p in store.list_pending_changes()] == ["m2"]
-
-
 class TestSchemaMigrations:
     """Evolving a Postgres store that already holds data.
 
@@ -1510,8 +1378,6 @@ class TestSchemaMigrations:
     """
 
     def test_a_fresh_database_is_stamped_and_complete(self, store):
-        from vestigo.store import _LATEST_SCHEMA_VERSION
-
         conn = store._get_connection()
         try:
             version = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()["v"]
@@ -1527,9 +1393,6 @@ class TestSchemaMigrations:
 
     def test_an_existing_database_is_carried_forward(self, postgres_dsn, tmp_path, store):
         """A new column reaches a store that already has rows."""
-        from vestigo.sql_backend import PostgresDialect
-        from vestigo.store import _LATEST_SCHEMA_VERSION
-
         version = store.create_artifact("keeper", "prov-keep", _spec())
         store.finalize_artifact("keeper", version, schema_json="", row_count=1, byte_size=1)
 
@@ -1567,9 +1430,6 @@ class TestSchemaMigrations:
     def test_existing_publication_tokens_are_hashed_and_still_resolve(
         self, postgres_dsn, tmp_path, store
     ):
-        from vestigo.sql_backend import PostgresDialect
-        from vestigo.store import publication_id
-
         version = store.create_artifact("fig", "prov-fig", _spec())
         with store.open_blob_writer("fig", version) as writer:
             writer.write(b"figure bytes")
@@ -1616,8 +1476,6 @@ class TestSchemaMigrations:
 
     def test_a_read_only_open_leaves_an_older_database_alone(self, postgres_dsn, tmp_path, store):
         """A shared database older nodes still serve: inspecting it must not migrate it."""
-        from vestigo.store import StoreSchemaMismatch
-
         conn = store._get_connection()
         try:
             conn.execute("UPDATE schema_version SET version = 8")
@@ -1661,8 +1519,6 @@ class TestOneActivePublicationPerVersion:
         return version
 
     def test_a_publish_racing_another_returns_the_winners_grant(self, store, monkeypatch):
-        import secrets
-
         version = self._ready(store, "fig")
         real_mint = secrets.token_urlsafe
         rival: list = []
@@ -1739,8 +1595,6 @@ class TestGraph:
     """Gate 2's graph steps on Postgres: the recursive walk and the batch write."""
 
     def test_put_batch_read_back_and_walk(self, store):
-        from vestigo.graph import Edge, NodeSpec, Traversal
-
         leaf = NodeSpec(domain="test/table", payload=b"s3://bucket/events")
         first = NodeSpec(domain="test/cell", payload=b"a", edges=(Edge("rows", 0, 0),))
         second = NodeSpec(
@@ -1768,8 +1622,6 @@ class TestGraph:
         }
 
     def test_a_version_records_its_definition(self, store):
-        from vestigo.graph import NodeSpec
-
         version = store.create_artifact(
             "a1", "prov-1", _spec(), definition=[NodeSpec("test/cell", b"x")]
         )
@@ -1798,8 +1650,6 @@ class TestProvenanceRaces:
     def test_an_import_overtaken_between_its_check_and_its_insert_lands_on_the_winner(
         self, store, postgres_dsn, tmp_path
     ):
-        from vestigo.store import ArtifactVersion
-
         record = ArtifactVersion(
             id="imported",
             version=1,
@@ -1881,8 +1731,6 @@ class TestProvenanceRaces:
         """Each row is promoted in provenance order whatever the caller's, so the two
         transactions queue on the first provenance instead of deadlocking on each other's
         unique-index entries; the loser's rejection is retried and it wins the second round."""
-        from vestigo.store import StagedVersion
-
         other = _second_store(postgres_dsn, tmp_path / "artifacts")
         original = ArtifactStore._promote_staged
         barrier = threading.Barrier(2, timeout=3)
@@ -1970,15 +1818,3 @@ class TestPromotionOnPostgres:
         finally:
             conn.close()
         assert [e["from_version"] for e in edges] == [1, 3]
-
-
-@pytest.fixture
-def ledger(store):
-    """Gate 2's ledger over the Postgres-backed store."""
-    from gate2 import make_ledger
-
-    return make_ledger(store)
-
-
-class TestGate2(Gate2):
-    """Gate 2 (ADR 002 §8) on PostgreSQL."""

@@ -9,14 +9,23 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import google.auth
 import pytest
+from azure.core.exceptions import ResourceNotFoundError
+from botocore.exceptions import ClientError
+from google.api_core.exceptions import Forbidden, NotFound, ServiceUnavailable
+from google.auth.exceptions import DefaultCredentialsError
+from google.auth.identity_pool import Credentials
+from moto import mock_aws
 
 from vestigo import blob_store as blob_store_module
 from vestigo.blob_store import (
+    AzureBlobStore,
     BlobStore,
     GCSBlobStore,
     LocalBlobStore,
     S3BlobStore,
+    _AzureDownloadReader,
     get_object_store_errors,
 )
 
@@ -300,8 +309,6 @@ class TestStagedLocalWriter:
     def test_tempfile_discarded_on_exception(self, tmp_path: Path, monkeypatch):
         """The staged tempfile is removed even when commit never runs."""
         captured_path: list[Path] = []
-        from vestigo import blob_store as blob_store_module
-
         real_mkstemp = blob_store_module.tempfile.mkstemp
 
         def _recording_mkstemp(*args, **kwargs):
@@ -325,8 +332,6 @@ class TestStagedLocalWriter:
     def test_commit_exception_propagates_and_cleans_up(self, tmp_path: Path, monkeypatch):
         """If commit raises, the tempfile is still removed."""
         captured_path: list[Path] = []
-        from vestigo import blob_store as blob_store_module
-
         real_mkstemp = blob_store_module.tempfile.mkstemp
 
         def _recording_mkstemp(*args, **kwargs):
@@ -402,8 +407,6 @@ class TestPublishBlobFromPath:
 
 def _client_error(status: int, code: str, operation: str):
     """A botocore ``ClientError`` as the SDK raises it for an HTTP ``status``."""
-    from botocore.exceptions import ClientError
-
     return ClientError(
         {"Error": {"Code": code, "Message": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
         operation,
@@ -413,8 +416,6 @@ def _client_error(status: int, code: str, operation: str):
 @pytest.fixture
 def s3_store():
     """An S3 store over moto's in-process S3, with its bucket made."""
-    from moto import mock_aws
-
     with mock_aws():
         store = S3BlobStore(
             bucket="fake-bucket",
@@ -561,7 +562,6 @@ class TestS3BlobStore:
     def test_a_backend_error_on_read_is_not_absent(self, s3_store):
         """ACCESS_DENIED, a bad region or a timeout used to read as None: an artifact whose
         blob is "gone", a 404, an integrity finding, all silent."""
-        from botocore.exceptions import ClientError
 
         def denied(**kwargs):
             raise _client_error(403, "AccessDenied", "GetObject")
@@ -579,7 +579,6 @@ class TestS3BlobStore:
     def test_exists_size_and_delete_propagate_a_backend_error(self, s3_store):
         """``delete_blob`` matters most: the caller removes the metadata row regardless, so a
         False that meant "could not reach the bucket" orphaned the object for good."""
-        from botocore.exceptions import ClientError
 
         def denied(**kwargs):
             raise _client_error(403, "AccessDenied", "HeadObject")
@@ -595,7 +594,6 @@ class TestS3BlobStore:
 
     def test_a_missing_bucket_on_read_is_an_error(self, s3_store):
         """A 404 is not always a missing object: a misnamed bucket must not read as empty."""
-        from botocore.exceptions import ClientError
 
         def no_bucket(**kwargs):
             raise _client_error(404, "NoSuchBucket", "GetObject")
@@ -648,8 +646,6 @@ class _FakeGcsBlob:
         self.size: int | None = None
 
     def _absent(self):
-        from google.api_core.exceptions import NotFound
-
         return NotFound(f"{self._path.name} not found")
 
     def reload(self) -> None:
@@ -730,8 +726,6 @@ class TestGCSBlobStore:
 
     def test_a_workload_identity_credentials_file_is_accepted(self, tmp_path: Path):
         """The setting takes any file ``GOOGLE_APPLICATION_CREDENTIALS`` would, not only a key."""
-        from google.auth.identity_pool import Credentials
-
         info = {
             "type": "external_account",
             "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p",
@@ -752,8 +746,6 @@ class TestGCSBlobStore:
 
     def test_without_credentials_or_anonymous_there_is_no_store(self, monkeypatch):
         """A store that could neither read nor write fails at construction, not at first use."""
-        import google.auth
-        from google.auth.exceptions import DefaultCredentialsError
 
         def no_credentials(scopes=None):
             raise DefaultCredentialsError("none")
@@ -799,8 +791,6 @@ class TestGCSBlobStore:
         assert store.blob_exists("artifact-1", 1) is False
 
     def test_a_backend_error_on_read_is_not_absent(self, tmp_path: Path):
-        from google.api_core.exceptions import Forbidden
-
         store = self._store(tmp_path, Forbidden("denied"))
         before = get_object_store_errors().snapshot()["get"]
 
@@ -812,8 +802,6 @@ class TestGCSBlobStore:
         assert get_object_store_errors().snapshot()["get"] == before + 2
 
     def test_exists_size_and_delete_propagate_a_backend_error(self, tmp_path: Path):
-        from google.api_core.exceptions import ServiceUnavailable
-
         store = self._store(tmp_path, ServiceUnavailable("backend"))
 
         for call in (store.blob_exists, store.blob_size, store.delete_blob):
@@ -821,8 +809,6 @@ class TestGCSBlobStore:
                 call("artifact-1", 1)
 
     def test_a_failed_upload_leaves_the_previous_object(self, tmp_path: Path):
-        from google.api_core.exceptions import ServiceUnavailable
-
         store = self._store(tmp_path)
         store.write_blob("artifact-1", 1, b"the old bytes")
         source = tmp_path / "incoming.bin"
@@ -840,8 +826,6 @@ class _FakeBlobClient:
     """One blob of a fake Azure container, over a local file."""
 
     def __init__(self, path: Path, record: list[str]):
-        from azure.core.exceptions import ResourceNotFoundError
-
         self._path = path
         self._record = record
         self._absent = ResourceNotFoundError
@@ -883,9 +867,6 @@ class TestAzureBackendOverAFakeClient:
     """The Azure I/O paths over a fake ``ContainerClient``, keyed like the real one."""
 
     def _store(self, tmp_path: Path):
-        pytest.importorskip("azure.core.exceptions")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore.__new__(AzureBlobStore)
         store.prefix = "artifacts"
         store._client = _FakeContainerClient(tmp_path)
@@ -893,8 +874,6 @@ class TestAzureBackendOverAFakeClient:
 
     def test_a_missing_container_is_an_error_not_an_absence(self, tmp_path: Path):
         """``BlobNotFound`` is absence; ``ContainerNotFound`` is the same 404 and is not."""
-        from azure.core.exceptions import ResourceNotFoundError
-
         store = self._store(tmp_path)
         gone = ResourceNotFoundError("the container does not exist")
         gone.error_code = "ContainerNotFound"
@@ -980,8 +959,6 @@ class TestAzureDownloadReader:
                 start += size
 
     def _raw(self):
-        from vestigo.blob_store import _AzureDownloadReader
-
         return _AzureDownloadReader(self.Downloader(self.DATA, self.CHUNK_SIZES))
 
     def test_read_returns_the_whole_blob(self):
@@ -1036,9 +1013,6 @@ class TestAzureBlobStore:
 
     def test_azure_key_format_with_prefix(self):
         """The Azure key includes the prefix."""
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         # A fake connection string: key generation needs no real connection.
         store = AzureBlobStore(
             account_name="testaccount",
@@ -1052,9 +1026,6 @@ class TestAzureBlobStore:
         assert key == "artifacts/abc123@v=5.arrow"
 
     def test_azure_key_format_without_prefix(self):
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore(
             account_name="testaccount",
             container_name="test-container",
@@ -1067,9 +1038,6 @@ class TestAzureBlobStore:
         assert key == "abc123@v=5.arrow"
 
     def test_blob_key_format(self):
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore(
             account_name="testaccount",
             container_name="test-container",
@@ -1083,9 +1051,6 @@ class TestAzureBlobStore:
 
     def test_requires_auth_method(self):
         """The Azure store raises without an auth method."""
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         with pytest.raises(ValueError, match="requires one of"):
             AzureBlobStore(
                 account_name="testaccount",
@@ -1096,9 +1061,6 @@ class TestAzureBlobStore:
 
     def test_endpoint_url_is_the_host_and_the_account_is_its_first_path_segment(self):
         """The documented meaning of ``azure_endpoint_url``."""
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore(
             account_name="devstoreaccount1",
             container_name="test-container",
@@ -1111,9 +1073,6 @@ class TestAzureBlobStore:
         assert store._client.account_name == "devstoreaccount1"
 
     def test_endpoint_url_already_naming_the_account_is_not_doubled(self):
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore(
             account_name="devstoreaccount1",
             container_name="test-container",
@@ -1125,9 +1084,6 @@ class TestAzureBlobStore:
         assert store._client.account_name == "devstoreaccount1"
 
     def test_endpoint_url_without_an_account_name_is_used_as_given(self):
-        pytest.importorskip("azure.storage.blob")
-        from vestigo.blob_store import AzureBlobStore
-
         store = AzureBlobStore(
             account_name="",
             container_name="test-container",

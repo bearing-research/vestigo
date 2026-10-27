@@ -15,7 +15,9 @@ import uuid
 from pathlib import Path
 
 import pytest
-from conftest import docker_or_skip
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ServiceRequestError
+from botocore.exceptions import ClientError, EndpointConnectionError
+from testcontainers.community.azurite import AzuriteContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.docker_client import DockerClient
 from testcontainers.core.wait_strategies import HttpWaitStrategy, LogMessageWaitStrategy
@@ -26,8 +28,6 @@ from vestigo.blob_store import (
     S3BlobStore,
     get_object_store_errors,
 )
-
-docker_or_skip()
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -92,7 +92,7 @@ def _azure_endpoint(container) -> str:
 
 
 @pytest.fixture(scope="module")
-def minio_endpoint():
+def minio_endpoint(docker_daemon):
     # Not testcontainers' MinioContainer: that imports the minio client package.
     container = (
         DockerContainer(MINIO_IMAGE)
@@ -114,7 +114,7 @@ def minio(minio_endpoint):
 
 
 @pytest.fixture(scope="module")
-def fake_gcs_endpoint():
+def fake_gcs_endpoint(docker_daemon):
     # A resumable upload's session URL is built from the external URL, so the port is
     # chosen here and bound explicitly rather than mapped at random.
     host = DockerClient().host()
@@ -139,9 +139,7 @@ def fake_gcs(fake_gcs_endpoint):
 
 
 @pytest.fixture(scope="module")
-def azurite_container():
-    from testcontainers.community.azurite import AzuriteContainer
-
+def azurite_container(docker_daemon):
     # The SDK speaks a newer API version than the emulator admits to; the check is skipped.
     container = AzuriteContainer(AZURITE_IMAGE).with_command(
         "azurite --skipApiVersionCheck --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0"
@@ -221,8 +219,6 @@ def test_a_missing_bucket_is_an_error_where_the_service_tells_it_apart(backend):
     missing = f"no-such-{uuid.uuid4().hex[:8]}"
     before = _errors()
     if name == "minio":
-        from botocore.exceptions import ClientError
-
         store = _minio_store(source, bucket=missing)
         with pytest.raises(ClientError, match="NoSuchBucket"):
             store.read_blob("art", 1)
@@ -233,8 +229,6 @@ def test_a_missing_bucket_is_an_error_where_the_service_tells_it_apart(backend):
         assert store.blob_exists("art", 1) is False
         assert _errors() == before
     else:
-        from azure.core.exceptions import ResourceNotFoundError
-
         store = _azure_store(source, bucket=missing)
         for call in (store.read_blob, store.blob_exists, store.blob_size, store.delete_blob):
             with pytest.raises(ResourceNotFoundError, match="ContainerNotFound"):
@@ -246,8 +240,6 @@ def test_a_refused_credential_is_an_error_on_every_call(backend):
     """A wrong key is never "not there": read, exists, size and delete all raise."""
     name, source = backend
     if name == "minio":
-        from botocore.exceptions import ClientError
-
         store, error, text = (
             _minio_store(source, secret_key="wrong"),
             ClientError,
@@ -256,8 +248,6 @@ def test_a_refused_credential_is_an_error_on_every_call(backend):
     elif name == "fake_gcs":
         pytest.skip("fake-gcs-server checks no credential")
     else:
-        from azure.core.exceptions import HttpResponseError
-
         # Azure answers ``AuthenticationFailed`` (a ClientAuthenticationError), Azurite a
         # plain ``AuthorizationFailure``; both are the one HttpResponseError family.
         store = _azure_store(source, key="d29uZw==")
@@ -276,15 +266,11 @@ def test_an_unreachable_endpoint_is_an_error(backend, monkeypatch):
     name, source = backend
     nowhere = f"http://127.0.0.1:{_free_port()}"
     if name == "minio":
-        from botocore.exceptions import EndpointConnectionError
-
         monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")  # boto3 would retry for seconds otherwise
         store, error = _minio_store(nowhere), EndpointConnectionError
     elif name == "fake_gcs":
         pytest.skip("google-cloud-storage retries a connection error for 120 s by design")
     else:
-        from azure.core.exceptions import ServiceRequestError
-
         store, error = _azure_store(source, endpoint=nowhere), ServiceRequestError
     before = _errors()
 
