@@ -324,6 +324,25 @@ class Gate2:
         assert all(v.state == "ready" for v in bundle.outputs)
         assert all(ledger.store.read_blob(v.id, v.version) is not None for v in bundle.outputs)
 
+    def test_a_builds_checkpoints_and_their_outputs_resolve_in_one_read(self, ledger: Ledger):
+        build_id = _build(ledger)
+        first = _checkpoint(ledger, build_id)
+        second = _checkpoint(ledger, build_id)
+        other = _build(ledger)
+        _checkpoint(ledger, other)
+
+        bundles = ledger.releases.bundles_of(build_id, "checkpoint")
+
+        assert [b.release.release_id for b in bundles] == [
+            first.release.release_id,
+            second.release.release_id,
+        ]
+        for bundle, accepted in zip(bundles, (first, second), strict=True):
+            assert bundle.release == ledger.releases.get(accepted.release.release_id)
+            assert sorted(v.id for v in bundle.outputs) == sorted(v.id for v in accepted.outputs)
+            assert {v.release_id for v in bundle.outputs} == {accepted.release.release_id}
+        assert ledger.releases.bundles_of("no-such-build") == []
+
     def test_recovery_after_a_crash_between_prepare_and_accept(self, ledger: Ledger):
         build_id = _build(ledger)
         _checkpoint(ledger, build_id)
