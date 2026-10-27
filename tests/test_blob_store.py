@@ -891,6 +891,37 @@ class TestAzureBackendOverAFakeClient:
         store._client = _FakeContainerClient(tmp_path)
         return store
 
+    def test_a_missing_container_is_an_error_not_an_absence(self, tmp_path: Path):
+        """``BlobNotFound`` is absence; ``ContainerNotFound`` is the same 404 and is not."""
+        from azure.core.exceptions import ResourceNotFoundError
+
+        store = self._store(tmp_path)
+        gone = ResourceNotFoundError("the container does not exist")
+        gone.error_code = "ContainerNotFound"
+
+        class _NoContainer:
+            def download_blob(self):
+                raise gone
+
+            def get_blob_properties(self):
+                raise gone
+
+            def delete_blob(self):
+                raise gone
+
+            def exists(self):
+                return False  # the SDK's answer to any 404, which the store must not use
+
+        store._client.get_blob_client = lambda key: _NoContainer()
+        before = get_object_store_errors().snapshot()
+
+        for call in (store.read_blob, store.blob_exists, store.blob_size, store.delete_blob):
+            with pytest.raises(ResourceNotFoundError, match="container"):
+                call("artifact-1", 1)
+
+        after = get_object_store_errors().snapshot()
+        assert sum(after.values()) == sum(before.values()) + 4
+
     def test_write_publish_exists_size_delete(self, tmp_path: Path):
         store = self._store(tmp_path)
 

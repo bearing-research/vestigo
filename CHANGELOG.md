@@ -9,6 +9,16 @@ Schema change: `build_attempts` gains `principal`, added on open, and
 `node_links` is a new table (migration 15), so the table inventory Strata's
 contract tests pin grows by one.
 
+### Fixed
+
+- A missing Azure container is an error on every call, as a missing S3 bucket
+  is on a read; it read as an absent blob before, and `blob_exists` used the
+  SDK's `exists()`, which answers False to any 404 (#19). The emulator suite
+  now asserts on the wire what the fakes asserted: a missing bucket, a refused
+  credential and an unreachable endpoint are errors, never absence, on MinIO,
+  Azurite and fake-gcs-server (where a missing bucket is the one documented
+  exception, the GCS API answering one `NotFound` for both).
+
 ### Added
 
 - `node_links` and `GraphStore.link(node_id, relation, target)`, `links`,
