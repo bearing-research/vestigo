@@ -60,9 +60,9 @@ The package exports nothing at its top level; a consumer imports each module.
   builds whose `dispatch` is `runner`); `BuildState`, `AttemptState`, `DISPATCHES`.
 - `vestigo.releases`: `ReleaseStore(artifacts, builds)`, a build's checkpoint
   and final releases (`prepare`, `attach`, `accept`, `abandon`, `resume`,
-  `latest_accepted`, `bundles_of`, `reference`, `authority`); `Release`,
-  `ReleaseBundle` and
-  the `ReleaseError` family.
+  `latest_accepted`, `bundles_of`, `collectable_checkpoints` with its `keep`
+  bound, `reference`, `authority`); `Release`, `ReleaseBundle` and the
+  `ReleaseError` family.
 - `vestigo.operations`: the typed operations a release runs in its transaction
   (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`,
   `AdvanceReference`, `InsertAuditEvent`), with `to_json` and `from_json`.

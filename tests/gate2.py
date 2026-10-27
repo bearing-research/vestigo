@@ -694,6 +694,23 @@ class Gate2:
         assert all(_state(ledger, v) == "ready" for v in first.outputs)
         assert all(ledger.store.get_artifact(v.id, v.version) is None for v in second.outputs)
 
+    def test_collectable_checkpoints_keep_the_newest_k_of_an_open_build(self, ledger: Ledger):
+        """A latest-k policy is the same read with a deeper bound; a finished build keeps none."""
+        build_id = _build(ledger)
+        checkpoints = [_checkpoint(ledger, build_id) for _ in range(4)]
+
+        def rows(*bundles):
+            return sorted((v.id, v.version) for bundle in bundles for v in bundle.outputs)
+
+        assert ledger.releases.collectable_checkpoints(keep=2) == rows(*checkpoints[:2])
+        assert ledger.releases.collectable_checkpoints(keep=10) == []
+        with pytest.raises(ValueError):
+            ledger.releases.collectable_checkpoints(keep=0)
+
+        final = ledger.releases.prepare(build_id, "a1", "final")
+        ledger.releases.accept(final.release_id, [_stage(ledger, final, "model", b"done")])
+        assert ledger.releases.collectable_checkpoints(keep=2) == rows(*checkpoints)
+
     # --- Fences and operations under two processes ---
 
     def test_two_builds_asserting_one_revision_have_one_winner(self, ledger: Ledger):

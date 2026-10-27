@@ -5,6 +5,13 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `collectable_checkpoints(keep=k)` spares the newest `k` accepted checkpoints
+  of each building build, so a latest-k policy is the same read with a deeper
+  bound; `accept` states that an empty `final` release ends a build without a
+  product (#15).
+
 ## 0.2.0 - 2026-10-26
 
 Schema change: `artifact_builds` gains `dispatch`, backfilled on open.
