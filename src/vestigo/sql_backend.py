@@ -332,7 +332,8 @@ class SqliteDialect:
 class _Row(Mapping):
     """A psycopg row that behaves like ``sqlite3.Row``.
 
-    Supports both ``row["col"]`` and ``row[0]``; implementing ``Mapping`` makes ``dict(row)`` work.
+    Supports ``row["col"]``, ``row[0]`` and ``row[1:3]``; implementing ``Mapping`` makes
+    ``dict(row)`` work.
     """
 
     __slots__ = ("_columns", "_values")
@@ -341,8 +342,8 @@ class _Row(Mapping):
         self._columns = columns
         self._values = values
 
-    def __getitem__(self, key: str | int) -> Any:
-        if isinstance(key, int):
+    def __getitem__(self, key: str | int | slice) -> Any:
+        if isinstance(key, int | slice):
             return self._values[key]
         try:
             return self._values[self._columns.index(key)]

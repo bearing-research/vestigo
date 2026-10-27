@@ -330,6 +330,30 @@ class TestDefinitions:
         assert store.definition_of("old", 2) == first
         assert store.versions_lacking_definition() == []
 
+    def test_versions_lacking_a_definition_come_from_every_tenant(self, store):
+        """The store-wide upgrade read: each row carries the tenant set_definitions needs."""
+        spec = TransformSpec("x@v1", {}, [])
+        for tenant in ("t1", "t2"):
+            version = store.create_artifact("old-" + tenant, "prov-" + tenant, spec, tenant=tenant)
+            store.finalize_artifact("old-" + tenant, version, "{}", 1, 1)
+        version = store.create_artifact("old", "prov-none", spec)
+        store.finalize_artifact("old", version, "{}", 1, 1)
+
+        lacking = store.versions_lacking_definition()
+        assert sorted(v.tenant or "" for v in lacking) == ["", "t1", "t2"]
+
+        nodes = {}
+        for tenant in ("t1", "t2", None):
+            nodes[tenant] = store.graph.put_batch(THREE, tenant=tenant)[-1]
+            store.set_definitions(
+                {(v.id, v.version): nodes[tenant] for v in lacking if (v.tenant or None) == tenant},
+                tenant=tenant,
+            )
+        assert store.versions_lacking_definition() == []
+        for v in lacking:
+            tenant = v.tenant or None
+            assert store.definition_of(v.id, v.version, tenant=tenant) == nodes[tenant]
+
     def test_a_definition_must_be_a_node_the_store_holds(self, store):
         """A string that is not a node of the version's scope is refused, not recorded."""
         spec = TransformSpec("x@v1", {}, [])

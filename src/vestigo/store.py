@@ -1436,10 +1436,12 @@ class ArtifactStore:
     def versions_lacking_definition(self, executor: str | None = None) -> list[ArtifactVersion]:
         """Current versions with a transform spec and no producing node, oldest first.
 
-        With *executor*, only the versions of that executor, selected in SQL by the
-        prefix every stored spec starts with (``canonical_json`` sorts its keys).
-        Oldest first is dependency order for rows one store wrote: a version's
-        inputs were stored before it.
+        Every tenant's versions: this is the read of a store-wide upgrade, and each
+        version carries its ``tenant`` for the :meth:`set_definitions` call that
+        records its node, one call per tenant. With *executor*, only the versions
+        of that executor, selected in SQL by the prefix every stored spec starts
+        with (``canonical_json`` sorts its keys). Oldest first is dependency order
+        for rows one store wrote: a version's inputs were stored before it.
         """
         conn = self._get_connection()
         try:
