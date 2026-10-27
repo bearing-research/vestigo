@@ -5,10 +5,17 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
-Schema change: `build_attempts` gains `principal`, added on open.
+Schema change: `build_attempts` gains `principal`, added on open, and
+`node_links` is a new table (migration 15), so the table inventory Strata's
+contract tests pin grows by one.
 
 ### Added
 
+- `node_links` and `GraphStore.link(node_id, relation, target)`, `links`,
+  `linked_from`: a relation between two stored nodes that is inside neither
+  identity. `reconstructed_from` (ADR 002 §6.3) is the first: a complete node
+  names the historical node rebuilt for rows from before roles were recorded
+  (#18, friction log 8).
 - `build_attempts.principal`: `open_attempt(principal=)` records who runs an
   attempt, which a resume may make someone other than the build's initiator;
   `AttemptState.principal` reads it back (#17).

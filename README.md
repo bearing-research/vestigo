@@ -68,8 +68,10 @@ The package exports nothing at its top level; a consumer imports each module.
   (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`,
   `AdvanceReference`, `InsertAuditEvent`), with `to_json` and `from_json`.
 - `vestigo.graph`: `GraphStore` (reached as `ArtifactStore.graph`: `put_batch`,
-  `get`, `inputs`, `ancestors`, `dependents`, `topological_order`), `NodeSpec`,
-  `Edge`, `Traversal(max_depth=MAX_DEPTH, max_nodes=MAX_NODES)`, the `CGN1` and
+  `get`, `inputs`, `ancestors`, `dependents`, `topological_order`; `link`,
+  `links`, `linked_from` for relations outside any id, `reconstructed_from`
+  among them), `NodeSpec`, `Edge`, `Link`,
+  `Traversal(max_depth=MAX_DEPTH, max_nodes=MAX_NODES)`, the `CGN1` and
   `CGD1` encoders (`node_id`, `cgn1_envelope`, `graph_definition_id`,
   `cgd1_envelope`) and `identity_scope`.
 - `vestigo.provenance`: `TransformSpec(executor, params, inputs)` and its
