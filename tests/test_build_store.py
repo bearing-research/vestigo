@@ -619,6 +619,39 @@ class TestAttempts:
         assert (build.state, build.version, build.completed_at) == ("ready", 3, clock())
         assert not build_store.open_attempt(build_id, "a3", writable_until=clock() + 3600)
 
+    def test_an_attempt_records_who_runs_it(self, build_store, clock):
+        """A resume by another principal is their attempt; the build keeps its initiator."""
+        build_id = self._pending(build_store)
+        assert build_store.open_attempt(
+            build_id, "a1", writable_until=clock() + 10, principal="user:alice"
+        )
+        assert build_store.get_attempt(build_id, "a1").principal == "user:alice"
+        # Re-opened without one, the attempt keeps its principal.
+        assert build_store.open_attempt(build_id, "a1", writable_until=clock() + 10)
+        assert build_store.get_attempt(build_id, "a1").principal == "user:alice"
+
+        clock.now += 61
+        assert build_store.open_attempt(
+            build_id, "a2", writable_until=clock() + 10, principal="user:bob"
+        )
+        assert build_store.get_attempt(build_id, "a2").principal == "user:bob"
+        assert build_store.get_attempt(build_id, "a1").principal == "user:alice"
+
+    def test_an_older_database_gains_the_attempt_principal(self, tmp_path, clock):
+        seed_build_targets(tmp_path)
+        store = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+        build_id = self._pending(store)
+        with closing(store._get_connection()) as conn:
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN principal")
+            conn.commit()
+
+        reopened = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+
+        assert reopened.open_attempt(
+            build_id, "a1", writable_until=clock() + 10, principal="user:alice"
+        )
+        assert reopened.get_attempt(build_id, "a1").principal == "user:alice"
+
     def test_find_open_build_is_scoped_to_the_tenant(self, build_store, clock):
         key = "computation-1"
         acme = self._pending(build_store, tenant="acme", computation_key=key)
