@@ -13,16 +13,16 @@ model (ADR 002).
 | `tla/ArtifactLifecycle.tla` | `artifact_versions`: create, write blob, fail, finalize (own id, refresh, foreign id through a pointer), finalize together, retain, release, one row of a sweep |
 | `tla/Artifact_GCRebuild.cfg` | One id with GC on: a sweep during a rebuild leaves the current value in place (1,868 states) |
 | `tla/Artifact_CrossIdDedup.cfg` | Two ids sharing a provenance, GC off: the loser reads the winner's bytes through its pointer (1,495 states) |
-| `tla/Artifact_Patched.cfg` | Both ids, GC on, pointers and sweeps together. All invariants, `PointersResolve` among them |
-| `tla/Artifact_Retention.cfg` | With retention roots and required edges (`MaxVer = 2`). All invariants and `HeldIsKept` |
+| `tla/Artifact_Patched.cfg` | Both ids, GC on, pointers and sweeps together. All invariants, `PointersResolve` among them (5,243,224 states) |
+| `tla/Artifact_Retention.cfg` | With retention roots and required edges (`MaxVer = 2`). All invariants and `HeldIsKept` (3,737,697 states) |
 | `tla/BuildLease.tla` | One build and its lease: claim, reclaim, open an attempt, heartbeat, checkpoint, publish, finalize, complete, fail, and the pull-path routes |
-| `tla/Build_RunnerPath.cfg` | Two runners, lease can expire mid-build, unpatched. Violation: a lapsed runner finalizes |
-| `tla/Build_PullPath.cfg` | Two executors fetch the same build's manifest, unpatched. Violation: both upload |
-| `tla/Build_Patched.cfg` | Runners and executors as the code is: attempts rotate the fence, a claim or reclaim clears it, a lapsed lease fences its attempt (`OnlyLeaseHolderReleases`). All invariants hold |
+| `tla/Build_RunnerPath.cfg` | Two runners, lease can expire mid-build, unpatched. Violation: a lapsed runner finalizes (`OnlyLeaseHolderFails`, 4 steps) |
+| `tla/Build_PullPath.cfg` | Two executors fetch the same build's manifest, unpatched. Violation: both upload (`ReadyBytesStable`, 6 steps) |
+| `tla/Build_Patched.cfg` | Runners and executors as the code is: attempts rotate the fence, a claim or reclaim clears it, a lapsed lease fences its attempt (`OnlyLeaseHolderReleases`). All invariants hold (373 states) |
 
-The state counts above are from the last TLC run of that configuration; the
-other configurations have not been re-run since the models were rewritten to
-match the code (2026-10-26) and should be before the next release.
+Every configuration was last run on 2026-10-26 (TLC 2.19, Java 21) against the
+models as they are; the counts are distinct states from that run, and the two
+violations are the expected ones. Re-run after a change to either model.
 
 ```bash
 curl -sSLO https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
