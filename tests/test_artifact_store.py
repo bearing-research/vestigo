@@ -98,6 +98,17 @@ class TestTransformSpec:
         assert version.params == {}
 
 
+class TestVersionRowMapping:
+    def test_the_select_list_is_the_dataclass(self):
+        # Every SELECT of a version and its constructor read `_VERSION_FIELDS`; a
+        # column added to the dataclass alone would come back as its default.
+        from dataclasses import fields
+
+        from vestigo.store import _VERSION_FIELDS
+
+        assert _VERSION_FIELDS == tuple(field.name for field in fields(ArtifactVersion))
+
+
 class TestProvenanceHash:
     def test_deterministic(self):
         spec = TransformSpec(
