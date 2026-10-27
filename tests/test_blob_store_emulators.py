@@ -20,7 +20,12 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.docker_client import DockerClient
 from testcontainers.core.wait_strategies import HttpWaitStrategy, LogMessageWaitStrategy
 
-from vestigo.blob_store import AzureBlobStore, GCSBlobStore, S3BlobStore
+from vestigo.blob_store import (
+    AzureBlobStore,
+    GCSBlobStore,
+    S3BlobStore,
+    get_object_store_errors,
+)
 
 docker_or_skip()
 
@@ -47,8 +52,47 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _minio_store(endpoint: str, *, bucket: str = BUCKET, secret_key: str = "minioadmin"):
+    return S3BlobStore(
+        bucket=bucket,
+        prefix="artifacts",
+        region="us-east-1",
+        endpoint_url=endpoint,
+        access_key="minioadmin",
+        secret_key=secret_key,
+    )
+
+
+def _gcs_store(endpoint: str, *, bucket: str = BUCKET):
+    return GCSBlobStore(
+        bucket=bucket, prefix="artifacts", anonymous=True, endpoint_override=endpoint
+    )
+
+
+def _azure_store(container, *, bucket: str = BUCKET, endpoint: str | None = None, key=None):
+    if endpoint is None and key is None:
+        return AzureBlobStore(
+            account_name=container.account_name,
+            container_name=bucket,
+            prefix="artifacts",
+            connection_string=container.get_connection_string(),
+        )
+    return AzureBlobStore(
+        account_name=container.account_name,
+        container_name=bucket,
+        prefix="artifacts",
+        account_key=key or container.account_key,
+        endpoint_url=endpoint or _azure_endpoint(container),
+    )
+
+
+def _azure_endpoint(container) -> str:
+    host = container.get_container_host_ip()
+    return f"http://{host}:{container.get_exposed_port(container.blob_service_port)}"
+
+
 @pytest.fixture(scope="module")
-def minio():
+def minio_endpoint():
     # Not testcontainers' MinioContainer: that imports the minio client package.
     container = (
         DockerContainer(MINIO_IMAGE)
@@ -60,20 +104,17 @@ def minio():
     )
     with container:
         endpoint = f"http://{container.get_container_host_ip()}:{container.get_exposed_port(9000)}"
-        store = S3BlobStore(
-            bucket=BUCKET,
-            prefix="artifacts",
-            region="us-east-1",
-            endpoint_url=endpoint,
-            access_key="minioadmin",
-            secret_key="minioadmin",
-        )
-        store._client.create_bucket(Bucket=BUCKET)
-        yield store
+        _minio_store(endpoint)._client.create_bucket(Bucket=BUCKET)
+        yield endpoint
 
 
 @pytest.fixture(scope="module")
-def fake_gcs():
+def minio(minio_endpoint):
+    return _minio_store(minio_endpoint)
+
+
+@pytest.fixture(scope="module")
+def fake_gcs_endpoint():
     # A resumable upload's session URL is built from the external URL, so the port is
     # chosen here and bound explicitly rather than mapped at random.
     host = DockerClient().host()
@@ -87,18 +128,18 @@ def fake_gcs():
         .waiting_for(LogMessageWaitStrategy("server started"))
     )
     with container:
-        store = GCSBlobStore(
-            bucket=BUCKET,
-            prefix="artifacts",
-            anonymous=True,
-            endpoint_override=f"http://{host}:{port}",
-        )
-        store._client.create_bucket(BUCKET)
-        yield store
+        endpoint = f"http://{host}:{port}"
+        _gcs_store(endpoint)._client.create_bucket(BUCKET)
+        yield endpoint
 
 
 @pytest.fixture(scope="module")
-def azurite():
+def fake_gcs(fake_gcs_endpoint):
+    return _gcs_store(fake_gcs_endpoint)
+
+
+@pytest.fixture(scope="module")
+def azurite_container():
     from testcontainers.community.azurite import AzuriteContainer
 
     # The SDK speaks a newer API version than the emulator admits to; the check is skipped.
@@ -106,19 +147,32 @@ def azurite():
         "azurite --skipApiVersionCheck --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0"
     )
     with container:
-        store = AzureBlobStore(
-            account_name=container.account_name,
-            container_name=BUCKET,
-            prefix="artifacts",
-            connection_string=container.get_connection_string(),
-        )
-        store._client.create_container()
-        yield store
+        _azure_store(container)._client.create_container()
+        yield container
+
+
+@pytest.fixture(scope="module")
+def azurite(azurite_container):
+    return _azure_store(azurite_container)
 
 
 @pytest.fixture(params=["minio", "fake_gcs", "azurite"])
 def store(request):
     return request.getfixturevalue(request.param)
+
+
+@pytest.fixture(params=["minio", "fake_gcs", "azurite"])
+def backend(request):
+    """``(name, what a store of it is built from)`` for the stores that must fail."""
+    if request.param == "minio":
+        return "minio", request.getfixturevalue("minio_endpoint")
+    if request.param == "fake_gcs":
+        return "fake_gcs", request.getfixturevalue("fake_gcs_endpoint")
+    return "azurite", request.getfixturevalue("azurite_container")
+
+
+def _errors() -> int:
+    return sum(get_object_store_errors().snapshot().values())
 
 
 def test_a_blob_round_trips_and_is_gone_after_delete(store, tmp_path: Path):
@@ -157,6 +211,87 @@ def test_a_large_blob_round_trips_in_parts(store, tmp_path: Path):
     with reader as f:
         chunks = iter(lambda: f.read(1 << 20), b"")
         assert b"".join(chunks) == LARGE
+
+
+def test_a_missing_bucket_is_an_error_where_the_service_tells_it_apart(backend):
+    """S3 says ``NoSuchBucket`` on a GET and Azure ``ContainerNotFound`` on every call;
+    neither reads as an absent blob. GCS answers the one ``NotFound`` for both, so a
+    misnamed bucket there is the documented exception; a HEAD on S3 is the other."""
+    name, source = backend
+    missing = f"no-such-{uuid.uuid4().hex[:8]}"
+    before = _errors()
+    if name == "minio":
+        from botocore.exceptions import ClientError
+
+        store = _minio_store(source, bucket=missing)
+        with pytest.raises(ClientError, match="NoSuchBucket"):
+            store.read_blob("art", 1)
+        assert _errors() == before + 1
+    elif name == "fake_gcs":
+        store = _gcs_store(source, bucket=missing)
+        assert store.read_blob("art", 1) is None
+        assert store.blob_exists("art", 1) is False
+        assert _errors() == before
+    else:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        store = _azure_store(source, bucket=missing)
+        for call in (store.read_blob, store.blob_exists, store.blob_size, store.delete_blob):
+            with pytest.raises(ResourceNotFoundError, match="ContainerNotFound"):
+                call("art", 1)
+        assert _errors() == before + 4
+
+
+def test_a_refused_credential_is_an_error_on_every_call(backend):
+    """A wrong key is never "not there": read, exists, size and delete all raise."""
+    name, source = backend
+    if name == "minio":
+        from botocore.exceptions import ClientError
+
+        store, error, text = (
+            _minio_store(source, secret_key="wrong"),
+            ClientError,
+            "403|SignatureDoesNotMatch",  # a HEAD carries no body, so no code
+        )
+    elif name == "fake_gcs":
+        pytest.skip("fake-gcs-server checks no credential")
+    else:
+        from azure.core.exceptions import HttpResponseError
+
+        # Azure answers ``AuthenticationFailed`` (a ClientAuthenticationError), Azurite a
+        # plain ``AuthorizationFailure``; both are the one HttpResponseError family.
+        store = _azure_store(source, key="d29uZw==")
+        error, text = HttpResponseError, "Authentication|Authorization"
+    before = _errors()
+
+    for call in (store.read_blob, store.blob_exists, store.blob_size, store.delete_blob):
+        with pytest.raises(error, match=text):
+            call("art", 1)
+
+    assert _errors() == before + 4
+
+
+def test_an_unreachable_endpoint_is_an_error(backend, monkeypatch):
+    """A connection failure propagates as the SDK's error and counts for the metric."""
+    name, source = backend
+    nowhere = f"http://127.0.0.1:{_free_port()}"
+    if name == "minio":
+        from botocore.exceptions import EndpointConnectionError
+
+        monkeypatch.setenv("AWS_MAX_ATTEMPTS", "1")  # boto3 would retry for seconds otherwise
+        store, error = _minio_store(nowhere), EndpointConnectionError
+    elif name == "fake_gcs":
+        pytest.skip("google-cloud-storage retries a connection error for 120 s by design")
+    else:
+        from azure.core.exceptions import ServiceRequestError
+
+        store, error = _azure_store(source, endpoint=nowhere), ServiceRequestError
+    before = _errors()
+
+    with pytest.raises(error):
+        store.read_blob("art", 1)
+
+    assert _errors() == before + 1
 
 
 def test_a_presigned_get_reads_the_blob_from_minio(minio):

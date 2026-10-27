@@ -555,7 +555,11 @@ def azure_account_url(endpoint_url: str, account_name: str) -> str:
 
 
 def _gcs_absent(exc: BaseException) -> bool:
-    """Whether a google-api-core error is a 404."""
+    """Whether a google-api-core error is a 404.
+
+    A missing bucket is the same ``NotFound`` as a missing object (only the message
+    differs), so on GCS a misnamed bucket reads as empty; S3 and Azure tell them apart.
+    """
     from google.api_core.exceptions import NotFound
 
     return isinstance(exc, NotFound)
@@ -805,9 +809,12 @@ class GCSBlobStore(BlobStore):
 
 
 def _azure_absent(exc: BaseException) -> bool:
+    """Whether an Azure error says the blob is not there; a missing container is not that."""
     from azure.core.exceptions import ResourceNotFoundError
 
-    return isinstance(exc, ResourceNotFoundError)
+    return isinstance(exc, ResourceNotFoundError) and (
+        getattr(exc, "error_code", None) != "ContainerNotFound"
+    )
 
 
 class _AzureDownloadReader(io.RawIOBase):
@@ -1033,11 +1040,19 @@ class AzureBlobStore(BlobStore):
         self._upload_from_path(key, source_path)
 
     def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in Azure Blob Storage."""
+        """Check if blob exists in Azure Blob Storage.
+
+        Not the SDK's ``exists()``: that answers False to any 404, a missing container's
+        included, which must be an error here as it is on S3.
+        """
         key = self._azure_key(artifact_id, version)
         blob_client = self._client.get_blob_client(key)
-        with _object_store_call("head"):
-            return blob_client.exists()
+        try:
+            with _object_store_call("head", _azure_absent):
+                blob_client.get_blob_properties()
+        except FileNotFoundError:
+            return False
+        return True
 
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from Azure Blob Storage metadata."""
