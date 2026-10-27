@@ -594,15 +594,31 @@ class ReleaseStore:
         """A build's releases in sequence order, of one kind or all."""
         conn = self._connect()
         try:
-            sql = "SELECT * FROM build_releases WHERE build_id = ?"
-            params: list = [build_id]
-            if kind is not None:
-                sql += " AND kind = ?"
-                params.append(kind)
-            rows = conn.execute(sql + " ORDER BY kind, sequence", params).fetchall()
+            return self._releases_of_on(conn, build_id, kind)
         finally:
             conn.close()
-        return [_release_from_row(r) for r in rows]
+
+    def bundles_of(self, build_id: str, kind: str | None = None) -> list[ReleaseBundle]:
+        """A build's releases with their outputs, in sequence order, in one read.
+
+        What a resume or a prune reads: :meth:`releases_of` and :meth:`bundle` per
+        release, as two statements on one connection.
+        """
+        conn = self._connect()
+        try:
+            releases = self._releases_of_on(conn, build_id, kind)
+            if not releases:
+                return []
+            marks = ", ".join("?" for _ in releases)
+            outputs = self._artifacts._versions_where(
+                conn, f"release_id IN ({marks})", tuple(r.release_id for r in releases)
+            )
+        finally:
+            conn.close()
+        by_release: dict[str | None, list[ArtifactVersion]] = {r.release_id: [] for r in releases}
+        for version in outputs:
+            by_release[version.release_id].append(version)
+        return [ReleaseBundle(r, by_release[r.release_id]) for r in releases]
 
     def reference(self, name: str, *, tenant: str | None = None) -> tuple[str, int] | None:
         """``(release_id, revision)`` of a reference, or ``None`` when it does not exist."""
@@ -629,6 +645,16 @@ class ReleaseStore:
         return None if row is None else row["release_id"]
 
     # --- Internals ---
+
+    @staticmethod
+    def _releases_of_on(conn: StoreConnection, build_id: str, kind: str | None) -> list[Release]:
+        sql = "SELECT * FROM build_releases WHERE build_id = ?"
+        params: list = [build_id]
+        if kind is not None:
+            sql += " AND kind = ?"
+            params.append(kind)
+        rows = conn.execute(sql + " ORDER BY kind, sequence", params).fetchall()
+        return [_release_from_row(r) for r in rows]
 
     @staticmethod
     def _get_on(conn: StoreConnection, release_id: str) -> Release | None:

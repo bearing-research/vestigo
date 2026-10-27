@@ -5,6 +5,12 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `ReleaseStore.bundles_of(build_id, kind=None)`: a build's releases with
+  their outputs in one read, what a resume or a prune did as `releases_of`
+  plus `bundle` per release (#13, friction log 6).
+
 ### Changed
 
 - **A build's `dispatch` is a column.** `artifact_builds.dispatch` is
