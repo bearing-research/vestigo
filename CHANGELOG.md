@@ -5,6 +5,11 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-26
+
+Schema change: `artifact_builds` gains `dispatch`, backfilled on open.
+Strata moves its pin to this version with its own dispatch change.
+
 ### Added
 
 - `ReleaseStore.bundles_of(build_id, kind=None)`: a build's releases with
