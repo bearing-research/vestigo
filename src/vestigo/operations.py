@@ -45,7 +45,11 @@ class AssignAuthority:
 
 @dataclass(frozen=True)
 class AdvanceReference:
-    """Move a mutable reference to the release's outputs, which it then retains."""
+    """Move a mutable reference to the release's outputs, which it then retains.
+
+    *release_id* is an accepted release of the tenant, or the release being accepted;
+    any other fails the operation.
+    """
 
     name: str
     release_id: str

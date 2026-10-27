@@ -29,6 +29,7 @@ from vestigo.operations import (
 )
 from vestigo.provenance import TransformSpec, checkpoint_output_key, derive_subkey, run_output_key
 from vestigo.releases import (
+    HEAD_ROOT_KIND,
     OperationFailed,
     Release,
     ReleaseBundle,
@@ -73,13 +74,16 @@ def ledger(backend_store) -> Ledger:
 
 def _build(
     ledger: Ledger,
-    attempt: str = "a1",
+    attempt: str | None = "a1",
     *,
     occurrence: str | None = None,
     computation_key: str = PARENT,
     tenant: str | None = None,
 ) -> str:
-    """A building build under *attempt* (runner-1's 60 s lease), targeting its final output."""
+    """A building build under *attempt* (runner-1's 60 s lease), targeting its final output.
+
+    Pending, with no attempt, when *attempt* is None.
+    """
     build_id = uuid.uuid4().hex
     target = f"final-{build_id}"
     version = ledger.store.create_artifact(
@@ -99,9 +103,10 @@ def _build(
         occurrence=occurrence,
         computation_key=computation_key,
     )
-    assert ledger.builds.open_attempt(
-        build_id, attempt, writable_until=ledger.clock() + 3600, lease_owner="runner-1"
-    )
+    if attempt is not None:
+        assert ledger.builds.open_attempt(
+            build_id, attempt, writable_until=ledger.clock() + 3600, lease_owner="runner-1"
+        )
     return build_id
 
 
@@ -670,8 +675,8 @@ class TestAttemptsAndFences:
         staged = [_stage(ledger, final, "model", b"done")]
         real_check = ReleaseStore._check_outputs
 
-        def failing_underneath(self, conn, release, staged_):
-            real_check(self, conn, release, staged_)
+        def failing_underneath(self, conn, release, staged_, sizes):
+            real_check(self, conn, release, staged_, sizes)
             conn.execute(
                 "UPDATE artifact_builds SET state = 'failed' WHERE build_id = ?", (build_id,)
             )
@@ -703,6 +708,127 @@ class TestAttemptsAndFences:
         assert isinstance(bundle, ReleaseBundle) and bundle.release.state == "accepted"
         assert failed is False
         assert ledger.builds.get_build(build_id).state == "ready"
+
+    def test_a_runner_checkpoints_under_the_attempt_its_claim_opens(self, ledger: Ledger):
+        build_id = _build(ledger, None)
+        assert ledger.builds.claim_build(build_id, "runner-1", 60.0)
+        assert ledger.builds.open_attempt(
+            build_id, "a1", writable_until=ledger.clock() + 3600, lease_owner="runner-1"
+        )
+        first = _checkpoint(ledger, build_id)
+        assert first.release.state == "accepted"
+
+        # The orphan's reclaimer continues it the same way, from the accepted checkpoint.
+        ledger.clock.now += 120
+        assert ledger.builds.reclaim_expired_build(build_id, "runner-2", 60.0)
+        resumed = ledger.releases.resume(
+            build_id,
+            "a2",
+            writable_until=ledger.clock() + 3600,
+            lease_owner="runner-2",
+            from_release=first.release.release_id,
+        )
+        assert resumed == 0
+        assert _checkpoint(ledger, build_id, "a2").release.sequence == 2
+
+    def test_a_new_attempt_abandons_what_the_fenced_ones_left_unsettled(self, ledger: Ledger):
+        """However the attempt opens; else every later checkpoint waits on a dead release."""
+        build_id = _build(ledger)
+        _checkpoint(ledger, build_id)
+        crashed = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        ledger.clock.now += 120
+        assert ledger.builds.open_attempt(
+            build_id, "a2", writable_until=ledger.clock() + 3600, lease_owner="runner-2"
+        )
+        assert ledger.releases.get(crashed.release_id).state == "abandoned"
+        assert _checkpoint(ledger, build_id, "a2").release.state == "accepted"
+
+        stuck = ledger.releases.prepare(build_id, "a2", "checkpoint")
+        ledger.clock.now += 120
+        assert ledger.builds.reclaim_expired_build(build_id, "runner-3", 60.0)
+        assert ledger.builds.open_attempt(
+            build_id, "a3", writable_until=ledger.clock() + 3600, lease_owner="runner-3"
+        )
+        assert ledger.releases.get(stuck.release_id).state == "abandoned"
+        assert _checkpoint(ledger, build_id, "a3").release.state == "accepted"
+
+    def test_attach_waits_for_an_acceptance_and_refuses_a_settled_release(self, ledger: Ledger):
+        """A row attached mid-acceptance would sit ``building`` under an accepted release."""
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        staged = [_stage(ledger, release, "model", b"w")]
+        late = ledger.store.create_artifact("late-row", "late-key", SPEC, minted=True)
+
+        def attaching(other: Ledger) -> object:
+            try:
+                return other.releases.attach(release.release_id, "a1", [("late-row", late)])
+            except ValueError as exc:
+                return exc
+
+        bundle, attached, locked = _interleave(
+            ledger,
+            lambda ledger_: ledger_.releases.accept(release.release_id, staged),
+            attaching,
+            after="SELECT state, release_id FROM artifact_versions",
+        )
+
+        assert locked, "attach ran inside the acceptance's transaction"
+        assert isinstance(bundle, ReleaseBundle) and bundle.release.state == "accepted"
+        assert isinstance(attached, ValueError) and "is accepted" in str(attached)
+        assert ledger.store.get_artifact("late-row", late).release_id is None
+        assert {v.state for v in ledger.releases.bundle(release.release_id).outputs} == {"ready"}
+
+    def test_a_rejection_never_lands_on_a_retry_accepted_meanwhile(
+        self, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+    ):
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        staged = [_stage(ledger, release, "model", b"w")]
+        ledger.clock.now += 120  # the lease lapses
+        real_settle = ReleaseStore._settle
+        retried: list[ReleaseBundle] = []
+
+        def settle_after_a_retry(self, release_id: str, state: str) -> None:
+            # Between the fence's rollback and the rejection, the runner renews its
+            # lease and the caller's retry is accepted.
+            if not retried:
+                assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+                retried.append(ledger.releases.accept(release_id, staged))
+            real_settle(self, release_id, state)
+
+        monkeypatch.setattr(ReleaseStore, "_settle", settle_after_a_retry)
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.accept(release.release_id, staged)
+
+        assert retried[0].release.state == "accepted"
+        assert ledger.releases.get(release.release_id).state == "accepted"
+        assert {_state(ledger, v) for v in staged} == {"ready"}
+
+    def test_outputs_are_sized_before_the_builds_key_is_taken(
+        self, ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On SQLite the key is the database's write lock, and a remote size is a request."""
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        staged = [_stage(ledger, release, "model", b"w"), _stage(ledger, release, "metrics", b"{}")]
+        events: list[str] = []
+        blob_size = ledger.store.blob_store.blob_size
+        begin_write = ledger.store.dialect.begin_write
+
+        def sizing(artifact_id: str, version: int) -> int | None:
+            events.append("size")
+            return blob_size(artifact_id, version)
+
+        def locking(conn, key: str) -> None:
+            events.append(f"key:{key}")
+            begin_write(conn, key)
+
+        monkeypatch.setattr(ledger.store.blob_store, "blob_size", sizing)
+        monkeypatch.setattr(ledger.store.dialect, "begin_write", locking)
+        ledger.releases.accept(release.release_id, staged)
+
+        assert events[: events.index(f"key:{build_id}")] == ["size", "size"]
+        assert {_state(ledger, v) for v in staged} == {"ready"}
 
 
 class TestReferencesAndAuthorities:
@@ -749,8 +875,9 @@ class TestReferencesAndAuthorities:
         assertion's read alone proves nothing: the advance is guarded on it.
         """
         b1, b2 = _build(ledger), _build(ledger)
-        _checkpoint(ledger, b1, operations=[AdvanceReference("shared/head", "seed")])
-        assert ledger.releases.reference("shared/head") == ("seed", 1)
+        seed = _checkpoint(ledger, b1).release.release_id
+        ledger.releases.apply(b1, "a1", [AdvanceReference("shared/head", seed)])
+        assert ledger.releases.reference("shared/head") == (seed, 1)
         r1 = ledger.releases.prepare(b1, "a1", "checkpoint")
         r2 = ledger.releases.prepare(b2, "a1", "checkpoint")
         s1, s2 = [_stage(ledger, r1, "model", b"1")], [_stage(ledger, r2, "model", b"2")]
@@ -776,6 +903,23 @@ class TestReferencesAndAuthorities:
         lost = r2 if winner.release.release_id == r1.release_id else r1
         assert ledger.releases.get(lost.release_id).state == "preparing"
         assert _state(ledger, (s1 if lost is r1 else s2)[0]) == "building"
+
+    def test_a_reference_moves_only_to_an_accepted_release_of_its_tenant(self, ledger: Ledger):
+        """Else it names nothing and its old head's outputs lose their root."""
+        build_id = _build(ledger)
+        head = _checkpoint(ledger, build_id).release.release_id
+        ledger.releases.apply(build_id, "a1", [AdvanceReference("train/best", head)])
+        roots = ledger.store.retention_roots(kind=HEAD_ROOT_KIND)
+        assert {r["holder"] for r in roots} == {"train/best"} and len(roots) == 2
+
+        unsettled = ledger.releases.prepare(build_id, "a1", "checkpoint").release_id
+        foreign = _checkpoint(ledger, _build(ledger, tenant="acme")).release.release_id
+        for release_id in ("no-such-release", unsettled, foreign):
+            with pytest.raises(OperationFailed, match="not an accepted release"):
+                ledger.releases.apply(build_id, "a1", [AdvanceReference("train/best", release_id)])
+
+        assert ledger.releases.reference("train/best") == (head, 1)
+        assert ledger.store.retention_roots(kind=HEAD_ROOT_KIND) == roots
 
     def test_multi_slot_authority_is_all_or_none(self, ledger: Ledger):
         taken = _build(ledger)
@@ -909,3 +1053,46 @@ class TestCheckpointRetention:
         final = ledger.releases.prepare(build_id, "a1", "final")
         ledger.releases.accept(final.release_id, [_stage(ledger, final, "model", b"done")])
         assert ledger.releases.collectable_checkpoints(keep=2) == rows(*checkpoints)
+
+    def test_a_builds_checkpoints_stay_collectable_once_its_row_is_gone(self, ledger: Ledger):
+        """Old builds are cleaned up, and an empty final's placeholder takes its build row."""
+
+        def rows(bundle):
+            return sorted((v.id, v.version) for v in bundle.outputs)
+
+        finished = _build(ledger)
+        kept = _checkpoint(ledger, finished)
+        final = ledger.releases.prepare(finished, "a1", "final")
+        ledger.releases.accept(final.release_id, [_stage(ledger, final, "model", b"done")])
+        empty = _build(ledger)
+        stored_nothing = _checkpoint(ledger, empty)
+        ledger.releases.accept(ledger.releases.prepare(empty, "a1", "final").release_id, [])
+        everything = sorted(rows(kept) + rows(stored_nothing))
+        assert ledger.releases.collectable_checkpoints() == everything
+
+        ledger.store.cleanup_failed(max_age_seconds=-10)
+        assert ledger.builds.get_build(empty) is None
+        ledger.clock.now += 8 * 86400
+        assert ledger.builds.cleanup_old_builds(max_age_days=7) == 1
+        assert ledger.builds.get_build(finished) is None
+
+        assert ledger.releases.collectable_checkpoints() == everything
+
+    def test_collectable_checkpoints_spare_what_the_current_attempt_resumed_from(
+        self, ledger: Ledger
+    ):
+        def rows(*bundles):
+            return sorted((v.id, v.version) for bundle in bundles for v in bundle.outputs)
+
+        build_id = _build(ledger)
+        first = _checkpoint(ledger, build_id)
+        second = _checkpoint(ledger, build_id)
+        _resume(ledger, build_id, "a2", from_release=first.release.release_id)
+        assert ledger.releases.collectable_checkpoints() == []
+
+        third = _checkpoint(ledger, build_id, "a2")
+        assert ledger.releases.collectable_checkpoints() == rows(second)
+
+        # Only the current attempt's origin is spared: a fenced attempt releases nothing.
+        _resume(ledger, build_id, "a3", from_release=third.release.release_id)
+        assert ledger.releases.collectable_checkpoints() == rows(first, second)

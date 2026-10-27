@@ -16,13 +16,16 @@ model (ADR 002).
 | `tla/Artifact_Patched.cfg` | Both ids, GC on, pointers and sweeps together. All invariants, `PointersResolve` among them (5,243,224 states) |
 | `tla/Artifact_Retention.cfg` | With retention roots and required edges (`MaxVer = 2`). All invariants and `HeldIsKept` (3,737,697 states) |
 | `tla/BuildLease.tla` | One build and its lease: claim, reclaim, open an attempt, heartbeat, checkpoint, publish, finalize, complete, fail, and the pull-path routes |
-| `tla/Build_RunnerPath.cfg` | Two runners, lease can expire mid-build, unpatched. Violation: a lapsed runner finalizes (`OnlyLeaseHolderFails`, 4 steps) |
-| `tla/Build_PullPath.cfg` | Two executors fetch the same build's manifest, unpatched. Violation: both upload (`ReadyBytesStable`, 6 steps) |
+| `tla/Build_RunnerPath.cfg` | Two runners, lease can expire mid-build, unpatched. Violation: a runner whose build another took over fails it (`OnlyLeaseHolderFails`, a trace of 5 states) |
+| `tla/Build_PullPath.cfg` | Two executors fetch the same build's manifest, unpatched. Violation: both upload (`ReadyBytesStable`, a trace of 6 states) |
 | `tla/Build_Patched.cfg` | Runners and executors as the code is: attempts rotate the fence, a claim or reclaim clears it, a lapsed lease fences its attempt (`OnlyLeaseHolderReleases`). All invariants hold (373 states) |
 
-Every configuration was last run on 2026-10-26 (TLC 2.19, Java 21) against the
-models as they are; the counts are distinct states from that run, and the two
-violations are the expected ones. Re-run after a change to either model.
+The `ArtifactLifecycle` configurations were last run on 2026-10-26 and the
+`BuildLease` ones on 2026-10-27 (TLC 2.19, Java 21), each against its model as it
+is; the counts are distinct states from those runs, and a trace's length counts
+its initial state. Each unpatched configuration lists only the invariant it shows
+violated: given several, TLC reports whichever violation a worker finds first, so
+the result would vary with `-workers`. Re-run after a change to either model.
 
 ```bash
 curl -sSLO https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar

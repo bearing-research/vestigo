@@ -11,6 +11,8 @@
 (*               On error: fail_build plus fail_artifact. A runner also    *)
 (*               stands for a release's attempt: open_attempt (or          *)
 (*               ReleaseStore.resume) makes it the build's current one.    *)
+(*               A claim or reclaim includes the claimant's own first      *)
+(*               open_attempt, which its live lease lets through.          *)
 (*                                                                         *)
 (*   Executors : a consumer's pull protocol for external executors. The    *)
 (*               manifest claims or renews the lease as the shared owner   *)
@@ -141,7 +143,9 @@ Claim(r) ==                                   \* claim_build
 
 \* open_attempt / ReleaseStore.resume: r becomes the build's attempt, fencing
 \* every earlier one. Patched, a live lease is taken over by no other attempt
-\* (open_attempt_within refuses it); unpatched, nothing checks the lease.
+\* (open_attempt_within refuses it); unpatched, nothing checks the lease. The
+\* new attempt replaces the owner (NULL in the code when none is given, which
+\* no owner-fenced call matches), so a lapsed owner keeps nothing.
 OpenAttempt(r) ==
     /\ pc[r] = "idle" /\ build \in Active /\ epoch < MaxEpoch
     /\ Patched => (owner = None \/ expired)

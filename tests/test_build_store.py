@@ -384,6 +384,28 @@ class TestBuildStore:
 
         assert build_store.get_build(recent_build) is not None
 
+    def test_cleanup_takes_the_console_and_leaves_the_attempts_to_the_sweep(
+        self, build_store, clock
+    ):
+        build_id = str(uuid.uuid4())
+        build_store.create_build(
+            build_id=build_id, artifact_id="art-1", version=1, executor_ref="duckdb_sql@v1"
+        )
+        assert build_store.open_attempt(build_id, "a1", writable_until=clock() + 10)
+        assert build_store.append_console_chunk(build_id, "stdout", 0, "never taken")
+        assert build_store.fail_build(build_id, "boom")
+        clock.now += 8 * 86400
+
+        assert build_store.cleanup_old_builds() == 1
+
+        with closing(build_store._get_connection()) as conn:
+            left = conn.execute(
+                "SELECT COUNT(*) AS n FROM build_console_chunks WHERE build_id = ?", (build_id,)
+            ).fetchone()["n"]
+        assert left == 0
+        # The attempt's row is the only record of a key it may have written.
+        assert build_store.settled_attempts() == [(build_id, "art-1", 1, "a1", False)]
+
     def test_get_stats(self, build_store):
         b1 = str(uuid.uuid4())
         b2 = str(uuid.uuid4())
@@ -579,6 +601,41 @@ class TestLeases:
             )
         assert build_store.get_build(build_id).state == "building"
 
+    def test_an_external_build_is_no_runners_orphan(self, build_store, clock):
+        """A consumer's own build whose attempt paused past its lease stays the consumer's."""
+        external = str(uuid.uuid4())
+        build_store.create_build(
+            build_id=external,
+            artifact_id="art-123",
+            version=1,
+            executor_ref="cell",
+            dispatch="external",
+        )
+        assert build_store.open_attempt(
+            external, "a1", writable_until=clock() + 3600, lease_owner="notebook"
+        )
+        orphan = self._building(build_store)
+        clock.now += 120
+
+        assert [b.build_id for b in build_store.list_expired_leases()] == [orphan]
+        assert [b.build_id for b in build_store.list_expired_leases(dispatch="external")] == [
+            external
+        ]
+        assert {b.build_id for b in build_store.list_expired_leases(dispatch=None)} == {
+            orphan,
+            external,
+        }
+        assert not build_store.reclaim_expired_build(external, "runner-b")
+        assert build_store.get_build(external).attempt == "a1"
+        assert build_store.renew_lease(external, "notebook", 60.0)
+
+        clock.now += 120
+        assert build_store.reclaim_expired_build(external, "notebook-2", dispatch="external")
+        with pytest.raises(ValueError, match="dispatch"):
+            build_store.list_expired_leases(dispatch="worker")
+        with pytest.raises(ValueError, match="dispatch"):
+            build_store.reclaim_expired_build(orphan, "runner-b", dispatch="worker")
+
     def test_a_claim_is_exact_in_complete_within(self, build_store, clock):
         build_id = self._building(build_store, owner="external:manifest")
         stale = build_store.get_build(build_id).lease_expires_at
@@ -720,6 +777,87 @@ class TestAttempts:
         assert build_store.find_open_build(key).build_id == default
         assert build_store.find_open_build(key, tenant_id="other") is None
 
+    def test_a_claims_owner_opens_its_first_attempt(self, build_store, clock):
+        """A claim has no attempt; its own owner opens one under the live lease, no one else."""
+        build_id = self._pending(build_store)
+        assert build_store.claim_build(build_id, "runner-a", lease_duration_seconds=600.0)
+        window = clock() + 3600
+        assert not build_store.open_attempt(build_id, "a1", writable_until=window)
+        assert not build_store.open_attempt(
+            build_id, "a1", writable_until=window, lease_owner="runner-b"
+        )
+        assert build_store.open_attempt(
+            build_id, "a1", writable_until=window, lease_owner="runner-a"
+        )
+        build = build_store.get_build(build_id)
+        # The claim's longer lease is kept.
+        assert (build.attempt, build.lease_owner, build.lease_expires_at) == (
+            "a1",
+            "runner-a",
+            clock() + 600.0,
+        )
+        # With an attempt current, the owner's next one waits for the lease like any other.
+        assert not build_store.open_attempt(
+            build_id, "a2", writable_until=window, lease_owner="runner-a"
+        )
+
+        clock.now += 601
+        assert build_store.reclaim_expired_build(build_id, "runner-b")
+        assert not build_store.open_attempt(
+            build_id, "a1", writable_until=window, lease_owner="runner-a"
+        )
+        assert build_store.open_attempt(
+            build_id, "b1", writable_until=window, lease_owner="runner-b"
+        )
+        assert build_store.get_build(build_id).attempt == "b1"
+
+    def test_a_new_attempt_replaces_the_lapsed_owner(self, build_store, clock):
+        """The runner that lost the build can no longer renew, fail or complete it."""
+        build_id = self._pending(build_store)
+        assert build_store.open_attempt(
+            build_id, "a1", writable_until=clock() + 3600, lease_owner="runner-a"
+        )
+        clock.now += 61
+        assert build_store.open_attempt(build_id, "a2", writable_until=clock() + 3600)
+        assert build_store.get_build(build_id).lease_owner is None
+
+        assert not build_store.renew_lease(build_id, "runner-a")
+        assert not build_store.fail_build(build_id, "timed out", lease_owner="runner-a")
+        assert not build_store.complete_build(build_id, lease_owner="runner-a")
+        assert build_store.get_build(build_id).state == "building"
+
+        clock.now += 61
+        assert build_store.open_attempt(
+            build_id, "a3", writable_until=clock() + 3600, lease_owner="runner-c"
+        )
+        assert build_store.get_build(build_id).lease_owner == "runner-c"
+
+    def test_a_reopened_attempt_keeps_the_later_deadline_and_takes_a_new_origin(
+        self, build_store, clock
+    ):
+        build_id = self._pending(build_store)
+        window = clock() + 3600
+        assert build_store.open_attempt(
+            build_id,
+            "a1",
+            writable_until=window,
+            lease_owner="me",
+            lease_duration_seconds=600.0,
+            resumed_from="r1",
+        )
+        assert build_store.open_attempt(build_id, "a1", writable_until=window)
+        assert build_store.get_build(build_id).lease_expires_at == clock() + 600.0
+        assert build_store.get_attempt(build_id, "a1").resumed_from == "r1"
+
+        assert build_store.open_attempt(build_id, "a1", writable_until=window, resumed_from="r2")
+        assert build_store.get_attempt(build_id, "a1").resumed_from == "r2"
+
+        clock.now += 500
+        assert build_store.open_attempt(
+            build_id, "a1", writable_until=window, lease_duration_seconds=300.0
+        )
+        assert build_store.get_build(build_id).lease_expires_at == clock() + 300.0
+
     def test_settled_attempts_are_the_closed_windows_of_ended_builds(self, build_store, clock):
         build_id = self._pending(build_store)
         build_store.record_attempt(build_id, "art-123", 1, "a1", writable_until=clock() + 10)
@@ -814,6 +952,17 @@ class TestRunnableBuilds:
 
         assert [b.build_id for b in listed] == runnable
         assert store.get_build(external).dispatch == "external"
+
+    def test_create_build_returns_the_dispatch_it_stored(self, store):
+        created = store.create_build(
+            build_id=str(uuid.uuid4()),
+            artifact_id="art-0",
+            version=1,
+            executor_ref="duckdb_sql@v1",
+            dispatch="external",
+        )
+        assert created.dispatch == "external"
+        assert store.get_build(created.build_id) == created
 
     def test_a_dispatch_the_ledger_does_not_know_is_refused(self, store):
         with pytest.raises(ValueError, match="dispatch"):

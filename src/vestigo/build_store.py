@@ -206,6 +206,16 @@ def _row_to_build_state(row: Any) -> BuildState:
 # What a build's ``dispatch`` may be.
 DISPATCHES = ("runner", "external")
 
+
+def _dispatch_filter(dispatch: str | None) -> tuple[str, tuple[str, ...]]:
+    """The ``AND dispatch = ?`` clause and its parameter, or nothing for any dispatch."""
+    if dispatch is None:
+        return "", ()
+    if dispatch not in DISPATCHES:
+        raise ValueError(f"dispatch must be None or one of {DISPATCHES}, not {dispatch!r}")
+    return " AND dispatch = ?", (dispatch,)
+
+
 # Before the ``dispatch`` column, a consumer marked a build its own worker runs with
 # this key in ``params``; the column is backfilled from it once, as a ``LIKE``
 # literal (a bare ``_`` matches any character).
@@ -412,6 +422,7 @@ class BuildStore:
                 name=name,
                 occurrence=occurrence,
                 computation_key=computation_key,
+                dispatch=dispatch,
             )
         finally:
             conn.close()
@@ -429,12 +440,20 @@ class BuildStore:
     ) -> bool:
         """Make *attempt* the build's current attempt, fencing every earlier one.
 
-        A pending build starts; a building one continues (a resume, whose attempt
-        names the accepted release it starts from in ``resumed_from``). The attempt's
-        write window is recorded as ``record_attempt`` does, with ``principal`` as who
-        runs it, which the build's ``principal_id`` need not be. Returns False when the
-        build is not active, or its lease is live under another attempt (or none:
-        a runner's claim), which only its own attempt may take over.
+        A pending build starts; a building one continues in *attempt*, and every
+        other attempt's unsettled release is abandoned. :meth:`ReleaseStore.resume
+        <vestigo.releases.ReleaseStore.resume>` is the resume: it also checks that
+        ``resumed_from`` is an accepted release of the build. The attempt's write
+        window is recorded as ``record_attempt`` does, with ``principal`` as who runs
+        it, which the build's ``principal_id`` need not be.
+
+        A new attempt takes the lease as ``lease_owner`` (None when not given) for
+        ``lease_duration_seconds``. The same attempt re-opened, or a claim's owner
+        opening its first, keeps the owner when none is given and the later of the
+        two deadlines; a re-opened attempt takes ``resumed_from`` when one is given.
+        Returns False when the build is not active, or its lease is live under
+        another attempt; a claim's live lease (no attempt yet) lets only its own
+        ``lease_owner`` through.
         """
         conn = self._get_connection()
         try:
@@ -469,30 +488,43 @@ class BuildStore:
         resumed_from: str | None = None,
         principal: str | None = None,
     ) -> bool:
-        """As :meth:`open_attempt`, on the caller's transaction."""
+        """As :meth:`open_attempt`, on the caller's transaction, which holds the build's key."""
         row = conn.execute(
-            "SELECT artifact_id, version, state, attempt, lease_expires_at "
+            "SELECT artifact_id, version, state, attempt, lease_owner, lease_expires_at "
             "FROM artifact_builds WHERE build_id = ?",
             (build_id,),
         ).fetchone()
         if row is None or row["state"] not in ("pending", "building"):
             return False
-        if (
-            row["attempt"] != attempt
-            and row["lease_expires_at"] is not None
-            and row["lease_expires_at"] >= now
-        ):
+        live = row["lease_expires_at"] is not None and row["lease_expires_at"] >= now
+        own_claim = (
+            row["attempt"] is None and lease_owner is not None and lease_owner == row["lease_owner"]
+        )
+        continuing = row["attempt"] == attempt or own_claim
+        if live and not continuing:
             return False
+        if continuing:
+            if lease_owner is None:
+                lease_owner = row["lease_owner"]
+            if row["lease_expires_at"] is not None:
+                lease_expires_at = max(lease_expires_at, row["lease_expires_at"])
         conn.execute(
             """
             UPDATE artifact_builds
             SET state = 'building', attempt = ?,
                 started_at = COALESCE(started_at, ?),
-                lease_owner = COALESCE(?, lease_owner),
+                lease_owner = ?,
                 lease_expires_at = ?
             WHERE build_id = ?
             """,
             (attempt, now, lease_owner, lease_expires_at, build_id),
+        )
+        # Only a release's own attempt may settle it, so a fenced attempt's would
+        # block every later release of its kind for good.
+        conn.execute(
+            "UPDATE build_releases SET state = 'abandoned', settled_at = ? "
+            "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
+            (now, build_id, attempt),
         )
         conn.execute(
             """
@@ -505,6 +537,7 @@ class BuildStore:
                     THEN excluded.writable_until
                     ELSE build_attempts.writable_until
                 END,
+                resumed_from = COALESCE(excluded.resumed_from, build_attempts.resumed_from),
                 principal = COALESCE(excluded.principal, build_attempts.principal)
             """,
             (
@@ -670,7 +703,8 @@ class BuildStore:
         """Claim a pending build under a lease, atomically; False if another runner won.
 
         Renew with ``renew_lease()`` or another runner may reclaim the build. A claimed
-        build has no attempt until ``open_attempt``: no release of it is accepted.
+        build has no attempt, so no release of it is accepted, until ``open_attempt``
+        with the same ``lease_owner``, which the claim's live lease lets through.
         """
         conn = self._get_connection()
         try:
@@ -728,20 +762,28 @@ class BuildStore:
         build_id: str,
         new_lease_owner: str,
         lease_duration_seconds: float = 60.0,
+        *,
+        dispatch: str | None = "runner",
     ) -> bool:
         """Take over a building build whose lease has expired (a dead runner's orphan).
 
-        The lapsed attempt is fenced: the build has none until ``open_attempt``, so a
-        release the old runner still sends is rejected. Returns False if the lease
-        has not expired or the build is not building.
+        The lapsed attempt is fenced: the build has none until ``open_attempt`` with
+        ``new_lease_owner``, so a release the old runner still sends is rejected.
+        Only a build of ``dispatch`` is taken (None: any), so a runner's orphan
+        recovery leaves alone the builds a consumer runs itself. Returns False if
+        the lease has not expired, the build is not building, or is another dispatch's.
+
+        Raises:
+            ValueError: If ``dispatch`` is neither None nor one of :data:`DISPATCHES`.
         """
+        dispatch_clause, dispatch_params = _dispatch_filter(dispatch)
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
             now = self._clock()
             lease_expires_at = now + lease_duration_seconds
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE artifact_builds
                 SET lease_owner = ?,
                     lease_expires_at = ?,
@@ -749,17 +791,27 @@ class BuildStore:
                     attempt = NULL
                 WHERE build_id = ?
                   AND state = 'building'
-                  AND lease_expires_at < ?
+                  AND lease_expires_at < ?{dispatch_clause}
                 """,
-                (new_lease_owner, lease_expires_at, now, build_id, now),
+                (new_lease_owner, lease_expires_at, now, build_id, now, *dispatch_params),
             )
             conn.commit()
             return cursor.rowcount > 0
         finally:
             conn.close()
 
-    def list_expired_leases(self, limit: int = 10) -> list[BuildState]:
-        """List building builds whose lease has expired (likely orphans)."""
+    def list_expired_leases(
+        self, limit: int = 10, *, dispatch: str | None = "runner"
+    ) -> list[BuildState]:
+        """List building builds of ``dispatch`` (None: any) whose lease has expired.
+
+        Likely orphans. By default only the runner's: a consumer's own build whose
+        attempt paused past its lease is not a runner's to reclaim.
+
+        Raises:
+            ValueError: If ``dispatch`` is neither None nor one of :data:`DISPATCHES`.
+        """
+        dispatch_clause, dispatch_params = _dispatch_filter(dispatch)
         conn = self._get_connection()
         try:
             now = self._clock()
@@ -769,11 +821,11 @@ class BuildStore:
                 FROM artifact_builds
                 WHERE state = 'building'
                   AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < ?
+                  AND lease_expires_at < ?{dispatch_clause}
                 ORDER BY lease_expires_at ASC
                 LIMIT ?
                 """,
-                (now, limit),
+                (now, *dispatch_params, limit),
             )
 
             return [_row_to_build_state(row) for row in cursor.fetchall()]
@@ -1096,10 +1148,28 @@ class BuildStore:
             conn.close()
 
     def cleanup_old_builds(self, max_age_days: float = 7.0) -> int:
-        """Delete ready/failed builds completed more than ``max_age_days`` ago; return the count."""
+        """Delete ready/failed builds completed more than ``max_age_days`` ago; return the count.
+
+        Their console chunks go with them. Their attempts stay for
+        :meth:`settled_attempts`, which lists an attempt whose build is gone: an
+        attempt row is the only record of a key the attempt may have written. Their
+        releases stay too, the record of what was published, which
+        :meth:`ReleaseStore.collectable_checkpoints
+        <vestigo.releases.ReleaseStore.collectable_checkpoints>` still reads.
+        """
         conn = self._get_connection()
         try:
             cutoff = self._clock() - (max_age_days * 86400)
+            conn.execute(
+                """
+                DELETE FROM build_console_chunks
+                WHERE build_id IN (
+                    SELECT build_id FROM artifact_builds
+                    WHERE state IN ('ready', 'failed') AND completed_at < ?
+                )
+                """,
+                (cutoff,),
+            )
             cursor = conn.execute(
                 """
                 DELETE FROM artifact_builds
