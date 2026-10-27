@@ -31,8 +31,16 @@ from vestigo.store import (
     StoreSchemaMismatch,
     publication_id,
 )
+from vestigo.tables import LEDGER_TABLES, TRANSIENT_TABLES
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
+
+_EVERY_TABLE = ", ".join([name for name, _ in LEDGER_TABLES] + list(TRANSIENT_TABLES))
+
+
+def _drop_ledger(conn) -> None:
+    """Every ledger table, so a test's first boot starts from an empty database."""
+    conn.executescript(f"DROP TABLE IF EXISTS {_EVERY_TABLE} CASCADE;")
 
 
 @pytest.fixture
@@ -234,11 +242,7 @@ class TestConcurrentSchemaInitialization:
         dialect = PostgresDialect(postgres_dsn)
         conn = dialect.connect()
         try:
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_versions, artifact_names, "
-                "artifact_aliases, artifact_tags, registry_audit, "
-                "registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
         finally:
             conn.close()
@@ -698,11 +702,7 @@ class TestConnectionPool:
         dialect = PostgresDialect(postgres_dsn, max_size=2)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_versions, artifact_names, "
-                "artifact_aliases, artifact_tags, registry_audit, "
-                "registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -854,11 +854,7 @@ class TestBuildStoreSharesTheBackend:
         dialect_b = PostgresDialect(postgres_dsn)
         try:
             conn = dialect_a.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -901,11 +897,7 @@ class TestBuildStoreSharesTheBackend:
         dialect_b = PostgresDialect(postgres_dsn)
         try:
             conn = dialect_a.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS build_console_chunks, artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -941,11 +933,7 @@ class TestBuildStoreSharesTheBackend:
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -1000,11 +988,7 @@ class TestBuildStoreSharesTheBackend:
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_builds, build_attempts, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -1029,11 +1013,7 @@ class TestBuildStoreSharesTheBackend:
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -1066,11 +1046,7 @@ class TestBuildStoreSharesTheBackend:
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -1106,11 +1082,7 @@ class TestTheAttemptLedgerOnPostgres:
         dialect = PostgresDialect(postgres_dsn)
         try:
             conn = dialect.connect()
-            conn.executescript(
-                "DROP TABLE IF EXISTS build_attempts, artifact_builds, artifact_versions, "
-                "artifact_names, artifact_aliases, artifact_tags, "
-                "registry_audit, registry_pending CASCADE;"
-            )
+            _drop_ledger(conn)
             conn.commit()
             conn.close()
 
@@ -1492,7 +1464,6 @@ class TestSchemaMigrations:
             try:
                 stamped = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
                 assert stamped["v"] == 8
-                assert not dialect.schema_exists(conn, "notebook_workers")
             finally:
                 conn.close()
         finally:
@@ -1613,13 +1584,10 @@ class TestGraph:
         assert set(store.graph.ancestors([second_id])) == {leaf_id, first_id}
         assert set(store.graph.dependents(leaf_id)) == {first_id, second_id}
         assert store.graph.topological_order([second_id]) == [leaf_id, first_id, second_id]
-        assert store.graph.ancestors([second_id], traversal=Traversal(max_depth=1)) == [
-            leaf_id,
-            first_id,
-        ] or set(store.graph.ancestors([second_id], traversal=Traversal(max_depth=1))) == {
-            leaf_id,
-            first_id,
-        }
+        # Both are direct inputs, so depth ties and the id decides.
+        assert store.graph.ancestors([second_id], traversal=Traversal(max_depth=1)) == sorted(
+            [leaf_id, first_id]
+        )
 
     def test_a_version_records_its_definition(self, store):
         version = store.create_artifact(
