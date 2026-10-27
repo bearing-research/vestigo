@@ -1048,6 +1048,37 @@ class TestBuildStoreSharesTheBackend:
         finally:
             dialect.close()
 
+    def test_an_attempt_principal_is_added_to_an_older_database(self, postgres_dsn, tmp_path):
+        """The column add runs under the schema lock on Postgres; the row then carries it."""
+        from vestigo.build_store import BuildStore
+
+        dialect = PostgresDialect(postgres_dsn)
+        try:
+            conn = dialect.connect()
+            conn.executescript(
+                "DROP TABLE IF EXISTS artifact_builds, build_attempts, artifact_versions, "
+                "artifact_names, artifact_aliases, artifact_tags, "
+                "registry_audit, registry_pending CASCADE;"
+            )
+            conn.commit()
+            conn.close()
+
+            artifacts = ArtifactStore(tmp_path / "a", dialect=dialect)
+            builds = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+            version = artifacts.create_artifact("art", "prov-art", _spec())
+            builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+
+            conn = dialect.connect()
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN principal")
+            conn.commit()
+            conn.close()
+            reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+
+            assert reopened.open_attempt("b", "a1", writable_until=1e12, principal="user:alice")
+            assert reopened.get_attempt("b", "a1").principal == "user:alice"
+        finally:
+            dialect.close()
+
     def test_a_fail_fenced_on_a_claim_needs_that_exact_claim(self, postgres_dsn, tmp_path):
         """The deadline read back from the row matches the one the fence sends."""
         from vestigo.build_store import BuildStore

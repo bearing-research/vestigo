@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS build_attempts (
     attempt TEXT NOT NULL,
     writable_until REAL NOT NULL,  -- Nothing can write the attempt's key after this
     resumed_from TEXT,  -- The accepted release this attempt continues from, if any
+    principal TEXT,  -- Who runs this attempt (a resume may be another's than the build's)
     PRIMARY KEY (build_id, attempt)
 );
 """
@@ -160,6 +161,7 @@ class AttemptState:
     version: int
     writable_until: float
     resumed_from: str | None = None
+    principal: str | None = None
 
 
 # The SELECT list of a BuildState; a new column is added here and in the dataclass.
@@ -310,6 +312,7 @@ class BuildStore:
             ("artifact_builds", "computation_key"): "TEXT",
             ("build_attempts", "resumed_from"): "TEXT",
             ("artifact_builds", "dispatch"): "TEXT NOT NULL DEFAULT 'runner'",
+            ("build_attempts", "principal"): "TEXT",
         }
         if all(self._dialect.column_exists(conn, table, column) for table, column in columns):
             return
@@ -422,12 +425,14 @@ class BuildStore:
         lease_owner: str | None = None,
         lease_duration_seconds: float = 60.0,
         resumed_from: str | None = None,
+        principal: str | None = None,
     ) -> bool:
         """Make *attempt* the build's current attempt, fencing every earlier one.
 
         A pending build starts; a building one continues (a resume, whose attempt
         names the accepted release it starts from in ``resumed_from``). The attempt's
-        write window is recorded as ``record_attempt`` does. Returns False when the
+        write window is recorded as ``record_attempt`` does, with ``principal`` as who
+        runs it, which the build's ``principal_id`` need not be. Returns False when the
         build is not active, or its lease is live under another attempt (or none:
         a runner's claim), which only its own attempt may take over.
         """
@@ -444,6 +449,7 @@ class BuildStore:
                 lease_expires_at=now + lease_duration_seconds,
                 now=now,
                 resumed_from=resumed_from,
+                principal=principal,
             )
             conn.commit()
             return opened
@@ -461,6 +467,7 @@ class BuildStore:
         lease_expires_at: float,
         now: float,
         resumed_from: str | None = None,
+        principal: str | None = None,
     ) -> bool:
         """As :meth:`open_attempt`, on the caller's transaction."""
         row = conn.execute(
@@ -490,15 +497,25 @@ class BuildStore:
         conn.execute(
             """
             INSERT INTO build_attempts
-                (build_id, artifact_id, version, attempt, writable_until, resumed_from)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(build_id, attempt) DO UPDATE SET writable_until = CASE
-                WHEN excluded.writable_until > build_attempts.writable_until
-                THEN excluded.writable_until
-                ELSE build_attempts.writable_until
-            END
+                (build_id, artifact_id, version, attempt, writable_until, resumed_from, principal)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(build_id, attempt) DO UPDATE SET
+                writable_until = CASE
+                    WHEN excluded.writable_until > build_attempts.writable_until
+                    THEN excluded.writable_until
+                    ELSE build_attempts.writable_until
+                END,
+                principal = COALESCE(excluded.principal, build_attempts.principal)
             """,
-            (build_id, row["artifact_id"], row["version"], attempt, writable_until, resumed_from),
+            (
+                build_id,
+                row["artifact_id"],
+                row["version"],
+                attempt,
+                writable_until,
+                resumed_from,
+                principal,
+            ),
         )
         return True
 
@@ -507,8 +524,8 @@ class BuildStore:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT build_id, artifact_id, version, attempt, writable_until, resumed_from "
-                "FROM build_attempts WHERE build_id = ? AND attempt = ?",
+                "SELECT build_id, artifact_id, version, attempt, writable_until, resumed_from, "
+                "principal FROM build_attempts WHERE build_id = ? AND attempt = ?",
                 (build_id, attempt),
             ).fetchone()
             if row is None:
@@ -520,6 +537,7 @@ class BuildStore:
                 version=row["version"],
                 writable_until=row["writable_until"],
                 resumed_from=row["resumed_from"],
+                principal=row["principal"],
             )
         finally:
             conn.close()

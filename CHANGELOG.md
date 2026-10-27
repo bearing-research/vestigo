@@ -5,8 +5,13 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+Schema change: `build_attempts` gains `principal`, added on open.
+
 ### Added
 
+- `build_attempts.principal`: `open_attempt(principal=)` records who runs an
+  attempt, which a resume may make someone other than the build's initiator;
+  `AttemptState.principal` reads it back (#17).
 - `collectable_checkpoints(keep=k)` spares the newest `k` accepted checkpoints
   of each building build, so a latest-k policy is the same read with a deeper
   bound; `accept` states that an empty `final` release ends a build without a
