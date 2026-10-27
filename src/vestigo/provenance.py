@@ -71,11 +71,13 @@ class TransformSpec:
 
 
 def parse_transform_spec(text: str | None) -> TransformSpec | None:
-    """A stored spec read back; ``None`` when there is none or it is not a JSON object.
+    """A stored spec read back; ``None`` when there is none or no spec can be rebuilt from it.
 
     Unreadable reads as unrecorded, not an error: rows also arrive from other servers
     (team store pulls, snapshot imports, datasets), and every reader treats a spec it
-    cannot read as one that names nothing. A missing or mistyped field reads as empty.
+    cannot read as one that names nothing. That covers text that is not a JSON object
+    and params ``TransformSpec`` refuses (``NaN``, which ``json.loads`` accepts). A
+    missing or mistyped field reads as empty.
     """
     if not text:
         return None
@@ -87,11 +89,14 @@ def parse_transform_spec(text: str | None) -> TransformSpec | None:
         return None
     params = data.get("params")
     inputs = data.get("inputs")
-    return TransformSpec(
-        executor=data.get("executor") or "",
-        params=params if isinstance(params, dict) else {},
-        inputs=inputs if isinstance(inputs, list) else [],
-    )
+    try:
+        return TransformSpec(
+            executor=data.get("executor") or "",
+            params=params if isinstance(params, dict) else {},
+            inputs=inputs if isinstance(inputs, list) else [],
+        )
+    except ValueError:
+        return None
 
 
 def compute_provenance_hash(input_hashes: list[str], transform_spec: TransformSpec) -> str:

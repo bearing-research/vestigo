@@ -1,6 +1,6 @@
 """The ledger of the shared computation substrate (ADR 002); *vestigo*, I trace.
 
-``store`` holds versioned artifacts, names, aliases, tags, pins, publications,
+``store`` holds versioned artifacts, names, aliases, tags, publications,
 retention and the audit log; ``build_store`` the builds, their leases and
 attempts; ``releases`` a build's checkpoint and final releases, fenced on its
 attempt's lease, with ``operations`` the typed operations a release runs in its

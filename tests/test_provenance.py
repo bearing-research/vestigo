@@ -18,6 +18,7 @@ from vestigo.provenance import (
     parse_transform_spec,
     run_output_key,
 )
+from vestigo.store import ArtifactStore, ArtifactVersion
 
 
 class TestTransformSpec:
@@ -70,6 +71,45 @@ class TestTransformSpec:
             hash(TransformSpec("x@v1", {}, []))
 
 
+# json.loads reads NaN and Infinity, which TransformSpec refuses: a writer from before
+# that check, or a foreign store, could have stored this text.
+NAN_SPEC = '{"executor": "x@v1", "inputs": [], "params": {"content_type": "arrow/ipc", "w": NaN}}'
+
+
+class TestParseTransformSpec:
+    @pytest.mark.parametrize(
+        "text",
+        [None, "", "not json", "[1, 2]", NAN_SPEC, '{"params": {"a": [Infinity]}}'],
+        ids=["none", "empty", "not_json", "not_an_object", "nan", "infinity"],
+    )
+    def test_a_spec_that_cannot_be_rebuilt_reads_as_unrecorded(self, text):
+        assert parse_transform_spec(text) is None
+
+    def test_a_missing_or_mistyped_field_reads_as_empty(self):
+        assert parse_transform_spec('{"params": [1], "inputs": "a"}') == TransformSpec("", {}, [])
+
+    def test_a_stored_row_whose_spec_cannot_be_rebuilt_reads_as_unrecorded(self, tmp_path):
+        store = ArtifactStore(tmp_path / "artifacts")
+        record = ArtifactVersion(
+            id="foreign",
+            version=1,
+            state="ready",
+            provenance_hash="P-foreign",
+            schema_json="{}",
+            row_count=1,
+            byte_size=5,
+            created_at=1.0,
+            transform_spec=NAN_SPEC,
+        )
+        store.import_artifact(record, b"bytes")
+
+        row = store.get_artifact("foreign", 1)
+        assert row is not None and row.transform_spec == NAN_SPEC
+        assert (row.spec, row.params) == (None, {})
+        assert store.versions_declaring("arrow/ipc") == []
+        store.close()
+
+
 class TestDerivedKeys:
     PARENT = hashlib.sha256(b"parent").hexdigest()
 
@@ -86,4 +126,6 @@ class TestDerivedKeys:
             derive_subkey(self.PARENT, "a:b")
         with pytest.raises(ValueError, match="contains ':'"):
             derive_subkey(self.PARENT, "a", "b:c")
-        assert derive_subkey(self.PARENT, "a", "b") == derive_subkey(self.PARENT, "a", "b")
+        assert derive_subkey(self.PARENT, "a", "b") == (
+            "045421da72d44725f6c296c07a327dffe2857c0b6b7d7a44d69f01447d126b44"
+        )

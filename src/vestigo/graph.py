@@ -19,12 +19,12 @@ import re
 import struct
 import time
 import unicodedata
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vestigo.sql_backend import SqlDialect, StoreConnection
+    from vestigo.sql_backend import StoreConnection
 
 DOMAIN_RE = re.compile(r"^[a-z0-9_\-./]+$")
 NODE_ID_BYTES = 32
@@ -37,6 +37,9 @@ NodeId = str
 
 MAX_DEPTH = 64
 MAX_NODES = 10_000
+
+_IN_LIST_IDS = 500
+"""The most ids one ``IN`` list binds: under SQLite's oldest variable limit (999)."""
 
 
 # --- Canonical identities ------------------------------------------------------
@@ -240,12 +243,20 @@ class Edge:
 
 @dataclass(frozen=True)
 class NodeSpec:
-    """What a writer says about a node; the store hashes it and never parses *payload*."""
+    """What a writer says about a node; the store hashes it and never parses *payload*.
+
+    Raises:
+        ValueError: *payload* is not ``bytes``.
+    """
 
     domain: str
     payload: bytes
     edges: tuple[Edge, ...] = ()
     payload_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, bytes):
+            raise ValueError(f"payload is a {type(self.payload).__name__}, not bytes")
 
 
 @dataclass(frozen=True)
@@ -285,8 +296,9 @@ class Traversal:
 
     ``max_depth`` (at least 1) is the deepest level returned and the bound on the
     work: the recursive query expands every path to that depth before the result
-    is counted. ``max_nodes`` caps the answer, not the walk: a walk that reaches
-    more distinct nodes than that raises ``ValueError`` after running to its depth.
+    is counted. ``max_nodes`` (at least 0) caps the answer, not the walk: a walk
+    that reaches more distinct nodes than that raises ``ValueError`` after running
+    to its depth.
     """
 
     max_depth: int = MAX_DEPTH
@@ -295,6 +307,8 @@ class Traversal:
     def __post_init__(self) -> None:
         if self.max_depth < 1:
             raise ValueError(f"max_depth {self.max_depth} is below 1")
+        if self.max_nodes < 0:
+            raise ValueError(f"max_nodes {self.max_nodes} is below 0")
 
 
 DEFAULT_TRAVERSAL = Traversal()
@@ -329,13 +343,15 @@ GRAPH_DDL: tuple[str, ...] = (
         created_at REAL NOT NULL,
         PRIMARY KEY (scope, node_id, relation, target_node_id)
     )""",
-            "CREATE INDEX IF NOT EXISTS idx_node_links_target "
-            "ON node_links(scope, relation, target_node_id)",
+            LINK_TARGET_INDEX := "CREATE INDEX IF NOT EXISTS idx_node_links_target "
+            "ON node_links(scope, target_node_id, relation)",
         )
     ),
 )
 """The graph's tables; also the tail of a fresh store's schema (``store._SCHEMA_SQL``).
-``LINK_DDL`` is the part a store from before links gains on open (migration 15)."""
+``LINK_DDL`` is the part a store from before links gains on open (migration 15).
+``LINK_TARGET_INDEX`` leads with the target so ``linked_from`` without a relation
+probes it; a store whose index led with the relation rebuilds it (migration 16)."""
 
 
 @dataclass(frozen=True)
@@ -355,9 +371,8 @@ class GraphStore:
     version). Reached as ``ArtifactStore.graph``.
     """
 
-    def __init__(self, connect: Callable[[], StoreConnection], dialect: SqlDialect) -> None:
+    def __init__(self, connect: Callable[[], StoreConnection]) -> None:
         self._connect = connect
-        self._dialect = dialect
 
     # --- Writing ---
 
@@ -452,15 +467,15 @@ class GraphStore:
 
     @staticmethod
     def _held(conn: StoreConnection, scope_hex: str, ids: Collection[NodeId]) -> set[NodeId]:
-        """Which of *ids* the scope holds, in one query."""
-        if not ids:
-            return set()
-        placeholders = ", ".join("?" for _ in ids)
-        rows = conn.execute(
-            f"SELECT node_id FROM nodes WHERE scope = ? AND node_id IN ({placeholders})",
-            (scope_hex, *ids),
-        ).fetchall()
-        return {r["node_id"] for r in rows}
+        """Which of *ids* the scope holds, one query per ``_IN_LIST_IDS`` of them."""
+        held: set[NodeId] = set()
+        for chunk in _chunks(sorted(ids)):
+            rows = conn.execute(
+                f"SELECT node_id FROM nodes WHERE scope = ? AND node_id IN ({_marks(chunk)})",
+                (scope_hex, *chunk),
+            ).fetchall()
+            held.update(r["node_id"] for r in rows)
+        return held
 
     # --- Links ---
 
@@ -574,7 +589,9 @@ class GraphStore:
             InputEdge(role=r["role"], position=r["position"], target_node_id=r["target_node_id"])
             for r in rows
         ]
-        ports.sort(key=lambda p: (canonical_role(p.role), p.position))
+        # Raw bytes, not canonical_role: a role stored before roles were checked must
+        # still read back, and a checked role is already its canonical form.
+        ports.sort(key=lambda p: (p.role.encode("utf-8"), p.position))
         return ports
 
     def ancestors(
@@ -619,17 +636,18 @@ class GraphStore:
         members = set(roots) | set(self.ancestors(roots, tenant=tenant, traversal=traversal))
         if not members:
             return []
-        placeholders = ", ".join("?" for _ in members)
         conn = self._connect()
         try:
-            missing = set(roots) - self._held(conn, scope_hex, sorted(set(roots)))
+            missing = set(roots) - self._held(conn, scope_hex, set(roots))
             if missing:
                 raise ValueError(f"node {min(missing)} is not in the store")
-            rows = conn.execute(
-                "SELECT node_id, target_node_id FROM node_inputs "
-                f"WHERE scope = ? AND node_id IN ({placeholders})",
-                (scope_hex, *sorted(members)),
-            ).fetchall()
+            rows = []
+            for chunk in _chunks(sorted(members)):
+                rows += conn.execute(
+                    "SELECT node_id, target_node_id FROM node_inputs "
+                    f"WHERE scope = ? AND node_id IN ({_marks(chunk)})",
+                    (scope_hex, *chunk),
+                ).fetchall()
         finally:
             conn.close()
         unread: dict[NodeId, int] = dict.fromkeys(members, 0)
@@ -666,39 +684,56 @@ class GraphStore:
         if not start_ids:
             return []
         scope_hex = identity_scope(tenant).hex()
-        placeholders = ", ".join("?" for _ in start_ids)
-        # One recursive query on both dialects; the depth bound ends it on any store.
-        sql = f"""
-            WITH RECURSIVE walk(node_id, depth) AS (
-                SELECT {to_column}, 1 FROM node_inputs
-                WHERE scope = ? AND {from_column} IN ({placeholders})
-                UNION
-                SELECT i.{to_column}, w.depth + 1 FROM node_inputs i
-                JOIN walk w ON i.{from_column} = w.node_id
-                WHERE i.scope = ? AND w.depth < ?
-            )
-            SELECT node_id, MIN(depth) AS depth FROM walk
-            WHERE node_id NOT IN ({placeholders})
-            GROUP BY node_id ORDER BY depth, node_id LIMIT ?
-        """
+        too_many = f"more than {traversal.max_nodes} nodes reached; raise the bound"
+        # A chunk's rows hold at most every start, so a chunk that fills this limit
+        # reached more than max_nodes others, and one that does not is complete.
+        limit = traversal.max_nodes + 1 + len(start_ids)
+        depths: dict[NodeId, int] = {}
         conn = self._connect()
         try:
-            rows = conn.execute(
-                sql,
-                (
-                    scope_hex,
-                    *start_ids,
-                    scope_hex,
-                    traversal.max_depth,
-                    *start_ids,
-                    traversal.max_nodes + 1,
-                ),
-            ).fetchall()
+            for chunk in _chunks(start_ids):
+                rows = conn.execute(
+                    _walk_sql(from_column, to_column, len(chunk)),
+                    (scope_hex, *chunk, scope_hex, traversal.max_depth, limit),
+                ).fetchall()
+                if len(rows) == limit:
+                    raise ValueError(too_many)
+                for r in rows:
+                    depths[r["node_id"]] = min(r["depth"], depths.get(r["node_id"], r["depth"]))
         finally:
             conn.close()
-        if len(rows) > traversal.max_nodes:
-            raise ValueError(f"more than {traversal.max_nodes} nodes reached; raise the bound")
-        return [r["node_id"] for r in rows]
+        for start in start_ids:
+            depths.pop(start, None)
+        if len(depths) > traversal.max_nodes:
+            raise ValueError(too_many)
+        return sorted(depths, key=lambda n: (depths[n], n))
+
+
+def _walk_sql(from_column: str, to_column: str, starts: int) -> str:
+    """One recursive query on both dialects; the depth bound ends it on any store.
+
+    ``walk w CROSS JOIN node_inputs i`` makes SQLite, which keeps a cross join's
+    written order, probe the index once per reached node instead of scanning the
+    walk inside a scan of the scope's edges. Postgres plans the join its own way.
+    """
+    return f"""
+        WITH RECURSIVE walk(node_id, depth) AS (
+            SELECT {to_column}, 1 FROM node_inputs
+            WHERE scope = ? AND {from_column} IN ({", ".join("?" * starts)})
+            UNION
+            SELECT i.{to_column}, w.depth + 1 FROM walk w CROSS JOIN node_inputs i
+            WHERE i.scope = ? AND i.{from_column} = w.node_id AND w.depth < ?
+        )
+        SELECT node_id, MIN(depth) AS depth FROM walk GROUP BY node_id LIMIT ?
+    """
+
+
+def _chunks(ids: Sequence[NodeId]) -> Iterator[Sequence[NodeId]]:
+    return (ids[i : i + _IN_LIST_IDS] for i in range(0, len(ids), _IN_LIST_IDS))
+
+
+def _marks(ids: Sequence[NodeId]) -> str:
+    return ", ".join("?" for _ in ids)
 
 
 def _checked_id(node_id: NodeId) -> NodeId:
