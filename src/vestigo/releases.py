@@ -259,13 +259,22 @@ class ReleaseStore:
 
         A row created with ``release_id`` needs no attaching. Returns how many rows
         were attached; a row that is ready or under another release is left alone.
+        Runs under the build's key, so no row lands between an acceptance's check of
+        the release's rows and its commit.
 
         Raises:
-            ValueError: the release does not exist or is not *attempt*'s.
+            ValueError: the release does not exist, is not *attempt*'s, or is settled.
         """
         conn = self._connect()
         try:
-            self._own(conn, release_id, attempt)
+            release = self._get_on(conn, release_id)
+            if release is None:
+                raise ValueError(f"release {release_id} does not exist")
+            self._dialect.begin_write(conn, release.build_id)
+            release = self._own(conn, release_id, attempt)
+            if release.state not in UNSETTLED:
+                conn.rollback()
+                raise ValueError(f"release {release_id} is {release.state}")
             attached = 0
             for artifact_id, version in versions:
                 attached += conn.execute(
@@ -327,6 +336,9 @@ class ReleaseStore:
             release = self._get_on(conn, release_id)
             if release is None:
                 raise ValueError(f"release {release_id} does not exist")
+            # On a remote store each size is a request; on SQLite the key below is
+            # the database's write lock.
+            sizes = self._sizes(staged) if release.state in UNSETTLED else {}
             self._dialect.begin_write(conn, release.build_id)
             release = self._get_on(conn, release_id)
             assert release is not None
@@ -354,9 +366,16 @@ class ReleaseStore:
                     f"{earlier['n']} earlier {release.kind} release(s) of build "
                     f"{release.build_id} are unsettled"
                 )
-            self._check_outputs(conn, release, staged)
+            self._check_outputs(conn, release, staged, sizes)
             try:
-                self._run(conn, operations, release.tenant, release.release_id, now)
+                self._run(
+                    conn,
+                    operations,
+                    release.tenant,
+                    release.release_id,
+                    now,
+                    accepting=release.release_id,
+                )
                 self._artifacts._promote_staged(conn, list(staged), now)
                 if release.kind == "final":
                     target = conn.execute(
@@ -443,8 +462,10 @@ class ReleaseStore:
         The build keeps its identity and its accepted releases; the old attempt can no
         longer release, and whatever it left unsettled is abandoned. ``from_release``
         is the accepted release of this build the new attempt starts from, recorded
-        on the attempt (ADR 001 C: an explicit release, never an alias). Returns how
-        many releases were abandoned.
+        on the attempt (ADR 001 C: an explicit release, never an alias). The lease
+        goes to ``lease_owner``, None when not given, as
+        :meth:`BuildStore.open_attempt <vestigo.build_store.BuildStore.open_attempt>`
+        says. Returns how many releases were abandoned.
 
         Raises:
             ValueError: the build is not pending or building, another attempt's lease
@@ -462,6 +483,11 @@ class ReleaseStore:
                     raise ValueError(
                         f"release {from_release} is not an accepted release of build {build_id}"
                     )
+            unsettled = conn.execute(
+                "SELECT COUNT(*) AS n FROM build_releases "
+                "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
+                (build_id, attempt),
+            ).fetchone()["n"]
             if not self._builds.open_attempt_within(
                 conn,
                 build_id,
@@ -476,13 +502,8 @@ class ReleaseStore:
                 raise ValueError(
                     f"build {build_id} is not active, or another attempt's lease on it is live"
                 )
-            cursor = conn.execute(
-                "UPDATE build_releases SET state = 'abandoned', settled_at = ? "
-                "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
-                (now, build_id, attempt),
-            )
             conn.commit()
-            return cursor.rowcount
+            return int(unsettled)
         finally:
             conn.close()
 
@@ -546,10 +567,12 @@ class ReleaseStore:
     ) -> list[tuple[str, int]]:
         """The checkpoint outputs nothing but a retention root may still need.
 
-        Every output of an accepted ``checkpoint`` release, except the newest *keep*
-        accepted checkpoints of each build still ``building`` (what a resume starts
-        from, and the ones before it a consumer keeps as its latest-k policy). Roots
-        are the collector's to honor; this only says which rows are not current values.
+        Every output of an accepted ``checkpoint`` release, except, of each build
+        still ``building``, the newest *keep* accepted checkpoints (what a resume
+        starts from, and the ones before it a consumer keeps as its latest-k policy)
+        and the one its current attempt resumed from. A release outlives its build
+        row; once the row is gone its checkpoints are collectable. Roots are the
+        collector's to honor; this only says which rows are not current values.
         """
         if keep < 1:
             raise ValueError(f"keep {keep} is below 1")
@@ -560,16 +583,23 @@ class ReleaseStore:
                 SELECT av.id, av.version
                 FROM artifact_versions av
                 JOIN build_releases r ON r.release_id = av.release_id
-                JOIN artifact_builds b ON b.build_id = r.build_id
+                LEFT JOIN artifact_builds b ON b.build_id = r.build_id
                 WHERE r.kind = 'checkpoint' AND r.state = 'accepted'
                   AND COALESCE(av.tenant, '') = COALESCE(?, '')
                   AND NOT (
-                    b.state = 'building'
+                    COALESCE(b.state, '') = 'building'
                     AND (
-                      SELECT COUNT(*) FROM build_releases
-                      WHERE build_id = r.build_id AND kind = 'checkpoint'
-                        AND state = 'accepted' AND sequence > r.sequence
-                    ) < ?
+                      (
+                        SELECT COUNT(*) FROM build_releases
+                        WHERE build_id = r.build_id AND kind = 'checkpoint'
+                          AND state = 'accepted' AND sequence > r.sequence
+                      ) < ?
+                      OR EXISTS (
+                        SELECT 1 FROM build_attempts a
+                        WHERE a.build_id = b.build_id AND a.attempt = b.attempt
+                          AND a.resumed_from = r.release_id
+                      )
+                    )
                   )
                 ORDER BY av.id, av.version
                 """,
@@ -693,22 +723,35 @@ class ReleaseStore:
         return self._artifacts._versions_where(conn, "release_id = ?", (release_id,))
 
     def _settle(self, release_id: str, state: str) -> None:
+        """Settle an unsettled release; one a retry settled meanwhile is left as it is."""
         conn = self._connect()
         try:
             conn.execute(
-                "UPDATE build_releases SET state = ?, settled_at = ? WHERE release_id = ?",
+                "UPDATE build_releases SET state = ?, settled_at = ? "
+                "WHERE release_id = ? AND state IN ('preparing', 'prepared')",
                 (state, self._clock(), release_id),
             )
             conn.commit()
         finally:
             conn.close()
 
-    def _check_outputs(
-        self, conn: StoreConnection, release: Release, staged: Sequence[StagedVersion]
-    ) -> None:
-        """Every output is a building row of this release whose bytes are all there,
-        and every building row of the release is an output."""
+    def _sizes(self, staged: Sequence[StagedVersion]) -> dict[tuple[str, int], int | None]:
+        """Each output's stored size, None where it has no bytes."""
         blobs = self._artifacts.blob_store
+        return {
+            (item.artifact_id, item.version): blobs.blob_size(item.artifact_id, item.version)
+            for item in staged
+        }
+
+    def _check_outputs(
+        self,
+        conn: StoreConnection,
+        release: Release,
+        staged: Sequence[StagedVersion],
+        sizes: dict[tuple[str, int], int | None],
+    ) -> None:
+        """Every output is a building row of this release whose bytes, sized in *sizes*,
+        are all there, and every building row of the release is an output."""
         declared = {(item.artifact_id, item.version) for item in staged}
         rows = conn.execute(
             "SELECT id, version FROM artifact_versions WHERE release_id = ? AND state = 'building'",
@@ -733,7 +776,7 @@ class ReleaseStore:
                 raise ReleaseIncomplete(
                     f"{item.artifact_id}@v={item.version} is not staged under this release"
                 )
-            size = blobs.blob_size(item.artifact_id, item.version)
+            size = sizes[(item.artifact_id, item.version)]
             if size != item.byte_size:
                 conn.rollback()
                 raise ReleaseIncomplete(
@@ -748,14 +791,20 @@ class ReleaseStore:
         tenant: str,
         subject: str,
         now: float,
+        *,
+        accepting: str | None = None,
     ) -> None:
-        """The operations in order on the caller's transaction; *subject* names an audit row."""
+        """The operations in order on the caller's transaction; *subject* names an audit row.
+
+        *accepting* is the release this transaction accepts, which a reference may
+        name before it is accepted.
+        """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
             # Before the transaction's first write, as the audit lock requires.
             self._artifacts._serialize_audit(conn)
         asserted: dict[str, int] = {}
         for op in operations:
-            self._apply(conn, op, tenant, subject, now, asserted)
+            self._apply(conn, op, tenant, subject, now, asserted, accepting)
 
     def _apply(
         self,
@@ -765,6 +814,7 @@ class ReleaseStore:
         subject: str,
         now: float,
         asserted: dict[str, int],
+        accepting: str | None,
     ) -> None:
         """One operation; *asserted* carries each asserted revision to the advance it guards."""
         if isinstance(op, CheckBuildLease):
@@ -794,6 +844,16 @@ class ReleaseStore:
             if row["release_id"] != op.release_id:
                 raise OperationFailed(f"slot {op.target} already belongs to {row['release_id']}")
         elif isinstance(op, AdvanceReference):
+            if op.release_id != accepting:
+                target = conn.execute(
+                    "SELECT tenant, state FROM build_releases WHERE release_id = ?",
+                    (op.release_id,),
+                ).fetchone()
+                if target is None or target["tenant"] != tenant or target["state"] != "accepted":
+                    raise OperationFailed(
+                        f"reference {op.name}: {op.release_id} is not an accepted release "
+                        f"of tenant {tenant!r}"
+                    )
             self._advance(conn, tenant, op.name, op.release_id, now, asserted.get(op.name))
             if op.name in asserted:
                 asserted[op.name] += 1
