@@ -78,15 +78,15 @@ class ArtifactIdTaken(ValueError):
 
 
 def _reject_unaddressable_id(artifact_id: str) -> None:
-    """Refuse an id no ``id@v=N`` reference could name: empty, or holding ``@``.
+    """Refuse an id no ``id@v=N`` reference could name: empty, or holding ``@v=``.
 
-    Lineage edges and URIs split ``id@v=N`` at the ``@``, so such an id would
-    silently have no lineage.
+    Lineage edges and URIs split ``id@v=N`` at its ``@v=``, so such an id would
+    silently have no lineage. Any other ``@`` is the consumer's (``x@iter=3``).
     """
     if not artifact_id:
         raise ValueError("an artifact id is required")
-    if "@" in artifact_id:
-        raise ValueError(f"an artifact id cannot contain '@': {artifact_id!r}")
+    if "@v=" in artifact_id:
+        raise ValueError(f"an artifact id cannot contain '@v=': {artifact_id!r}")
 
 
 def reject_unsafe_artifact_id(artifact_id: str) -> None:

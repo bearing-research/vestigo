@@ -3,6 +3,17 @@
 All notable changes to vestigo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.2.1 - 2026-10-27
+
+### Fixed
+
+- An artifact id may hold `@` again, as a consumer's suffix such as
+  `x@iter=3` or `x@variant=a` does; only an empty id or one holding `@v=`
+  is refused, by `create_artifact`, `import_artifact` and `artifact_uri`.
+  0.2.0 refused every `@` (audit G-5), which broke Strata's loop, fan-out,
+  checkpoint and import ids. `parse_artifact_uri` now ends the id at the
+  last `@v=`, so such ids read back from a URI, pinned or not (#28).
+
 ## 0.2.0 - 2026-10-27
 
 Schema changes, all applied on open: `artifact_builds` gains `dispatch`
