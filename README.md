@@ -44,8 +44,8 @@ The package exports nothing at its top level; a consumer imports each module.
 
 - `vestigo.store`: `ArtifactStore(artifact_dir, blob_store=None, dialect=None,
   read_only=False)`, the versioned artifacts with their names, aliases, tags,
-  pins, publications, retention (`retain`, `require`, `requires=` on
-  `create_artifact`)
+  publications, retention (roots through `retain`, a pin among them;
+  `require`, `requires=` on `create_artifact`)
   and audit log; `register_validator(content_type, validate)`; the
   `ArtifactVersion` record; `get_artifact_store` and `reset_artifact_store`
   for the process-wide instance.

@@ -1,6 +1,6 @@
 name: Release
 
-# A `v*` tag builds the wheel and sdist, publishes to TestPyPI via OIDC
+# A `v*` tag runs the suite, builds the wheel and sdist, publishes to TestPyPI via OIDC
 # trusted publishing, then to PyPI after manual approval on the protected
 # `pypi` environment.
 #
@@ -57,11 +57,30 @@ jobs:
           print(f"releasing {version}")
           PY
 
+  # The tag publishes only what passes the suite, whatever CI said about the commit.
+  test:
+    name: Test the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: preflight
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: "3.12"
+          version: "latest"
+      - run: uv sync --all-extras --locked
+      - run: uv run pytest -q -p no:cacheprovider
+        env:
+          VESTIGO_REQUIRE_DOCKER: "1"
+
   build:
     name: Build and smoke-test
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: preflight
+    needs: test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:

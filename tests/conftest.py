@@ -20,6 +20,7 @@ from testcontainers.community.postgres import PostgresContainer
 from vestigo.build_store import reset_build_store
 from vestigo.sql_backend import PostgresDialect
 from vestigo.store import ArtifactStore, register_validator, reset_artifact_store
+from vestigo.tables import LEDGER_TABLES, TRANSIENT_TABLES
 from vestigo.uris import DEFAULT_URI_SCHEME, set_uri_scheme, uri_scheme
 
 
@@ -110,13 +111,7 @@ def postgres_dsn(docker_daemon) -> Iterator[str]:
         yield container.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
 
 
-LEDGER_TABLES = (
-    "artifact_versions, artifact_names, artifact_aliases, artifact_tags, registry_audit, "
-    "registry_pending, artifact_publications, retention_roots, retention_edges, "
-    "store_upgrades, nodes, node_inputs, node_links, build_releases, release_references, "
-    "release_authorities, import_staging, artifact_builds, build_attempts, "
-    "build_console_chunks, schema_version"
-)
+_EVERY_TABLE = ", ".join([name for name, _ in LEDGER_TABLES] + list(TRANSIENT_TABLES))
 
 
 @pytest.fixture
@@ -125,7 +120,7 @@ def postgres_store(postgres_dsn, tmp_path) -> Iterator[ArtifactStore]:
     dialect = PostgresDialect(postgres_dsn)
     conn = dialect.connect()
     try:
-        conn.executescript(f"DROP TABLE IF EXISTS {LEDGER_TABLES} CASCADE;")
+        conn.executescript(f"DROP TABLE IF EXISTS {_EVERY_TABLE} CASCADE;")
         conn.commit()
     finally:
         conn.close()

@@ -62,7 +62,7 @@ containers on the runner. ty checks `src` only.
 
 | Module | Holds |
 | --- | --- |
-| `store` | `ArtifactStore`: versions, names, aliases, tags, pins, publications, retention, audit log, GC, `register_validator`, the process-wide instance |
+| `store` | `ArtifactStore`: versions, names, aliases, tags, publications, retention roots (a pin is one), audit log, GC, `register_validator`, the process-wide instance |
 | `build_store` | `BuildStore`: builds, leases, attempts, console chunks; `find_open_build` by computation key |
 | `releases` | `ReleaseStore`: a build's checkpoint and final releases, fenced on the attempt's lease, accepted only once every output's bytes are stored |
 | `operations` | the typed operations a release runs in its transaction (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`, `AdvanceReference`, `InsertAuditEvent`) |
