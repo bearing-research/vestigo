@@ -18,12 +18,6 @@ def store(tmp_path) -> Iterator[ArtifactStore]:
     store.close()
 
 
-@pytest.fixture
-def validators(monkeypatch):
-    """This test's registrations only; the suite's own (conftest) are restored after."""
-    monkeypatch.setattr("vestigo.store._VALIDATORS", dict(_VALIDATORS))
-
-
 def _stored(store: ArtifactStore, artifact_id: str, data: bytes, content_type: str, rows=None):
     version = store.create_artifact(
         artifact_id,
@@ -40,10 +34,17 @@ def _lines(data: bytes) -> int:
     return data.count(b"\n")
 
 
-@pytest.mark.usefixtures("validators")
+@pytest.fixture
+def lines_validator():
+    """``text/lines`` for this test only; the suite's own registrations (conftest) stay."""
+    register_validator("text/lines", _lines)
+    yield
+    del _VALIDATORS["text/lines"]
+
+
+@pytest.mark.usefixtures("lines_validator")
 class TestARegisteredValidator:
     def test_its_error_is_an_invalid_stream(self, store):
-        register_validator("text/lines", _lines)
         _stored(store, "good", b"a\nb\n", "text/lines", rows=2)
         _stored(store, "bad", b"a\x00", "text/lines", rows=1)
 
@@ -53,7 +54,6 @@ class TestARegisteredValidator:
         assert finding["detail"] == "not text"
 
     def test_its_count_is_checked_against_the_recorded_rows(self, store):
-        register_validator("text/lines", _lines)
         _stored(store, "short", b"a\n", "text/lines", rows=3)
 
         [finding] = store.verify_artifacts()
@@ -61,7 +61,6 @@ class TestARegisteredValidator:
         assert (finding["artifact_id"], finding["problem"]) == ("short", "row_count_mismatch")
 
     def test_a_type_without_one_is_checked_for_its_digest_only(self, store):
-        register_validator("text/lines", _lines)
         _stored(store, "opaque", b"a\x00", "application/octet-stream", rows=7)
 
         assert store.verify_artifacts() == []

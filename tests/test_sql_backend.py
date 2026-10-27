@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import threading
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from vestigo import sql_backend
@@ -15,6 +15,9 @@ from vestigo.sql_backend import (
     SERVER_THREAD_LIMIT,
     PostgresDialect,
     SqliteDialect,
+    _Lease,
+    _PostgresConnection,
+    _Row,
     advisory_lock_id,
     translate_placeholders,
 )
@@ -153,8 +156,6 @@ class TestPostgresConnectionAdapter:
     """The wrapper keeps the store's call sites unchanged."""
 
     def _wrap(self):
-        from vestigo.sql_backend import _Lease, _PostgresConnection
-
         inner = _FakeInner()
         released = []
         lease = _Lease(inner)
@@ -236,8 +237,6 @@ class TestRowBehavesLikeSqliteRow:
     """The store reads results by name, by position, and via dict()."""
 
     def _row(self):
-        from vestigo.sql_backend import _Row
-
         return _Row(("id", "tenant"), ("a1", "acme"))
 
     def test_indexable_by_name(self):
@@ -327,29 +326,6 @@ class TestThreadLimitAndPoolAreOneNumber:
         assert PostgresDialect("postgresql:///x").max_size == SERVER_THREAD_LIMIT + 1
 
 
-def _docker_daemon_reachable() -> bool:
-    try:
-        import docker
-
-        docker.from_env().ping()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def postgres_dsn():
-    """A live Postgres for the pooled-connection tests; skipped without Docker."""
-    if not _docker_daemon_reachable():
-        if os.environ.get("VESTIGO_REQUIRE_DOCKER"):
-            raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
-        pytest.skip("Docker daemon is not running")
-    from testcontainers.community.postgres import PostgresContainer
-
-    with PostgresContainer("postgres:18-alpine") as container:
-        yield container.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
-
-
 @pytest.fixture
 def dialect(postgres_dsn):
     dialect = PostgresDialect(postgres_dsn)
@@ -373,8 +349,6 @@ class TestPooledConnectionLifecycle:
     def test_a_wrapper_dropped_after_a_failed_statement_does_not_poison_the_thread(
         self, dialect, caplog
     ):
-        import psycopg
-
         def forgets_to_close() -> None:
             conn = dialect.connect()
             try:
@@ -392,8 +366,6 @@ class TestPooledConnectionLifecycle:
             assert again.execute("SELECT 1").fetchone()[0] == 1
 
     def test_a_nested_connect_on_a_failed_transaction_is_refused(self, dialect):
-        import psycopg
-
         outer = dialect.connect()
         try:
             with pytest.raises(psycopg.Error):
@@ -459,8 +431,6 @@ class TestPooledConnectionLifecycle:
     def test_a_connection_the_server_dropped_is_not_handed_out(self, dialect, postgres_dsn):
         # After a restart or failover every idle pooled connection is dead; the pool checks
         # before handing one out, so no store call fails for it.
-        import psycopg
-
         with dialect.connect() as conn:
             pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
         with psycopg.connect(postgres_dsn, autocommit=True) as killer:

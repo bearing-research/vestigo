@@ -105,7 +105,11 @@ module gains an entry point.
 - The S3 unit tests run over moto; GCS and Azure over fake clients. The
   autouse `_no_ambient_cloud_credentials` fixture scrubs the developer's own
   credentials; never read real ones in a test.
-- Gate 2 (ADR 002 §8) is `tests/gate2.py`, one class run on both backends.
+- Gate 2 (ADR 002 §8) is `tests/test_releases.py`; its `ledger` fixture runs every test
+  on SQLite and Postgres through `backend_store` (conftest), which any store test can take.
+- `tests/conftest.py` holds fixtures only (singleton resets, the credential scrub, the
+  suite's validator, the session's Postgres container); a helper lives in the module that
+  uses it, and imports sit at the top of the module.
 - Fixtures yield and close their stores; a test closes any connection or
   response body it opens. The suite passes under `-W error`; keep it so.
 - Every new test is teeth-checked: it fails on the code it pins.

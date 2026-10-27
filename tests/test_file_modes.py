@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import vestigo.file_modes
 from vestigo.file_modes import PASS_THROUGH_DIR, narrow, private_dir
 from vestigo.store import ArtifactStore
 
@@ -86,8 +87,6 @@ class TestTheArtifactStore:
 
     def test_journals_sqlite_deletes_while_the_store_opens_are_skipped(self, tmp_path, monkeypatch):
         """A live server's last connection closing deletes them between any check and the chmod."""
-        import vestigo.file_modes
-
         db = ArtifactStore(tmp_path / "artifacts").db_path
         held = _held_open(db)
         assert all(p.exists() for p in _journals(db))

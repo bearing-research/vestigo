@@ -1,20 +1,34 @@
 """Tests for the artifact store: lifecycle, provenance dedup, names, blob I/O, cleanup."""
 
+import hashlib
 import json
+import sqlite3
+import threading
+import time
+from dataclasses import fields
 
+import pyarrow as pa
+import pyarrow.ipc as ipc
 import pytest
-from conftest import race_after_pending_read
 
 from vestigo import uris
+from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES
+from vestigo.build_store import BuildStore
+from vestigo.graph import NodeSpec
 from vestigo.provenance import (
     TransformSpec,
     compute_provenance_hash,
     parse_transform_spec,
 )
+from vestigo.sql_backend import SqlDialect, SqliteDialect
 from vestigo.store import (
+    _VERSION_FIELDS,
+    ArtifactIdTaken,
+    ArtifactImportConflict,
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
+    StagedVersion,
     reset_artifact_store,
 )
 
@@ -102,9 +116,6 @@ class TestVersionRowMapping:
     def test_the_select_list_is_the_dataclass(self):
         # Every SELECT of a version and its constructor read `_VERSION_FIELDS`; a
         # column added to the dataclass alone would come back as its default.
-        from dataclasses import fields
-
-        from vestigo.store import _VERSION_FIELDS
 
         assert _VERSION_FIELDS == tuple(field.name for field in fields(ArtifactVersion))
 
@@ -306,9 +317,6 @@ class TestProvenanceLookup:
         """The use note is advisory: a hit returns while a sweep holds the write lock,
         rather than waiting the busy timeout behind it. The lock is held throughout,
         so the lookup can only come back by giving the note up."""
-        import sqlite3
-        import threading
-
         version = store.create_artifact("test-id", "unique-hash")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
         conn = store._get_connection()
@@ -479,8 +487,6 @@ class TestCleanup:
 
     def test_cleanup_failed_takes_a_failed_build_row_with_it(self, store):
         """A server build that failed leaves a build row, whose foreign key refused the delete."""
-        from vestigo.build_store import BuildStore
-
         builds = BuildStore(store.db_path, dialect=store.dialect)
         version = store.create_artifact("built", "hash-built")
         builds.create_build("build-1", "built", version, "exec@v1")
@@ -588,9 +594,6 @@ class TestStats:
 
 def _ipc_bytes(num_rows: int) -> bytes:
     """A single valid Arrow IPC stream with ``num_rows`` rows."""
-    import pyarrow as pa
-    import pyarrow.ipc as ipc
-
     sink = pa.BufferOutputStream()
     with ipc.new_stream(sink, pa.schema([("id", pa.int64())])) as writer:
         writer.write_batch(pa.RecordBatch.from_pydict({"id": list(range(num_rows))}))
@@ -641,8 +644,6 @@ class TestForeignKeyEnforcement:
         assert store.get_artifact("art-1", 1) is not None
 
     def test_delete_artifact_takes_the_build_row_with_it(self, tmp_path, store):
-        from vestigo.build_store import BuildStore
-
         builds = BuildStore(store.db_path)
         self._ready(store, "art-1", "prov-a")
         builds.create_build("build-1", "art-1", 1, "exec@v1")
@@ -653,8 +654,6 @@ class TestForeignKeyEnforcement:
         assert builds.get_build("build-1") is None
 
     def test_garbage_collect_takes_build_rows_with_it(self, tmp_path, store):
-        from vestigo.build_store import BuildStore
-
         builds = BuildStore(store.db_path)
         self._ready(store, "art-1", "prov-a")
         self._ready(store, "art-1", "prov-b")
@@ -768,8 +767,6 @@ class TestVersionPromotion:
     def test_promotion_copies_a_blob_larger_than_one_stream_chunk(self, store):
         # The copy is streamed rather than read into memory; a payload spanning
         # several chunks is what tells a chunk-boundary bug from a working one.
-        from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES
-
         payload = bytes(range(256)) * ((BLOB_STREAM_CHUNK_BYTES * 2) // 256 + 3)
         self._ready(store, "art-1", "prov-a", payload)
         self._ready(store, "art-1", "prov-b", b"small")
@@ -830,8 +827,6 @@ class TestVersionPromotion:
         assert store.get_artifact("file-1", 1) is not None
 
     def test_promotion_refuses_an_id_another_tenant_holds(self, store):
-        from vestigo.store import ArtifactIdTaken
-
         version = store.create_artifact("art-1", "prov-a", tenant="acme")
         store.blob_store.write_blob("art-1", version, b"theirs")
         store.finalize_artifact("art-1", version, "{}", 1, 6)
@@ -844,8 +839,6 @@ class TestVersionPromotion:
         assert store.promote_version("art-1", version, tenant="acme").version == 2
 
     def test_a_refused_promotion_closes_the_source_reader(self, store, monkeypatch):
-        from vestigo.store import ArtifactIdTaken
-
         version = store.create_artifact("art-1", "prov-a", tenant="acme")
         store.blob_store.write_blob("art-1", version, b"theirs")
         store.finalize_artifact("art-1", version, "{}", 1, 6)
@@ -881,8 +874,6 @@ class TestVersionPromotion:
 
     def test_promotion_keeps_its_own_bytes_when_another_id_holds_the_provenance(self, store):
         """A non-deterministic cell's twin holds other bytes; the reverted cell gets its own."""
-        from vestigo.store import StagedVersion
-
         self._ready(store, "art-1", "prov-a", b"mine-bytes")
         self._ready(store, "art-1", "prov-b", b"second")
         twin = store.create_artifact("art-twin", "prov-a")
@@ -1496,18 +1487,70 @@ class TestApproveAtomicity:
         assert entries[0]["actor"] == "approver"
 
 
-def _no_wait_store(artifact_dir):
-    """A second store on the same database (as another process would open) that never waits."""
-    competitor = ArtifactStore(artifact_dir)
+def _no_wait_store(store: ArtifactStore) -> ArtifactStore:
+    """A second store on the same database, as another process opens one, that never waits."""
+    dialect = store.dialect
+    if dialect.name == "sqlite":
+        other: SqlDialect = SqliteDialect(store.db_path)
+        no_wait = "PRAGMA busy_timeout = 0"
+    else:
+        other = type(dialect)(dialect.dsn)  # type: ignore[attr-defined]
+        no_wait = "SET lock_timeout = '1ms'"
+    competitor = ArtifactStore(store.artifact_dir, dialect=other)
     connect = competitor._get_connection
 
-    def no_wait():
+    def connect_without_waiting():
         conn = connect()
-        conn.execute("PRAGMA busy_timeout = 0")
+        conn.execute(no_wait)
         return conn
 
-    competitor._get_connection = no_wait
+    competitor._get_connection = connect_without_waiting
     return competitor
+
+
+def race_after_pending_read(store, competitor, first, second) -> tuple[object, object]:
+    """Run ``first(store)``, landing ``second(competitor)`` right after it reads the pending row.
+
+    ``competitor`` is a second store whose connections do not wait for a lock. One that finds it
+    held runs ``second`` again once ``first`` is done, as a second process waiting on it would.
+    Returns each call's result, or the ``ValueError`` it raised.
+    """
+    outcomes: dict[str, object] = {}
+    state = {"read": False, "locked": False}
+
+    def call(key, fn, target):
+        try:
+            outcomes[key] = fn(target)
+        except ValueError as exc:
+            outcomes[key] = exc
+
+    class Interleaved:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, attr):
+            return getattr(self._inner, attr)
+
+        def execute(self, sql, params=()):
+            if state["read"] and not state["locked"] and "second" not in outcomes:
+                try:
+                    call("second", second, competitor)
+                except competitor.dialect.operational_error:
+                    state["locked"] = True
+            cursor = self._inner.execute(sql, params)
+            if "FROM registry_pending" in sql:
+                state["read"] = True
+            return cursor
+
+    connect = store._get_connection
+    store._get_connection = lambda: Interleaved(connect())
+    try:
+        call("first", first, store)
+    finally:
+        store._get_connection = connect
+    if state["locked"]:
+        call("second", second, competitor)
+    return outcomes["first"], outcomes["second"]
 
 
 _DECISIONS = {
@@ -1517,17 +1560,27 @@ _DECISIONS = {
 
 
 class TestPendingChangeRaces:
-    """Reading a pending change and consuming it is one step, even across connections."""
+    """Reading a pending change and consuming it is one step, across connections and nodes."""
+
+    @pytest.fixture
+    def store(self, backend_store):
+        return backend_store
+
+    @pytest.fixture
+    def competitor(self, store):
+        competitor = _no_wait_store(store)
+        yield competitor
+        competitor.dialect.close()
 
     @pytest.mark.parametrize(("first", "second"), [("approve", "reject"), ("reject", "approve")])
     def test_an_approve_and_a_reject_of_one_change_have_one_winner(
-        self, store, artifact_dir, first, second
+        self, store, competitor, first, second
     ):
         _make_ready_artifact(store, "m1", "prov-1")
         store.request_alias_change("demo/model", "champion", "set", artifact_id="m1", version=1)
 
         won, lost = race_after_pending_read(
-            store, _no_wait_store(artifact_dir), _DECISIONS[first], _DECISIONS[second]
+            store, competitor, _DECISIONS[first], _DECISIONS[second]
         )
 
         assert won["artifact_id"] == "m1"
@@ -1539,14 +1592,14 @@ class TestPendingChangeRaces:
         )
         assert (store.resolve_alias("demo/model", "champion") is not None) == (first == "approve")
 
-    def test_an_approval_leaves_a_newer_request_pending(self, store, artifact_dir):
+    def test_an_approval_leaves_a_newer_request_pending(self, store, competitor):
         _make_ready_artifact(store, "m1", "prov-1")
         _make_ready_artifact(store, "m2", "prov-2")
         store.request_alias_change("demo/model", "champion", "set", artifact_id="m1", version=1)
 
         applied, requested = race_after_pending_read(
             store,
-            _no_wait_store(artifact_dir),
+            competitor,
             _DECISIONS["approve"],
             lambda s: s.request_alias_change(
                 "demo/model", "champion", "set", artifact_id="m2", version=1
@@ -1564,8 +1617,6 @@ class TestCreateArtifactVersionRace:
     """Concurrent creates for one artifact id allocate distinct versions."""
 
     def test_threaded_creates_never_collide(self, store):
-        import threading
-
         _make_ready_artifact(store, "contended", "prov-base")
         errors: list[Exception] = []
         versions: list[int] = []
@@ -1736,8 +1787,6 @@ class TestListArtifactsSortAndSince:
         assert [a.id for a in result] == ["a"]
 
     def test_since_filter(self, store):
-        import time
-
         self._add(store, "a", 1)
         assert len(store.list_artifacts(since=0)) == 1
         assert store.list_artifacts(since=time.time() + 3600) == []
@@ -1798,8 +1847,6 @@ class TestTenantNormalization:
         result = store.finalize_artifact("art-2", 1, "{}", 1, 10)
         assert result.id == "art-1"  # deduped to the first
 
-        import sqlite3
-
         conn = sqlite3.connect(str(store.db_path))
         ready = conn.execute(
             "SELECT COUNT(*) FROM artifact_versions "
@@ -1825,8 +1872,6 @@ class TestTenantNormalization:
     @staticmethod
     def _staged_over_a_ready_equal(store, provenance):
         """``canonical`` staged with the provenance ``equiv`` already holds ready, in team-a."""
-        from vestigo.store import StagedVersion
-
         store.create_artifact("equiv", provenance, tenant="team-a")
         store.write_blob("equiv", 1, b"x" * 10)
         store.finalize_artifact("equiv", 1, "{}", 1, 10)
@@ -1841,8 +1886,6 @@ class TestTenantNormalization:
         SQLite's BEGIN IMMEDIATE prevents this in production, so the conflict is injected; the
         retry loop is dialect-agnostic.
         """
-        import sqlite3
-
         staged = self._staged_over_a_ready_equal(store, "race-prov")
 
         real_get_connection = store._get_connection
@@ -1876,8 +1919,6 @@ class TestTenantNormalization:
 
     def test_canonical_finalize_surfaces_a_persistent_conflict(self, store):
         """Sustained contention must surface, not report a promotion that did not happen."""
-        import sqlite3
-
         staged = self._staged_over_a_ready_equal(store, "race-prov")
 
         real_get_connection = store._get_connection
@@ -1905,8 +1946,6 @@ class TestTenantNormalization:
 
         [promoted] = store.finalize_canonical_together([staged])
         assert promoted is not None and promoted.state == "ready"
-
-        import sqlite3
 
         conn = sqlite3.connect(str(store.db_path))
         ready_ids = [
@@ -1947,8 +1986,6 @@ class TestTenantNormalization:
         """A legacy store with NULL tenants and a duplicate ready row normalizes to '' and collapses
         the duplicate so the uniqueness index holds.
         """
-        import sqlite3
-
         store = ArtifactStore(artifact_dir)
         store.create_artifact("a1", "h")
         store.finalize_artifact("a1", 1, "{}", 1, 10)
@@ -1984,8 +2021,6 @@ class TestTenantNormalization:
     def test_a_tenant_migration_that_fails_part_way_keeps_the_old_index(self, artifact_dir):
         """DROP INDEX used to commit on its own, so a failure later in the rebuild left the
         store with no uniqueness index at all (and two upgrading processes could interleave)."""
-        import sqlite3
-
         store = ArtifactStore(artifact_dir)
         store.create_artifact("a1", "h")
         store.finalize_artifact("a1", 1, "{}", 1, 10)
@@ -2155,8 +2190,6 @@ class TestAnIdTwoComputationsClaim:
 
     @staticmethod
     def _record(provenance: str):
-        from vestigo.store import ArtifactVersion
-
         return ArtifactVersion(
             id="nb_shared_cell_c1_var_rows",
             version=1,
@@ -2184,8 +2217,6 @@ class TestAnIdTwoComputationsClaim:
         """Keeping the existing row would leave the caller's name, tags and descendants on someone
         else's bytes.
         """
-        from vestigo.store import ArtifactImportConflict
-
         store.import_artifact(self._record("a" * 64), b"ALICE")
 
         with pytest.raises(ArtifactImportConflict):
@@ -2202,8 +2233,6 @@ class TestAnIdIsHeldByOneTenant:
 
     @pytest.mark.parametrize("holder,caller", [("team-b", "team-a"), ("team-b", None), (None, "a")])
     def test_create_refuses_an_id_another_tenant_holds(self, store, holder, caller):
-        from vestigo.store import ArtifactIdTaken
-
         store.create_artifact("nb_x", "a" * 64, tenant=holder)
 
         with pytest.raises(ArtifactIdTaken):
@@ -2220,8 +2249,6 @@ class TestAnIdIsHeldByOneTenant:
     @pytest.mark.parametrize("version", [1, 2])
     def test_import_refuses_an_id_another_tenant_holds(self, store, version):
         """Version 1 is the same computation, which used to resolve onto the other tenant's row."""
-        from vestigo.store import ArtifactImportConflict, ArtifactVersion
-
         held = store.create_artifact("nb_x", "a" * 64, tenant="team-b")
         store.write_blob("nb_x", held, b"TEAMB")
         store.finalize_artifact("nb_x", held, "", row_count=None, byte_size=5)
@@ -2260,9 +2287,6 @@ class TestTwoIdsOneComputation:
     B = "nb_B_cell_c1_var_df"
 
     def _both_finalized(self, store):
-        import hashlib
-
-        from vestigo.store import StagedVersion
 
         _make_ready_artifact(store, self.A, "same-prov")
         vb = store.create_artifact(self.B, "same-prov")
@@ -2304,8 +2328,6 @@ class TestFinalizeTogether:
 
     @staticmethod
     def _staged(store, artifact_id: str, provenance: str):
-        from vestigo.store import StagedVersion
-
         version = store.create_artifact(artifact_id, provenance)
         store.write_blob(artifact_id, version, b"x")
         return StagedVersion(artifact_id, version, "{}", 1, 1, "digest")
@@ -2422,8 +2444,6 @@ class TestVersionsOfComputation:
             )
             store.write_blob(artifact_id, version, _ipc_bytes(1))
             store.finalize_artifact(artifact_id, version, "{}", 1, 10)
-        from vestigo.store import StagedVersion
-
         _make_ready_artifact(store, "other", "prov-other")
         store.create_artifact("building", "prov-b", computation_key="comp-1")
         store.create_artifact("twin", "prov-model")
@@ -2441,8 +2461,6 @@ class TestSetDefinitions:
     """A version is attributed only to a node stored in its tenant's scope."""
 
     def _node(self, store, tenant=None):
-        from vestigo.graph import NodeSpec
-
         return store.graph.put_batch([NodeSpec("test/cell", b"x")], tenant=tenant)[0]
 
     def test_a_definition_is_recorded_in_the_versions_tenant(self, store):

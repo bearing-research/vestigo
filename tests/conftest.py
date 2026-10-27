@@ -1,23 +1,25 @@
-"""Fixtures and helpers for the ledger's own suite.
+"""Fixtures for the ledger's own suite.
 
 Nothing here imports Strata: the suite must run from a checkout of this package alone.
+Helpers that one module uses live in that module; this file holds what every module
+shares: the singleton resets, the credential scrub, the validator the suite registers,
+and the Docker-backed Postgres that any store test can run on.
 """
 
 from __future__ import annotations
 
-import http.server
-import json
 import os
-import threading
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 
+import docker
 import pyarrow as pa
 import pytest
+from testcontainers.community.postgres import PostgresContainer
 
 from vestigo.build_store import reset_build_store
-from vestigo.store import register_validator, reset_artifact_store
+from vestigo.sql_backend import PostgresDialect
+from vestigo.store import ArtifactStore, register_validator, reset_artifact_store
 from vestigo.uris import DEFAULT_URI_SCHEME, set_uri_scheme, uri_scheme
 
 
@@ -86,142 +88,67 @@ def _no_ambient_cloud_credentials(monkeypatch: pytest.MonkeyPatch, _no_cloud_con
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
-def docker_or_skip() -> None:
-    """Skip the module when the Docker daemon is unreachable; fail it where Docker is required.
+@pytest.fixture(scope="session")
+def docker_daemon() -> None:
+    """Skip what needs a container when the Docker daemon is unreachable; fail where required.
 
     Only possible locally: CI sets ``VESTIGO_REQUIRE_DOCKER`` so a missing daemon cannot
-    skip a container-backed suite to green.
+    skip a container-backed test to green.
     """
-    import docker
-
     try:
         docker.from_env().ping()
     except Exception:
         if os.environ.get("VESTIGO_REQUIRE_DOCKER"):
             raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
-        pytest.skip("Docker daemon is not running", allow_module_level=True)
+        pytest.skip("Docker daemon is not running")
 
 
-BUILD_TARGET_IDS: tuple[str, ...] = (
-    "a",
-    "art-123",
-    "canonical-artifact",
-    *(f"art-{i}" for i in range(4)),
-    *(f"artifact-{i}" for i in range(1, 4)),
+@pytest.fixture(scope="session")
+def postgres_dsn(docker_daemon) -> Iterator[str]:
+    """One live Postgres for the session; each store fixture starts from an empty schema."""
+    with PostgresContainer("postgres:18-alpine") as container:
+        yield container.get_connection_url().replace("postgresql+psycopg2://", "postgresql://")
+
+
+LEDGER_TABLES = (
+    "artifact_versions, artifact_names, artifact_aliases, artifact_tags, registry_audit, "
+    "registry_pending, artifact_publications, retention_roots, retention_edges, "
+    "store_upgrades, nodes, node_inputs, node_links, build_releases, release_references, "
+    "release_authorities, import_staging, artifact_builds, build_attempts, "
+    "build_console_chunks, schema_version"
 )
 
 
-def seed_build_targets(
-    artifact_dir: Path,
-    artifact_ids: Iterable[str] = BUILD_TARGET_IDS,
-    versions: Iterable[int] = range(1, 8),
-) -> None:
-    """Create the artifact versions that build rows are allowed to reference.
-
-    ``artifact_builds`` has a foreign key on ``(artifact_id, version)`` and production always
-    creates the version first. Opening the artifact store also creates ``artifact_versions``
-    in the shared database, without which the key cannot resolve.
-    """
-    from vestigo.store import ArtifactStore
-
-    store = ArtifactStore(artifact_dir)
+@pytest.fixture
+def postgres_store(postgres_dsn, tmp_path) -> Iterator[ArtifactStore]:
+    """A store with metadata on Postgres and local blobs, on a schema this test creates."""
+    dialect = PostgresDialect(postgres_dsn)
+    conn = dialect.connect()
     try:
-        for artifact_id in artifact_ids:
-            for version in versions:
-                created = store.create_artifact(artifact_id, f"seed-{artifact_id}-{version}")
-                store.blob_store.write_blob(artifact_id, created, b"seed")
-                store.finalize_artifact(artifact_id, created, "{}", 1, 4)
+        conn.executescript(f"DROP TABLE IF EXISTS {LEDGER_TABLES} CASCADE;")
+        conn.commit()
     finally:
-        store.close()
+        conn.close()
+
+    yield ArtifactStore(tmp_path / "artifacts", dialect=dialect)
+
+    # Each test builds its own pool against the shared container. Left open
+    # they accumulate toward Postgres's default max_connections of 100 and
+    # later tests start failing for reasons that have nothing to do with them.
+    dialect.close()
 
 
-def race_after_pending_read(store, competitor, first, second) -> tuple[object, object]:
-    """Run ``first(store)``, landing ``second(competitor)`` right after it reads the pending row.
-
-    ``competitor`` is a second store whose connections do not wait for a lock. One that finds it
-    held runs ``second`` again once ``first`` is done, as a second process waiting on it would.
-    Returns each call's result, or the ``ValueError`` it raised.
-    """
-    outcomes: dict[str, object] = {}
-    state = {"read": False, "locked": False}
-
-    def call(key, fn, target):
-        try:
-            outcomes[key] = fn(target)
-        except ValueError as exc:
-            outcomes[key] = exc
-
-    class Interleaved:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def __getattr__(self, attr):
-            return getattr(self._inner, attr)
-
-        def execute(self, sql, params=()):
-            if state["read"] and not state["locked"] and "second" not in outcomes:
-                try:
-                    call("second", second, competitor)
-                except competitor.dialect.operational_error:
-                    state["locked"] = True
-            cursor = self._inner.execute(sql, params)
-            if "FROM registry_pending" in sql:
-                state["read"] = True
-            return cursor
-
-    connect = store._get_connection
-    store._get_connection = lambda: Interleaved(connect())
-    try:
-        call("first", first, store)
-    finally:
-        store._get_connection = connect
-    if state["locked"]:
-        call("second", second, competitor)
-    return outcomes["first"], outcomes["second"]
-
-
-@contextmanager
-def _serve(handler: type[http.server.BaseHTTPRequestHandler]) -> Iterator[str]:
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
-        server.server_close()
-
-
-@contextmanager
-def role_credentials(
-    monkeypatch: pytest.MonkeyPatch, access_key: str, secret_key: str, token: str
-) -> Iterator[list[str]]:
-    """Serve temporary credentials the way an ECS task role does, with no other source.
-
-    Yields the list of requests the endpoint saw, so a test can count resolutions.
-    """
-    seen: list[str] = []
-    body = json.dumps(
-        {
-            "AccessKeyId": access_key,
-            "SecretAccessKey": secret_key,
-            "Token": token,
-            "Expiration": "2099-01-01T00:00:00Z",
-        }
-    ).encode()
-
-    class Role(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
-            seen.append(self.path)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *args):
-            return None
-
-    # Every other source is out already: ``_no_ambient_cloud_credentials`` runs first.
-    with _serve(Role) as base:
-        monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", f"{base}/role")
-        yield seen
+@pytest.fixture(
+    params=[
+        "sqlite",
+        pytest.param("postgres", marks=[pytest.mark.integration, pytest.mark.slow]),
+    ]
+)
+def backend_store(request, tmp_path) -> Iterator[ArtifactStore]:
+    """A store on each metadata backend: a test that takes it runs once per backend."""
+    if request.param == "postgres":
+        yield request.getfixturevalue("postgres_store")
+        return
+    store = ArtifactStore(tmp_path / "artifacts")
+    yield store
+    store.close()

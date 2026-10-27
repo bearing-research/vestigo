@@ -5,6 +5,13 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- The suite: Gate 2 is `tests/test_releases.py`, its tests grouped by what they prove
+  and run on both backends through a `backend_store` fixture; one Postgres container
+  serves the session instead of one per module; helpers live in the module that uses
+  them and `conftest.py` holds fixtures only; every import is at module level (#21).
+
 ## 0.2.0 - 2026-10-26
 
 Schema changes, all applied on open: `artifact_builds` gains `dispatch`

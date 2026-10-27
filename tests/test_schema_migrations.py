@@ -5,10 +5,15 @@ The Postgres half lives in ``test_artifact_store_postgres.py``.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
+import threading
+import time
 
 import pytest
 
+from vestigo.provenance import TransformSpec
+from vestigo.sql_backend import SqliteDialect
 from vestigo.store import (
     _BASELINE_SCHEMA_VERSION,
     _LATEST_SCHEMA_VERSION,
@@ -104,8 +109,6 @@ class TestExistingDatabase:
 
     def test_data_survives_a_migration(self, tmp_path):
         """The rows are why the store could not be recreated."""
-        import hashlib
-
         store = ArtifactStore(tmp_path / "old")
         version = store.create_artifact("keeper", hashlib.sha256(b"x").hexdigest())
         with store.open_blob_writer("keeper", version) as writer:
@@ -147,10 +150,6 @@ class TestTwoFirstBoots:
         inserted when the second boot finds the tables. Under the lock the second
         waits (its no-wait connection reports the lock instead); without it the
         second stamps every version first and the first boot's insert collides."""
-        import threading
-        import time
-
-        from vestigo.sql_backend import SqliteDialect
 
         class NoWait(SqliteDialect):
             def connect(self):
@@ -282,8 +281,6 @@ class TestConstantsAndMigrationsAgree:
 
 
 def _ready(store, artifact_id, executor, inputs, input_versions=None) -> None:
-    from vestigo.provenance import TransformSpec
-
     spec = TransformSpec(executor=executor, params={"sql": "SELECT 1"}, inputs=inputs)
     version = store.create_artifact(
         artifact_id, f"hash-{artifact_id}", transform_spec=spec, input_versions=input_versions
@@ -293,8 +290,6 @@ def _ready(store, artifact_id, executor, inputs, input_versions=None) -> None:
 
 def test_column_exists_reports_truthfully(tmp_path):
     """The primitive every migration is built from."""
-    from vestigo.sql_backend import SqliteDialect
-
     store = ArtifactStore(tmp_path / "s")
     dialect = SqliteDialect(store.db_path)
     conn = dialect.connect()
