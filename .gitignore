@@ -221,3 +221,6 @@ __marimo__/
 
 # TLC writes its state space beside the models.
 formal/tla/states/
+
+# Internal docs (handoff, runbook, audits, design copies) stay local, as in Strata.
+docs/internal/
