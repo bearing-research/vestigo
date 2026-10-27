@@ -5,22 +5,19 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
-Schema change: `build_attempts` gains `principal`, added on open, and
-`node_links` is a new table (migration 15), so the table inventory Strata's
-contract tests pin grows by one.
+## 0.2.0 - 2026-10-26
 
-### Fixed
-
-- A missing Azure container is an error on every call, as a missing S3 bucket
-  is on a read; it read as an absent blob before, and `blob_exists` used the
-  SDK's `exists()`, which answers False to any 404 (#19). The emulator suite
-  now asserts on the wire what the fakes asserted: a missing bucket, a refused
-  credential and an unreachable endpoint are errors, never absence, on MinIO,
-  Azurite and fake-gcs-server (where a missing bucket is the one documented
-  exception, the GCS API answering one `NotFound` for both).
+Schema changes, all applied on open: `artifact_builds` gains `dispatch`
+(backfilled from the old params mark), `build_attempts` gains `principal`,
+and `node_links` is a new table (migration 15), so the table inventory
+Strata's contract tests pin grows by one. Strata moves its pin to this
+version with its own dispatch, principal and link changes.
 
 ### Added
 
+- `ReleaseStore.bundles_of(build_id, kind=None)`: a build's releases with
+  their outputs in one read, what a resume or a prune did as `releases_of`
+  plus `bundle` per release (#13, friction log 6).
 - `node_links` and `GraphStore.link(node_id, relation, target)`, `links`,
   `linked_from`: a relation between two stored nodes that is inside neither
   identity. `reconstructed_from` (ADR 002 §6.3) is the first: a complete node
@@ -28,22 +25,11 @@ contract tests pin grows by one.
   (#18, friction log 8).
 - `build_attempts.principal`: `open_attempt(principal=)` records who runs an
   attempt, which a resume may make someone other than the build's initiator;
-  `AttemptState.principal` reads it back (#17).
+  `AttemptState.principal` reads it back (#17, friction log 7).
 - `collectable_checkpoints(keep=k)` spares the newest `k` accepted checkpoints
   of each building build, so a latest-k policy is the same read with a deeper
   bound; `accept` states that an empty `final` release ends a build without a
-  product (#15).
-
-## 0.2.0 - 2026-10-26
-
-Schema change: `artifact_builds` gains `dispatch`, backfilled on open.
-Strata moves its pin to this version with its own dispatch change.
-
-### Added
-
-- `ReleaseStore.bundles_of(build_id, kind=None)`: a build's releases with
-  their outputs in one read, what a resume or a prune did as `releases_of`
-  plus `bundle` per release (#13, friction log 6).
+  product (#15, friction log 5 and 2).
 
 ### Changed
 
@@ -52,8 +38,7 @@ Strata moves its pin to this version with its own dispatch change.
   runs it itself); `create_build` takes `dispatch=` and refuses any other
   value. The ledger no longer reads the `_dispatch_mode` mark in `params`;
   a database from before the column backfills it from the mark once, on
-  either backend (#12, friction log 11). Schema change: the next release
-  bumps the minor.
+  either backend (#12, friction log 11).
 - One column list and one row mapper build every `ArtifactVersion` the store
   reads; a new column is one entry in `_VERSION_FIELDS` and one dataclass
   field, pinned equal by a test (#10, friction log 1).
@@ -64,7 +49,19 @@ Strata moves its pin to this version with its own dispatch change.
 
 ### Fixed
 
+- A missing Azure container is an error on every call, as a missing S3 bucket
+  is on a read; it read as an absent blob before, and `blob_exists` used the
+  SDK's `exists()`, which answers False to any 404 (#19). The emulator suite
+  now asserts on the wire what the fakes asserted: a missing bucket, a refused
+  credential and an unreachable endpoint are errors, never absence, on MinIO,
+  Azurite and fake-gcs-server (where a missing bucket is the one documented
+  exception, the GCS API answering one `NotFound` for both).
 - The PostgreSQL row shim accepts a slice, as `sqlite3.Row` does (#9).
+
+### Verified
+
+- Every TLA+ configuration re-run on the rewritten models; counts and the
+  expected violations in `formal/README.md` (#16).
 
 ## 0.1.0 - 2026-10-26
 
