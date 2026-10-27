@@ -247,6 +247,11 @@ class TestRowBehavesLikeSqliteRow:
         # create_artifact reads `cursor.fetchone()[0]`.
         assert self._row()[0] == "a1"
 
+    def test_sliceable_by_position(self):
+        # sqlite3.Row slices; a reader unpacking `row[1:]` must work on both.
+        assert self._row()[1:] == ("acme",)
+        assert self._row()[:2] == ("a1", "acme")
+
     def test_convertible_to_dict(self):
         # read_audit and list_pending_changes do `dict(row)`.
         assert dict(self._row()) == {"id": "a1", "tenant": "acme"}
