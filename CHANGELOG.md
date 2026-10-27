@@ -7,6 +7,13 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Changed
 
+- **A build's `dispatch` is a column.** `artifact_builds.dispatch` is
+  `runner` (offered by `list_runnable_builds`) or `external` (the consumer
+  runs it itself); `create_build` takes `dispatch=` and refuses any other
+  value. The ledger no longer reads the `_dispatch_mode` mark in `params`;
+  a database from before the column backfills it from the mark once, on
+  either backend (#12, friction log 11). Schema change: the next release
+  bumps the minor.
 - One column list and one row mapper build every `ArtifactVersion` the store
   reads; a new column is one entry in `_VERSION_FIELDS` and one dataclass
   field, pinned equal by a test (#10, friction log 1).
