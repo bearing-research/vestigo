@@ -3,6 +3,26 @@
 All notable changes to vestigo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `vestigo.torch`, behind a new `torch` extra: PyTorch checkpoints as ledger
+  releases (Investigation 09, stages T0, T1 and the local half of T2). A
+  model (class and `state_dict` schema under a declared version) and a
+  training program (its loss and optimizer, an `impl` edge to the model) are
+  structural nodes; an execution is a build keyed by the program, its inputs
+  and the release it starts from. `Run.finalize_callback` makes each
+  checkpoint `torch_checkpointing` writes one release of its files under a
+  manifest that requires them, accepted only while the run's attempt holds
+  the lease; `resume` continues an execution in a new attempt and fences the
+  old one, `branch` opens a new execution from any accepted release, and
+  `Run.restore` writes the release back, checked against its digests. A
+  resumed run and a branch end on the weights of an uninterrupted one; a
+  crash before acceptance leaves an orphan, never an authority. Local
+  filesystem and synchronous saves; the extra pins `torch-checkpointing`
+  0.1.1, and the module imports nothing of torch (#29).
+
 ## 0.2.1 - 2026-10-27
 
 ### Fixed
