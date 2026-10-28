@@ -47,9 +47,9 @@ built on (CPU wheels from the PyTorch index in development); importing the
 module without them raises one `ImportError` naming the extra. CI's matrix runs
 without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
 job installs it for ty, and a separate `torch` job runs `tests/test_torch.py`
-on SQLite, Postgres and S3 (moto), one rank and two, and runs the scripts in
-`examples/torch/` as subprocesses. `docs/torch.md` is the user guide; a change to
-the adapter's API updates both.
+on SQLite, Postgres, and MinIO, fake-gcs-server and Azurite, one rank and two,
+and runs the scripts in `examples/torch/` as subprocesses. `docs/torch.md` is the
+user guide; a change to the adapter's API updates both.
 
 ## Build & Development
 
@@ -107,10 +107,11 @@ module gains an entry point.
 
 ## Testing
 
-- SQLite tests need nothing; `test_artifact_store_postgres.py` and
-  `test_blob_store_emulators.py` start containers through Docker
-  (`postgres:18-alpine`; MinIO, fake-gcs-server and Azurite by digest) and
-  skip without a daemon unless `VESTIGO_REQUIRE_DOCKER=1`, which CI sets.
+- SQLite tests need nothing; the Postgres and object-store tests start
+  containers through Docker (`postgres:18-alpine`; MinIO, fake-gcs-server and
+  Azurite by digest), one of each per session from `conftest.py`, and skip
+  without a daemon unless `VESTIGO_REQUIRE_DOCKER=1`, which CI sets. A module
+  makes its own buckets in the emulators it uses.
 - The S3 unit tests run over moto; GCS and Azure over fake clients. The
   autouse `_no_ambient_cloud_credentials` fixture scrubs the developer's own
   credentials; never read real ones in a test.

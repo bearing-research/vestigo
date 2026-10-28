@@ -2,8 +2,8 @@
 
 Needs the ``torch`` extra; CI runs this module in its own job and the matrix ignores
 it. Every checkpoint is written through the ledger's own storage: on local blobs and
-SQLite, on Postgres, on S3 (moto), synchronously and asynchronously, on one rank and on
-two (gloo, one process each).
+SQLite, on Postgres, on S3, GCS and Azure (their emulators), synchronously and
+asynchronously, on one rank and on two (gloo, one process each).
 """
 
 from __future__ import annotations
@@ -17,16 +17,15 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
-import boto3
 import pytest
 import torch
 import torch.distributed as dist
-from moto import mock_aws
 from torch import nn
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 
@@ -805,36 +804,58 @@ def test_asynchronous_saves_release_in_order_and_resume(tmp_path: Path):
 # --- Object store ---
 
 
-def test_checkpoints_on_s3_load_back(tmp_path: Path):
-    settings = BlobSettings(s3_region="us-east-1", s3_access_key="testing", s3_secret_key="testing")
-    with mock_aws():
-        client = boto3.client(
-            "s3",
-            region_name="us-east-1",
-            aws_access_key_id="testing",
-            aws_secret_access_key="testing",
+@pytest.fixture(params=["s3", "gcs", "azure"])
+def remote(request) -> RemoteBlobs:
+    """A fresh bucket on each backend's emulator, as the adapter reaches it."""
+    bucket = f"ckpt-{uuid.uuid4().hex[:8]}"
+    if request.param == "s3":
+        endpoint = request.getfixturevalue("minio_endpoint")
+        settings = BlobSettings(
+            s3_region="us-east-1",
+            s3_endpoint_url=endpoint,
+            s3_access_key="minioadmin",
+            s3_secret_key="minioadmin",
         )
-        client.create_bucket(Bucket="ckpt")
-        blobs = RemoteBlobs("s3", "ckpt", "ledger", settings)
-        with Ledger(tmp_path / "ledger", blobs=blobs) as ledger:
-            expected = _uninterrupted(ledger)
-            trainer = Trainer(ledger)
-            first = ledger.start(trainer.program)
-            trainer.train(first, 3)
-            first.close()
-            with ledger.resume(first.execution_id) as resumed:
-                trainer = Trainer(ledger)
-                trainer.restore(resumed)
-                trainer.train(resumed, STEPS)
-                resumed.finish()
+    elif request.param == "gcs":
+        endpoint = request.getfixturevalue("fake_gcs_endpoint")
+        settings = BlobSettings(gcs_anonymous=True, gcs_endpoint_override=endpoint)
+    else:
+        container = request.getfixturevalue("azurite_container")
+        settings = BlobSettings(
+            azure_account_name=container.account_name,
+            azure_connection_string=container.get_connection_string(),
+        )
+    blobs = RemoteBlobs(request.param, bucket, "ledger", settings)
+    store = blobs.open()
+    if request.param == "s3":
+        store._client.create_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    elif request.param == "gcs":
+        store._client.create_bucket(bucket)  # type: ignore[attr-defined]
+    else:
+        store._client.create_container()  # type: ignore[attr-defined]
+    return blobs
 
-            assert _same(trainer.weights(), expected)
-            [model] = [
-                v for v in _outputs(ledger, first, 3) if v.params.get("file") == "model_0.pt"
-            ]
-            keys = {o["Key"] for o in client.list_objects_v2(Bucket="ckpt")["Contents"]}
-            assert f"ledger/{model.id}@v={model.version}.arrow" in keys
-            assert not (tmp_path / "ledger" / "blobs").exists()
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_checkpoints_on_an_object_store_load_back(tmp_path: Path, remote: RemoteBlobs):
+    with Ledger(tmp_path / "ledger", blobs=remote) as ledger:
+        expected = _uninterrupted(ledger)
+        trainer = Trainer(ledger)
+        first = ledger.start(trainer.program)
+        trainer.train(first, 3)
+        first.close()
+        with ledger.resume(first.execution_id) as resumed:
+            trainer = Trainer(ledger)
+            trainer.restore(resumed)
+            trainer.train(resumed, STEPS)
+            resumed.finish()
+
+        assert _same(trainer.weights(), expected)
+        # The bytes are in the bucket, through a client of its own, and nowhere local.
+        [model] = [v for v in _outputs(ledger, first, 3) if v.params.get("file") == "model_0.pt"]
+        assert remote.open().blob_exists(model.id, model.version)
+        assert not (tmp_path / "ledger" / "blobs").exists()
 
 
 # --- Two ranks ---

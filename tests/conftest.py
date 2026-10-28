@@ -3,19 +3,24 @@
 Nothing here imports Strata: the suite must run from a checkout of this package alone.
 Helpers that one module uses live in that module; this file holds what every module
 shares: the singleton resets, the credential scrub, the validator the suite registers,
-and the Docker-backed Postgres that any store test can run on.
+and the Docker-backed Postgres and object-store emulators that any test can run on.
 """
 
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 
 import docker
 import pyarrow as pa
 import pytest
+from testcontainers.community.azurite import AzuriteContainer
 from testcontainers.community.postgres import PostgresContainer
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.docker_client import DockerClient
+from testcontainers.core.wait_strategies import HttpWaitStrategy, LogMessageWaitStrategy
 
 from vestigo.build_store import reset_build_store
 from vestigo.sql_backend import PostgresDialect
@@ -147,3 +152,66 @@ def backend_store(request, tmp_path) -> Iterator[ArtifactStore]:
     store = ArtifactStore(tmp_path / "artifacts")
     yield store
     store.close()
+
+
+# --- Object-store emulators: one of each per session; a module makes its own buckets ---
+
+MINIO_IMAGE = (
+    "cgr.dev/chainguard/minio"
+    "@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1"
+)
+FAKE_GCS_IMAGE = (
+    "fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
+)
+AZURITE_IMAGE = (
+    "mcr.microsoft.com/azure-storage/azurite"
+    "@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
+)
+
+
+@pytest.fixture(scope="session")
+def minio_endpoint(docker_daemon) -> Iterator[str]:
+    """MinIO's URL; its root user and password are both ``minioadmin``."""
+    # Not testcontainers' MinioContainer: that imports the minio client package.
+    container = (
+        DockerContainer(MINIO_IMAGE)
+        .with_env("MINIO_ROOT_USER", "minioadmin")
+        .with_env("MINIO_ROOT_PASSWORD", "minioadmin")
+        .with_command("server /data --address :9000")
+        .with_exposed_ports(9000)
+        .waiting_for(HttpWaitStrategy(9000, "/minio/health/live"))
+    )
+    with container:
+        yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(9000)}"
+
+
+@pytest.fixture(scope="session")
+def fake_gcs_endpoint(docker_daemon) -> Iterator[str]:
+    """fake-gcs-server's URL; it checks no credential."""
+    # A resumable upload's session URL is built from the external URL, so the port is
+    # chosen here and bound explicitly rather than mapped at random.
+    host = DockerClient().host()
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    container = (
+        DockerContainer(FAKE_GCS_IMAGE)
+        .with_bind_ports(4443, port)
+        .with_command(
+            f"-scheme http -port 4443 -external-url http://{host}:{port} -public-host {host}:{port}"
+        )
+        .waiting_for(LogMessageWaitStrategy("server started"))
+    )
+    with container:
+        yield f"http://{host}:{port}"
+
+
+@pytest.fixture(scope="session")
+def azurite_container(docker_daemon) -> Iterator[AzuriteContainer]:
+    """Azurite, for its connection string, account name and key."""
+    # The SDK speaks a newer API version than the emulator admits to; the check is skipped.
+    container = AzuriteContainer(AZURITE_IMAGE).with_command(
+        "azurite --skipApiVersionCheck --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0"
+    )
+    with container:
+        yield container
