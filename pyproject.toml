@@ -34,11 +34,26 @@ azure = [
     "azure-storage-blob>=12.20.0",
     "azure-identity>=1.25.3",
 ]
+# vestigo.torch imports neither; it is written and tested against these. The
+# library is pre-1.0 and its callback shape has changed before, hence the pin.
+torch = [
+    "torch>=2.11",
+    "torch-checkpointing==0.1.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/bearing-research/vestigo"
 Repository = "https://github.com/bearing-research/vestigo"
 Changelog = "https://github.com/bearing-research/vestigo/blob/main/CHANGELOG.md"
+
+# CPU wheels: the CUDA build is gigabytes the suite never uses.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]

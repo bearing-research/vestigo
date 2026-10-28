@@ -22,8 +22,9 @@ jobs:
         with:
           python-version: "3.12"
           version: "latest"
-      # ty resolves the extras' SDKs through the project venv, so the full sync.
-      - run: uv sync --all-extras --locked
+      # ty resolves the extras' SDKs through the project venv; vestigo.torch imports
+      # nothing of torch, so that extra stays out.
+      - run: uv sync --all-extras --no-extra torch --locked
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/pre-commit
@@ -45,7 +46,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           version: "latest"
-      - run: uv sync --all-extras --locked
+      - run: uv sync --all-extras --no-extra torch --locked
 
       # The ledger stands on its own: nothing of its first consumer may be
       # installed, or a test could pass by reaching into it.
@@ -59,6 +60,21 @@ jobs:
 
       # The Postgres suite starts a container through Docker on the runner;
       # without a daemon it fails here rather than skipping to green.
-      - run: uv run pytest -v -p no:cacheprovider
+      # The torch adapter's tests have their own job.
+      - run: uv run pytest -v -p no:cacheprovider --ignore=tests/test_torch.py
         env:
           VESTIGO_REQUIRE_DOCKER: "1"
+
+  torch:
+    name: Tests (torch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: "3.12"
+          version: "latest"
+      # CPU torch, from the index pyproject.toml names for it.
+      - run: uv sync --extra torch --locked
+      - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py

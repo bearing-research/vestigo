@@ -85,12 +85,24 @@ The package exports nothing at its top level; a consumer imports each module.
   copy order, and `TRANSIENT_TABLES`.
 - `vestigo.file_modes`: `private_dir`, `private_file`, `narrow`, the modes the
   stores create their directories and files with.
+- `vestigo.torch` (the `torch` extra): PyTorch checkpoints as releases.
+  `Ledger(artifact_dir)` with `define_model` and `define_program` (a model's
+  class and `state_dict` schema under a declared version; a program's loss and
+  optimizer over it, as structural nodes), `start`, `resume`, `branch` and
+  `find` for executions, and the `Run` they return: `checkpoint_id(step)` and
+  `finalize_callback` for `torch_checkpointing`'s `CheckpointManager`, so each
+  saved checkpoint is one release of its files under a manifest, accepted
+  only while the run holds its lease; `restore` (the release a resume or
+  branch starts from, written back into a directory and checked against its
+  digests), `release_of`, `set_head`, `finish`. Local filesystem and
+  synchronous saves; the module imports nothing of torch.
 
 ## Install
 
 ```bash
 uv add vestigo            # or: pip install vestigo; no dependencies beyond the stdlib
 uv add "vestigo[postgres]"  # PostgreSQL metadata; [s3], [gcs], [azure] bring each blob backend's SDK
+uv add "vestigo[torch]"     # the PyTorch adapter's torch and torch-checkpointing
 ```
 
 ## Development
