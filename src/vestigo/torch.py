@@ -562,6 +562,16 @@ class Ledger:
                     return f"{ROOT}/{release.build_id}/{release.attempt}/step-{step}"
         raise ValueError(f"release {release_id} is not an accepted checkpoint")
 
+    def configure(self, config: Any) -> Any:
+        """Point a ``CheckpointManager.Config`` at the ledger for loads only; returns it.
+
+        For a job that loads checkpoints and saves none, such as an evaluation or an
+        export: no run, no lease, and a save through it raises. Load by
+        :meth:`checkpoint_id`; with a verify key, every load checks the signature.
+        """
+        config.storage_config = LedgerStorageConfig(self.config)
+        return config
+
     def _files(self, at: _Location) -> dict[str, ArtifactVersion] | None:
         """The files of the accepted checkpoint *at* names, by path in it; None if none."""
         bundle = self._checkpoint(at)
@@ -981,7 +991,7 @@ class Checkpoints:
         Sets its storage, both write callbacks and ``write_to_temp_dir=False`` (the
         barrier stays: rank 0 accepts only after every rank has written).
         """
-        config.storage_config = LedgerStorageConfig(self)
+        config.storage_config = LedgerStorageConfig(self.ledger, self)
         config.pre_finalize_callback = report
         config.finalize_callback = self
         config.save.writer_config.write_to_temp_dir = False
@@ -1011,10 +1021,12 @@ def report(args: Any) -> None:
 
 @dataclass
 class LedgerStorageConfig(StorageConfig):
-    checkpoints: Checkpoints
+    ledger: LedgerConfig
+    # None for a storage that only loads (Ledger.configure).
+    checkpoints: Checkpoints | None = None
 
     def create_storage(self) -> LedgerStorage:
-        return LedgerStorage(self.checkpoints)
+        return LedgerStorage(self.ledger, self.checkpoints)
 
 
 class _Upload(io.RawIOBase):
@@ -1026,7 +1038,7 @@ class _Upload(io.RawIOBase):
         self._hasher = hashlib.sha256()
         self._size = 0
         self._writer = None  # set once open; the finalizer of a failed open needs it
-        self._opened = storage.checkpoints.ledger.open()
+        self._opened = storage.ledger.open()
         ledger = self._opened.__enter__()
         try:
             writer = ledger.store.open_blob_writer(artifact_id, version)
@@ -1088,10 +1100,12 @@ class LedgerStorage(Storage):
     A write goes only under this attempt's own checkpoint ids, each file a new version
     of its own id. A read serves only accepted checkpoints, of any execution in the
     ledger, whole and checked against the digest the release recorded (so a file is held
-    in memory once while it loads). Nothing is renamed, deleted or overwritten.
+    in memory once while it loads). Nothing is renamed, deleted or overwritten. A storage
+    without *checkpoints* (:meth:`Ledger.configure`) only loads.
     """
 
-    def __init__(self, checkpoints: Checkpoints) -> None:
+    def __init__(self, ledger: LedgerConfig, checkpoints: Checkpoints | None = None) -> None:
+        self.ledger = ledger
         self.checkpoints = checkpoints
         self._lock = threading.Lock()
         self._written: dict[_Location, list[dict[str, Any]]] = {}
@@ -1103,13 +1117,19 @@ class LedgerStorage(Storage):
 
     # --- Writing ---
 
+    def _writer(self) -> Checkpoints:
+        if self.checkpoints is None:
+            raise PermissionError("this storage only loads; save through a run's configure")
+        return self.checkpoints
+
     def stream_write(self, path: Path) -> io.IOBase:
-        at = self.checkpoints._own(path)
+        writer = self._writer()
+        at = writer._own(path)
         if at.file is None:
             raise IsADirectoryError(f"{path} is a checkpoint, not a file in one")
         label = f"file={quote(at.file, safe='')}"
-        with self.checkpoints.ledger.open() as ledger:
-            artifact_id, version = ledger._stage(self.checkpoints, at, label, {"file": at.file})
+        with self.ledger.open() as ledger:
+            artifact_id, version = ledger._stage(writer, at, label, {"file": at.file})
         return _Upload(self, at, artifact_id, version)
 
     def write(self, path: Path, data: Any) -> None:
@@ -1123,11 +1143,12 @@ class LedgerStorage(Storage):
 
     def report(self, path: Path) -> None:
         """Record, as this rank's report for the step, every file it wrote of it."""
-        at = self.checkpoints._own(path)
+        writer = self._writer()
+        at = writer._own(path)
         with self._lock:
             files = self._written.pop(at, [])
-        with self.checkpoints.ledger.open() as ledger:
-            ledger._report(self.checkpoints, at, files)
+        with self.ledger.open() as ledger:
+            ledger._report(writer, at, files)
 
     def mkdir(self, path: Path, recursive: bool = True) -> None:
         # Ids, not directories: nothing to make.
@@ -1155,7 +1176,7 @@ class LedgerStorage(Storage):
             at = _Location.of(path)
         except FileNotFoundError:
             return _Location("", "", 0, None), {}
-        with self.checkpoints.ledger.open() as ledger:
+        with self.ledger.open() as ledger:
             files = ledger._files(at)
         return at, files or {}
 
@@ -1188,7 +1209,7 @@ class LedgerStorage(Storage):
     def stream_read(self, path: Path, read_args: ReadArgs | None = None) -> io.RawIOBase:
         version = self._version(path)
         expected = version.content_sha256
-        with self.checkpoints.ledger.open() as ledger:
+        with self.ledger.open() as ledger:
             if ledger.config.verify_key is not None:
                 # The signed manifest's digest, not the row's: the database is not trusted.
                 expected = ledger._signed_digest(_Location.of(path), version)

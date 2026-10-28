@@ -65,6 +65,11 @@ All notable changes to vestigo are recorded here. The format follows
   checkpoints are refused. torch-checkpointing unpickles what it loads, so a
   writer of both the blob store and the metadata database can no longer
   change what a load deserializes (#38).
+- `Ledger.configure(config)`: a `CheckpointManager.Config` over a storage
+  that only loads, for a job that holds no run, such as an evaluation or a
+  promotion gate. It opens no execution and takes no lease; a save through
+  it raises `PermissionError`; with a verify key every load checks the
+  signature (#39).
 
 ### Documentation
 
@@ -80,6 +85,14 @@ All notable changes to vestigo are recorded here. The format follows
   run that stops, resumes in the same execution and records its exported
   forward pass; a branch that fine-tunes from the best epoch; two ranks under
   `torchrun`. The torch job runs the examples (#33).
+- Signed checkpoints in `docs/torch.md`: what each check stops (bucket
+  writer, bucket and database writer, database-only rollback, key holder),
+  a promotion gate end to end, key handling, jobs that only load, every
+  refusal message, rotation, and what is not signed. `examples/torch/` gains
+  `keys.py` (a key pair, the private half 0600), `train.py --signing-key`,
+  `evaluate.py` (a gate that verifies, scores held-out data and ships
+  safetensors) and `tamper.py` (a drill that changes a weight and its
+  database row, which an unkeyed gate ships and a keyed one refuses) (#39).
 
 ### Verified
 

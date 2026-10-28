@@ -495,6 +495,45 @@ def test_keys_are_checked_and_the_private_one_is_never_shown(tmp_path: Path):
         assert signing.hex() not in repr(ledger.config) and repr(signing) not in repr(ledger.config)
 
 
+def _load_only(ledger: Ledger, release_id: str) -> list[torch.Tensor]:
+    model = _model()
+    manager = ledger.configure(CheckpointManager.Config.with_sync_save()).build()
+    try:
+        state = manager.load(ledger.checkpoint_id(release_id), into={"model": model.state_dict()})
+    finally:
+        manager.close()
+    model.load_state_dict(state["model"])
+    return [p.detach().clone() for p in model.parameters()]
+
+
+def test_a_load_only_ledger_reads_a_checkpoint_and_writes_nothing(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 2)
+            run.finish()
+        source = run.release_of(2).release_id
+
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        before = reader.store.list_versions_by_id_prefix("torch_")
+        assert _same(_load_only(reader, source), trainer.weights())
+        assert reader.store.list_versions_by_id_prefix("torch_") == before
+        manager = reader.configure(CheckpointManager.Config.with_sync_save()).build()
+        try:
+            with pytest.raises(PermissionError, match="only loads"):
+                manager.save(run.checkpoint_id(3), {"model": trainer.model.state_dict()})
+        finally:
+            manager.close()
+
+        _tamper(reader, run, 2)
+        with pytest.raises(OSError, match="differs from the checkpoint"):
+            _load_only(reader, source)
+    with Ledger(tmp_path / "ledger", verify_key=_keypair()[1]) as rotated:
+        with pytest.raises(OSError, match="does not verify"):
+            _load_only(rotated, source)
+
+
 # --- Authority ---
 
 
@@ -1262,6 +1301,34 @@ def _said(result: subprocess.CompletedProcess[str], pattern: str) -> str:
     match = re.search(pattern, result.stdout)
     assert match is not None, result.stdout + result.stderr
     return match.group(1)
+
+
+def test_the_gate_ships_what_the_trainer_signed_and_refuses_a_forgery(tmp_path: Path):
+    root, keys = str(tmp_path / "ledger"), tmp_path / "keys"
+    made = _example("keys.py", str(keys))
+    assert made.returncode == 0, made.stderr
+    assert (keys / "signing.key").stat().st_mode & 0o777 == 0o600
+    again = _example("keys.py", str(keys))
+    assert again.returncode == 1 and "exists" in again.stderr
+    trained = _example("train.py", root, f"--signing-key={keys / 'signing.key'}")
+    assert trained.returncode == 0, trained.stderr
+    verify = f"--verify-key={keys / 'verify.key'}"
+
+    shipped = _example("evaluate.py", root, verify, f"--out={tmp_path / 'model.safetensors'}")
+    assert shipped.returncode == 0, shipped.stderr
+    assert "signature verified" in shipped.stdout
+    assert (tmp_path / "model.safetensors").exists()
+
+    tampered = _example("tamper.py", root)
+    assert tampered.returncode == 0, tampered.stderr
+    # Bytes and row agree, so the digest alone is fooled.
+    fooled = _example("evaluate.py", root, f"--out={tmp_path / 'forged.safetensors'}")
+    assert fooled.returncode == 0, fooled.stderr
+    assert (tmp_path / "forged.safetensors").exists()
+    refused = _example("evaluate.py", root, verify, f"--out={tmp_path / 'refused.safetensors'}")
+    assert refused.returncode == 1
+    assert "differs from the checkpoint the ledger accepted" in refused.stderr
+    assert not (tmp_path / "refused.safetensors").exists()
 
 
 def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: Path):

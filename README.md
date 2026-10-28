@@ -112,12 +112,16 @@ The package exports nothing at its top level; a consumer imports each module.
   its own, which keeps only its own outputs; `Ledger.derived` finds it again.
   `Ledger(signing_key=)` (the `sign` extra) signs each checkpoint's manifest
   with Ed25519 as rank 0 accepts it, and `verify_key=` makes every load check
-  the signature, the file's entry and its bytes before deserializing. `Run.observe(exported_program,
+  the signature, the file's entry and its bytes before deserializing.
+  `Ledger.configure` points a `CheckpointManager.Config` at a storage that
+  only loads, for a job with no run (an evaluation, a promotion gate).
+  `Run.observe(exported_program,
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
   node changes), `Ledger.observations` lists them.
   [`docs/torch.md`](docs/torch.md) is the guide; [`examples/torch/`](examples/torch/)
-  trains, resumes after a crash, branches, and runs on two ranks under `torchrun`.
+  trains, resumes after a crash, branches, runs on two ranks under `torchrun`,
+  and gates a signed checkpoint before it ships (with a tamper drill).
 
 ## Install
 
