@@ -32,7 +32,7 @@ All notable changes to vestigo are recorded here. The format follows
   range constraints, and a declared scope and coverage. No node changes, so
   no definition moves; the commit is fenced on the attempt's lease, and the
   same program recorded twice is one version. `Ledger.observations` lists
-  them (#PR).
+  them (#31).
 
 ## 0.2.1 - 2026-10-27
 
