@@ -34,8 +34,8 @@ azure = [
     "azure-storage-blob>=12.20.0",
     "azure-identity>=1.25.3",
 ]
-# vestigo.torch imports neither; it is written and tested against these. The
-# library is pre-1.0 and its callback shape has changed before, hence the pin.
+# vestigo.torch implements torch_checkpointing's Storage; the library is pre-1.0
+# and its callback shape has changed before, hence the pin.
 torch = [
     "torch>=2.11",
     "torch-checkpointing==0.1.1",

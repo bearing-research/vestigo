@@ -86,16 +86,20 @@ The package exports nothing at its top level; a consumer imports each module.
 - `vestigo.file_modes`: `private_dir`, `private_file`, `narrow`, the modes the
   stores create their directories and files with.
 - `vestigo.torch` (the `torch` extra): PyTorch checkpoints as releases.
-  `Ledger(artifact_dir)` with `define_model` and `define_program` (a model's
-  class and `state_dict` schema under a declared version; a program's loss and
-  optimizer over it, as structural nodes), `start`, `resume`, `branch` and
-  `find` for executions, and the `Run` they return: `checkpoint_id(step)` and
-  `finalize_callback` for `torch_checkpointing`'s `CheckpointManager`, so each
-  saved checkpoint is one release of its files under a manifest, accepted
-  only while the run holds its lease; `restore` (the release a resume or
-  branch starts from, written back into a directory and checked against its
-  digests), `release_of`, `set_head`, `finish`. Local filesystem and
-  synchronous saves; the module imports nothing of torch.
+  `Ledger(artifact_dir, dsn=None, blobs=None)` (Postgres metadata and an
+  object store through `RemoteBlobs`, for ranks on several machines) with
+  `define_model` and `define_program` (a model's class and `state_dict`
+  schema under a declared version; a program's loss and optimizer over it,
+  as structural nodes), `start`, `resume`, `branch` and `find` for
+  executions, and the `Run` they return. `Run.configure` (or
+  `Checkpoints.configure` on another rank, `Run.checkpoints` broadcast to
+  it) points a `torch_checkpointing` `CheckpointManager.Config` at
+  `LedgerStorage`, so every file a rank writes is a version of the ledger
+  and each saved step one release, accepted by rank 0 after the barrier
+  only while the run holds its lease; synchronous or asynchronous saves.
+  `restore` names the checkpoint a resume or branch loads, read back
+  through the same storage and checked against its digests;
+  `release_of`, `set_head`, `finish`.
 
 ## Install
 

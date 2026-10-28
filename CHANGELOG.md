@@ -8,20 +8,24 @@ All notable changes to vestigo are recorded here. The format follows
 ### Added
 
 - `vestigo.torch`, behind a new `torch` extra: PyTorch checkpoints as ledger
-  releases (Investigation 09, stages T0, T1 and the local half of T2). A
-  model (class and `state_dict` schema under a declared version) and a
-  training program (its loss and optimizer, an `impl` edge to the model) are
-  structural nodes; an execution is a build keyed by the program, its inputs
-  and the release it starts from. `Run.finalize_callback` makes each
-  checkpoint `torch_checkpointing` writes one release of its files under a
-  manifest that requires them, accepted only while the run's attempt holds
-  the lease; `resume` continues an execution in a new attempt and fences the
-  old one, `branch` opens a new execution from any accepted release, and
-  `Run.restore` writes the release back, checked against its digests. A
-  resumed run and a branch end on the weights of an uninterrupted one; a
-  crash before acceptance leaves an orphan, never an authority. Local
-  filesystem and synchronous saves; the extra pins `torch-checkpointing`
-  0.1.1, and the module imports nothing of torch (#29).
+  releases (Investigation 09, stages T0 to T2 and T5). A model (class and
+  `state_dict` schema under a declared version) and a training program (its
+  loss and optimizer, an `impl` edge to the model) are structural nodes; an
+  execution is a build keyed by the program, its inputs and the release it
+  starts from. `LedgerStorage` is `torch_checkpointing`'s storage over the
+  ledger: every file a rank writes is a `building` version created before
+  its bytes, on local disk, S3, GCS or Azure, so a crash leaves rows garbage
+  collection reaps; each rank reports what it wrote before the barrier, and
+  rank 0 makes the step one release under a manifest that requires the
+  files, accepted only while the run's attempt holds the lease. Saves are
+  synchronous or asynchronous; metadata on SQLite or Postgres. `resume`
+  continues an execution in a new attempt and fences the old one, `branch`
+  opens a new execution from any accepted release, and loads read accepted
+  releases only, each file checked against its digest. A resumed run and a
+  branch end on the weights of an uninterrupted one; a crash before
+  acceptance leaves an orphan, never an authority; a rank that dies before
+  writing leaves no release. The extra pins `torch-checkpointing` 0.1.1
+  (#29, #30).
 
 ## 0.2.1 - 2026-10-27
 
