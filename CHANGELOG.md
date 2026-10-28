@@ -30,9 +30,12 @@ All notable changes to vestigo are recorded here. The format follows
   implementation (Investigation 09, T6): the PT2 archive as a version of the
   execution, with its archive, schema and opset versions, torch version and
   range constraints, and a declared scope and coverage. No node changes, so
-  no definition moves; the commit is fenced on the attempt's lease, and the
-  same program recorded twice is one version. `Ledger.observations` lists
-  them (#31).
+  no definition moves. A stale or finished attempt records nothing, an
+  archive that fails to store is failed for cleanup, and the archive goes
+  through a temporary file rather than memory. The same program exported
+  again under one scope and coverage is one version (graph, weights and
+  constants compared, not the example inputs). `Ledger.observations` lists
+  an execution's own records (#31, #PR).
 
 ## 0.2.1 - 2026-10-27
 
