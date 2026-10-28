@@ -118,7 +118,9 @@ refused, and so are its `set_head`, `observe` and `finish` calls.
 
 `finish()` completes the execution, and nothing resumes it after that. `find` returns
 only unfinished executions, so the same computation started again after a finish is a
-new execution.
+new execution. The checkpoint the run ended on (its attempt's last, or the one it
+restored if it saved none) stays under the reference `vestigo-torch/<execution>`, and
+`ledger.final_checkpoint(execution)` returns that release.
 
 ## Branch
 
@@ -137,8 +139,37 @@ it came from, or against another branch of the same release.
 
 `run.set_head(name, release_id)` points a reference at an accepted release, and
 `ledger.releases.reference(name)` returns `(release_id, revision)`. Names are global to
-the ledger, so give each one a prefix (`regression/best`). A head keeps its release from
-garbage collection.
+the ledger, so give each one a prefix (`regression/best`). A head keeps its release
+through every collection.
+
+## Keep the latest checkpoints
+
+Every save stores a full copy of what you pass it, and nothing is deleted until you
+collect:
+
+```python
+ledger.collect(keep=2)
+```
+
+`collect` runs over the whole ledger. It keeps:
+
+- of each unfinished execution, its newest `keep` checkpoints and the one its attempt
+  resumed from;
+- of each finished execution, the checkpoint it ended on;
+- the release each unfinished branch starts from;
+- every release a head points at.
+
+Every other checkpoint's files, rank reports and manifest are deleted. So are the files
+a fenced or ended attempt staged but never released (a step that crashed mid-save). An
+attempt that still holds its execution keeps everything it is writing, so you can
+collect while runs train. `examples/torch/train.py --keep 1` collects after every epoch.
+
+`collect` returns the store's counts (`deleted_count`, `deleted_bytes`) plus `orphaned`,
+the staged files of ended attempts it failed. `dry_run=True` deletes nothing and lists
+what it would take under `collected`. Loading a checkpoint, or branching from it,
+counts as a use, and `min_idle_seconds=` spares whatever was used that recently. Pass
+it when branches may open while `collect` runs, since a branch opened after `collect`
+has read the executions is not yet among the ones it keeps.
 
 ## Asynchronous saves
 
@@ -223,8 +254,7 @@ timestamps. Like a save, `observe` needs the lease.
 - A file whose bytes no longer match the digest the ledger accepted fails the load
   with `OSError`.
 - An attempt cannot write under another attempt's checkpoint id.
-- `delete`, `rmdir` and `rename` raise. Old checkpoints go through retention and
-  garbage collection.
+- `delete`, `rmdir` and `rename` raise. Old checkpoints go through `collect`.
 
 ## Limits
 

@@ -1,10 +1,11 @@
 """Train a small regression, every epoch a checkpoint in a vestigo ledger.
 
     uv run python examples/torch/train.py ledger --epochs 6 --crash-at 3
-    uv run python examples/torch/train.py ledger --epochs 6
+    uv run python examples/torch/train.py ledger --epochs 6 --keep 1
 
 The first command stops after epoch 3; the second finds that run again by its
-computation (the program and its inputs), resumes it from epoch 3 and finishes it.
+computation (the program and its inputs), resumes it from epoch 3 and finishes it,
+deleting after each epoch every checkpoint but the newest one and the best.
 The lowest-loss epoch is the reference ``regression/best``, which ``branch.py``
 fine-tunes from. Before finishing, the run records the model's exported forward pass.
 """
@@ -36,6 +37,7 @@ def main() -> None:
     parser.add_argument("ledger", type=Path)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--crash-at", type=int, help="stop after saving this epoch")
+    parser.add_argument("--keep", type=int, help="checkpoints to keep beyond the heads")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -95,6 +97,8 @@ def main() -> None:
                     if loss == best:
                         run.set_head(HEAD, release.release_id)
                     print(f"epoch {epoch}: loss {loss:.4f}, release {release.release_id}")
+                    if args.keep:
+                        ledger.collect(keep=args.keep)
                     if epoch == args.crash_at:
                         # Leaving the block closes the run: it keeps its checkpoints
                         # and drops its lease, so the next command resumes at once.
@@ -108,7 +112,11 @@ def main() -> None:
                 exported, scope="model_forward", coverage="complete_under_declared_constraints"
             )
             run.finish()
-            print(f"finished {run.execution_id}")
+            if args.keep:
+                ledger.collect(keep=args.keep)  # the checkpoint it resumed from goes too
+            final = ledger.final_checkpoint(run.execution_id)
+            assert final is not None
+            print(f"finished {run.execution_id} on release {final.release_id}")
 
 
 if __name__ == "__main__":
