@@ -42,6 +42,7 @@ from vestigo.torch import (
     Run,
     _archive_metadata,
     _canonical,
+    report,
 )
 
 STEPS = 6
@@ -532,6 +533,151 @@ def test_a_load_only_ledger_reads_a_checkpoint_and_writes_nothing(tmp_path: Path
     with Ledger(tmp_path / "ledger", verify_key=_keypair()[1]) as rotated:
         with pytest.raises(OSError, match="does not verify"):
             _load_only(rotated, source)
+
+
+def _execute(ledger: Ledger, sql: str, args: tuple) -> None:
+    conn = ledger.store._get_connection()
+    try:
+        conn.execute(sql, args)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _report_of(ledger: Ledger, run: Run, step: int) -> tuple[str, int]:
+    report_id = f"torch_{run.execution_id}@attempt={run.attempt}@step={step}@rank=0"
+    [version] = [v for v in ledger.store.list_versions_by_id_prefix(report_id) if v.id == report_id]
+    return report_id, version.version
+
+
+def _save_meddled(ledger: Ledger, run: Run, step: int, meddle) -> None:
+    """Save *step*, letting *meddle* at the store between the rank's report and rank 0."""
+
+    def reported(args: SimpleNamespace) -> None:
+        report(args)
+        meddle()
+
+    config = run.configure(CheckpointManager.Config.with_sync_save())
+    config.pre_finalize_callback = reported
+    manager = config.build()
+    try:
+        manager.save(run.checkpoint_id(step), {"model": _model().state_dict()})
+    finally:
+        manager.close()
+
+
+def _forge_report(ledger: Ledger, run: Run, step: int, rewrite_report: bool) -> None:
+    """A bucket writer's forgery: the model file's bytes and, if asked, the report's digest.
+
+    The forged file keeps its size, which acceptance checks.
+    """
+    report_id, version = _report_of(ledger, run, step)
+    content = json.loads(ledger.store.read_blob(report_id, version))
+    [entry] = [e for e in content["files"] if e["file"] == "model_0.pt"]
+    data = bytearray(ledger.store.read_blob(entry["artifact_id"], entry["version"]))
+    data[len(data) // 2] ^= 0xFF
+    data = bytes(data)
+    ledger.store.write_blob(entry["artifact_id"], entry["version"], data)
+    entry["sha256"], entry["byte_size"] = hashlib.sha256(data).hexdigest(), len(data)
+    if rewrite_report:
+        ledger.store.write_blob(report_id, version, _canonical(content))
+
+
+def test_a_bucket_writer_during_a_save_cannot_have_a_forgery_signed(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            with pytest.raises(OSError, match="rank 0's report of step 1 .* does not verify"):
+                _save_meddled(ledger, run, 1, lambda: _forge_report(ledger, run, 1, True))
+            assert run.release_of(1) is None
+
+            # The report left alone, rank 0 signs what the rank hashed, not the bytes now there.
+            _save_meddled(ledger, run, 2, lambda: _forge_report(ledger, run, 2, False))
+            source = run.release_of(2).release_id
+
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        with pytest.raises(OSError, match="differs from the checkpoint"):
+            _load_only(reader, source)
+
+
+def test_a_report_moved_from_another_step_is_refused(tmp_path: Path):
+    with Ledger(tmp_path / "ledger", signing_key=_keypair()[0]) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            _save_meddled(ledger, run, 1, lambda: None)
+
+            def replay() -> None:
+                one, two = _report_of(ledger, run, 1), _report_of(ledger, run, 2)
+                ledger.store.write_blob(*two, ledger.store.read_blob(*one))
+
+            with pytest.raises(OSError, match="signed for another checkpoint"):
+                _save_meddled(ledger, run, 2, replay)
+            assert run.release_of(2) is None
+
+
+def _signed_run(tmp_path: Path) -> tuple[Ledger, Run, str, bytes]:
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+            run.finish()
+    return ledger, run, run.release_of(1).release_id, verify
+
+
+def test_a_database_writer_cannot_shorten_or_hide_a_signed_file(tmp_path: Path):
+    ledger, run, source, verify = _signed_run(tmp_path)
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        expected = _load_only(reader, source)
+        [model] = [v for v in _outputs(reader, run, 1) if v.params.get("file") == "model_0.pt"]
+        # A shorter size would have the loader read a prefix of the signed bytes.
+        _execute(
+            reader,
+            "UPDATE artifact_versions SET byte_size = ? WHERE id = ? AND version = ?",
+            (model.byte_size - 100, model.id, model.version),
+        )
+        assert _same(_load_only(reader, source), expected)
+        # Renamed in the database, the file is still where the signed manifest says.
+        _execute(
+            reader,
+            "UPDATE artifact_versions SET transform_spec = REPLACE(transform_spec, "
+            "'model_0.pt', 'hidden.pt') WHERE id = ? AND version = ?",
+            (model.id, model.version),
+        )
+        assert _same(_load_only(reader, source), expected)
+
+
+@pytest.mark.parametrize(
+    ("content", "refusal"),
+    [
+        (b"\xff not json", "is malformed"),
+        (b"[1, 2]", "is malformed"),
+        (b'{"signature": 7}', "does not verify"),
+        (b'{"signature": "00", "x": NaN}', "does not verify"),
+    ],
+)
+def test_a_garbled_manifest_is_a_refusal(tmp_path: Path, content: bytes, refusal: str):
+    ledger, run, source, verify = _signed_run(tmp_path)
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        [manifest] = [v for v in _outputs(reader, run, 1) if v.params.get("manifest")]
+        reader.store.write_blob(manifest.id, manifest.version, content)
+        with pytest.raises(OSError, match=refusal):
+            _load_only(reader, source)
+
+
+def test_a_second_manifest_row_is_a_refusal(tmp_path: Path):
+    ledger, run, source, verify = _signed_run(tmp_path)
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        [model] = [v for v in _outputs(reader, run, 1) if v.params.get("file") == "model_0.pt"]
+        _execute(
+            reader,
+            "UPDATE artifact_versions SET transform_spec = REPLACE(transform_spec, "
+            '\'"file":\', \'"manifest":true,"file":\') WHERE id = ? AND version = ?',
+            (model.id, model.version),
+        )
+        with pytest.raises(OSError, match="has 2 manifests"):
+            _load_only(reader, source)
 
 
 # --- Authority ---

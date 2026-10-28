@@ -94,6 +94,22 @@ All notable changes to vestigo are recorded here. The format follows
   safetensors) and `tamper.py` (a drill that changes a weight and its
   database row, which an unkeyed gate ships and a keyed one refuses) (#39).
 
+### Fixed
+
+- A signed checkpoint could be a signed forgery. Rank 0 signed the digests it
+  read back from each rank's report in the store, so whoever could write the
+  bucket while a save was in flight could replace a file and its report's
+  digest, and rank 0 signed the forgery. Each rank now signs its own report
+  with the digests it computed as it wrote, bound to its execution, attempt,
+  step and rank, and rank 0 verifies every report before signing the
+  manifest; one that does not verify fails the save (#40).
+- A verifying load now takes a checkpoint's files, sizes and digests from its
+  signed manifest, not the database: a database writer could shorten a
+  file's recorded size, and the loader read a prefix of the signed bytes, or
+  hide a signed file by renaming its row. A garbled manifest (not JSON, not
+  an object, a signature that is not hex, two manifest rows) is an `OSError`
+  refusal rather than an unhandled error (#40).
+
 ### Verified
 
 - `vestigo.torch` checkpoints on every object store: one test trains,
