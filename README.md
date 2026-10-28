@@ -99,7 +99,10 @@ The package exports nothing at its top level; a consumer imports each module.
   only while the run holds its lease; synchronous or asynchronous saves.
   `restore` names the checkpoint a resume or branch loads, read back
   through the same storage and checked against its digests;
-  `release_of`, `set_head`, `finish`.
+  `release_of`, `set_head`, `finish`. `Run.observe(exported_program,
+  scope=, coverage=)` records an `ExportedProgram` as an observed
+  implementation (the PT2 archive with its versions and constraints; no
+  node changes), `Ledger.observations` lists them.
 
 ## Install
 

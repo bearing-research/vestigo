@@ -8,6 +8,7 @@ two (gloo, one process each).
 
 from __future__ import annotations
 
+import io
 import json
 import multiprocessing
 import os
@@ -26,7 +27,7 @@ from torch_checkpointing.checkpoint_manager import CheckpointManager
 
 from vestigo.blob_store import BlobSettings
 from vestigo.releases import ReleaseRejected, ReleaseStore
-from vestigo.store import ArtifactStore
+from vestigo.store import ArtifactStore, BuildLeaseLost
 from vestigo.torch import Checkpoints, Definition, Ledger, RemoteBlobs, Run
 
 STEPS = 6
@@ -613,3 +614,84 @@ def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
         assert ledger.release_of(outcome["execution"], 2) is None
         [release] = ledger.releases.releases_of(outcome["execution"], "checkpoint")
         assert release.sequence == 1
+
+
+# --- Observed implementations ---
+
+
+def _exported(model: nn.Module) -> torch.export.ExportedProgram:
+    batch = torch.export.Dim("batch")
+    return torch.export.export(model, (torch.randn(2, 4),), dynamic_shapes=({0: batch},))
+
+
+def _node_count(ledger: Ledger) -> int:
+    conn = ledger.store._get_connection()
+    try:
+        return conn.execute("SELECT COUNT(*) AS n FROM nodes").fetchone()["n"]
+    finally:
+        conn.close()
+
+
+def test_an_exported_program_is_recorded_with_its_scope_and_versions(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        nodes = _node_count(ledger)
+
+        recorded = run.observe(
+            _exported(trainer.model),
+            scope="model_forward",
+            coverage="complete_under_declared_constraints",
+        )
+
+        assert _node_count(ledger) == nodes
+        assert ledger.observations(run.execution_id) == [recorded]
+        params = recorded.params
+        assert (params["observed"], params["coverage"], params["attempt"]) == (
+            "model_forward",
+            "complete_under_declared_constraints",
+            run.attempt,
+        )
+        [program] = params["programs"].values()
+        assert program["torch_version"] == torch.__version__
+        assert program["schema_version"]["major"] >= 8
+        assert "aten" in program["opset_version"]
+        assert params["serialization_id"]
+        # The record is the archive itself: it loads and computes what the model does.
+        data = ledger.store.read_blob(recorded.id, recorded.version)
+        loaded = torch.export.load(io.BytesIO(data)).module()
+        x = torch.randn(5, 4)
+        assert torch.equal(loaded(x), trainer.model(x))
+
+
+def test_an_observation_changes_no_definition(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, {"train": "data@v=1"}) as run:
+        run.observe(_exported(trainer.model), scope="model_forward", coverage="partial")
+
+        again = _program(ledger, _model(), torch.optim.AdamW(_model().parameters(), lr=1e-2))
+        assert again.node_id == trainer.program.node_id
+        assert run.computation_key == ledger.computation_key(again, {"train": "data@v=1"})
+
+
+def test_the_same_archive_recorded_twice_is_one_version(ledger: Ledger):
+    trainer = Trainer(ledger)
+    exported = _exported(trainer.model)
+    with ledger.start(trainer.program) as run:
+        first = run.observe(exported, scope="model_forward", coverage="complete")
+        second = run.observe(exported, scope="model_forward", coverage="complete")
+
+        assert (second.id, second.version) == (first.id, first.version)
+        other = run.observe(exported, scope="model_forward", coverage="partial")
+        assert ledger.observations(run.execution_id) == [first, other]
+
+
+def test_a_stale_attempt_cannot_record_an_observation(ledger: Ledger):
+    trainer = Trainer(ledger)
+    first = ledger.start(trainer.program)
+    trainer.train(first, 1)
+    first.close()
+    with ledger.resume(first.execution_id):
+        with pytest.raises(BuildLeaseLost):
+            first.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+        assert ledger.observations(first.execution_id) == []

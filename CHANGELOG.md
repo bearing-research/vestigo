@@ -26,6 +26,13 @@ All notable changes to vestigo are recorded here. The format follows
   acceptance leaves an orphan, never an authority; a rank that dies before
   writing leaves no release. The extra pins `torch-checkpointing` 0.1.1
   (#29, #30).
+- `Run.observe` records an `ExportedProgram` the run captured as an observed
+  implementation (Investigation 09, T6): the PT2 archive as a version of the
+  execution, with its archive, schema and opset versions, torch version and
+  range constraints, and a declared scope and coverage. No node changes, so
+  no definition moves; the commit is fenced on the attempt's lease, and the
+  same program recorded twice is one version. `Ledger.observations` lists
+  them (#31).
 
 ## 0.2.1 - 2026-10-27
 
