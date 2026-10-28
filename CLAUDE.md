@@ -47,7 +47,9 @@ built on (CPU wheels from the PyTorch index in development); importing the
 module without them raises one `ImportError` naming the extra. CI's matrix runs
 without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
 job installs it for ty, and a separate `torch` job runs `tests/test_torch.py`
-on SQLite, Postgres and S3 (moto), one rank and two.
+on SQLite, Postgres and S3 (moto), one rank and two, and runs the scripts in
+`examples/torch/` as subprocesses. `docs/torch.md` is the user guide; a change to
+the adapter's API updates both.
 
 ## Build & Development
 
