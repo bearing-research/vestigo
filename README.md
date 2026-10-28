@@ -90,8 +90,10 @@ The package exports nothing at its top level; a consumer imports each module.
 - `vestigo.file_modes`: `private_dir`, `private_file`, `narrow`, the modes the
   stores create their directories and files with.
 - `vestigo.torch` (the `torch` extra): PyTorch checkpoints as releases.
-  `Ledger(artifact_dir, dsn=None, blobs=None)` (Postgres metadata and an
-  object store through `RemoteBlobs`, for ranks on several machines) with
+  `Ledger(artifact_dir, *, dsn=None, blobs=None, lease_seconds=60.0,
+  writable_seconds=604800.0, signing_key=None, verify_key=None)` (Postgres
+  metadata and an object store through `RemoteBlobs`, for ranks on several
+  machines) with
   `define_model` and `define_program` (a model's class and `state_dict`
   schema under a declared version; a program's loss and optimizer over it,
   as structural nodes), `start`, `resume`, `branch` and `find` for
@@ -105,8 +107,9 @@ The package exports nothing at its top level; a consumer imports each module.
   through the same storage and checked against its digests;
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
-  checkpoints no execution needs: an unfinished run keeps its newest `keep`,
-  heads and a branch's source stay, and an ended attempt's staged files go.
+  checkpoints no execution needs: an unfinished run keeps its newest `keep`
+  and the one it resumed from, a finished run the one it ended on, heads and
+  a branch's source stay, and an ended attempt's staged files go.
   `Ledger.derive(from_release, name, outputs)` publishes what was computed
   from an accepted checkpoint (an export, evaluation metrics) as a release of
   its own, which keeps only its own outputs; `Ledger.derived` finds it again.

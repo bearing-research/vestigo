@@ -5,7 +5,8 @@
 
 The first command stops after epoch 3; the second finds that run again by its
 computation (the program and its inputs), resumes it from epoch 3 and finishes it,
-deleting after each epoch every checkpoint but the newest one and the best.
+deleting after each epoch every checkpoint but the newest one, the best and, until it
+finishes, the one it resumed from.
 The lowest-loss epoch is the reference ``regression/best``, which ``branch.py``
 fine-tunes from. Before finishing, the run records the model's exported forward pass;
 after, an evaluation of the last checkpoint is a release derived from it.
