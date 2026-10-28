@@ -451,9 +451,10 @@ class BuildStore:
         ``lease_duration_seconds``. The same attempt re-opened, or a claim's owner
         opening its first, keeps the owner when none is given and the later of the
         two deadlines; a re-opened attempt takes ``resumed_from`` when one is given.
-        Returns False when the build is not active, or its lease is live under
-        another attempt; a claim's live lease (no attempt yet) lets only its own
-        ``lease_owner`` through.
+        Returns False when the build is not active, its lease is live under another
+        attempt, or *attempt* is the build's and its lease has lapsed (it continues
+        only in a new attempt); a claim's live lease (no attempt yet) lets only its
+        own ``lease_owner`` through.
         """
         conn = self._get_connection()
         try:
@@ -502,6 +503,9 @@ class BuildStore:
         )
         continuing = row["attempt"] == attempt or own_claim
         if live and not continuing:
+            return False
+        # A lapsed attempt was fenced, so a release it sent meanwhile was rejected.
+        if row["attempt"] == attempt and not live:
             return False
         if continuing:
             if lease_owner is None:
@@ -734,9 +738,11 @@ class BuildStore:
         lease_owner: str,
         lease_duration_seconds: float = 60.0,
     ) -> bool:
-        """Extend the lease from now.
+        """Extend a live lease from now.
 
-        Returns False unless ``lease_owner`` holds it and the build is building.
+        Returns False unless ``lease_owner`` holds it, it has not lapsed and the build
+        is building. A lapsed lease stays lapsed: its attempt is fenced for good, and
+        the build goes on only in a new attempt or a reclaim.
         """
         conn = self._get_connection()
         try:
@@ -749,8 +755,9 @@ class BuildStore:
                 WHERE build_id = ?
                   AND state = 'building'
                   AND lease_owner = ?
+                  AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
                 """,
-                (lease_expires_at, build_id, lease_owner),
+                (lease_expires_at, build_id, lease_owner, now),
             )
             conn.commit()
             return cursor.rowcount > 0

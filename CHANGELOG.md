@@ -72,6 +72,16 @@ All notable changes to vestigo are recorded here. The format follows
   it raises `PermissionError`; with a verify key every load checks the
   signature (#39).
 
+### Changed
+
+- A lapsed lease stays lapsed. `renew_lease` returns False once the lease has
+  expired, and `open_attempt` refuses to re-open the attempt it covered, so an
+  attempt that stalled past its lease is fenced for good, as one whose build was
+  reclaimed is; the build goes on in a new attempt. Before, a stalled attempt
+  that nobody had reclaimed renewed and released again, after a release it sent
+  in the gap had been rejected. A derivation's lease now lasts its write window
+  instead of being renewed after its uploads (#44).
+
 ### Documentation
 
 - `docs/ledger.md`, the guide to the ledger: opening one on SQLite or

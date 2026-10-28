@@ -732,12 +732,14 @@ class Ledger:
             dispatch="external",
         )
         attempt = uuid.uuid4().hex
+        # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
+        # however long the uploads take.
         self.builds.open_attempt(
             build_id,
             attempt,
             writable_until=time.time() + self.config.writable_seconds,
             lease_owner=attempt,
-            lease_duration_seconds=self.lease_seconds,
+            lease_duration_seconds=self.config.writable_seconds,
         )
         release = self.releases.prepare(build_id, attempt, "final")
         created: list[tuple[str, int]] = []
@@ -762,9 +764,6 @@ class Ledger:
                     staged.append(StagedVersion(artifact_id, version, "", None, size, digest))
                 else:
                     staged.append(self._write_small(artifact_id, version, value))
-            # Nothing resumes a derivation, so its lease need only be live at acceptance,
-            # however long the uploads took.
-            self.builds.renew_lease(build_id, attempt, self.lease_seconds)
             return self.releases.accept(release.release_id, staged)
         except BaseException:
             self.releases.abandon(release.release_id, attempt)

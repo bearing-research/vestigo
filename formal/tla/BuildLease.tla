@@ -39,7 +39,8 @@
 (* accept any number of checkpoint releases (ReleaseStore.accept).         *)
 (* Patched, every acceptance is fenced as lease_held is: the attempt must  *)
 (* be the build's current one and its lease must not have lapsed; a        *)
-(* release by any other attempt is rejected. Unpatched, nothing fences a   *)
+(* release by any other attempt is rejected, and a lapsed lease is never   *)
+(* renewed, so its attempt stays fenced. Unpatched, nothing fences a       *)
 (* checkpoint, and a fenced attempt publishes over the attempt that took   *)
 (* over.                                                                   *)
 (*                                                                         *)
@@ -160,7 +161,11 @@ Expire ==                                     \* heartbeat missed for a whole le
     /\ UNCHANGED <<build, owner, epoch, art, blobs, chosen, digest, pc, tok, url,
                    staleFail, staleBytes, staleRelease>>
 
-Renew(r) ==                                   \* renew_lease: no expiry check in the WHERE
+\* Unpatched, renew_lease had no expiry check, so a lapsed lease came back.
+\* Patched, it refuses a lapsed lease, and renewing a live one changes nothing
+\* modelled.
+Renew(r) ==
+    /\ ~Patched
     /\ pc[r] \in {"exec", "published", "finalized"}
     /\ build = "building" /\ owner = r /\ expired
     /\ expired' = FALSE

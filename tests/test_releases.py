@@ -598,19 +598,35 @@ class TestAttemptsAndFences:
         assert _resume(ledger, build_id, "a2") == 0
         assert ledger.builds.get_build(build_id).attempt == "a2"
 
-    def test_a_lapsed_lease_fences_its_attempt_until_renewed_or_reclaimed(self, ledger: Ledger):
+    def test_a_lapsed_lease_fences_its_attempt_for_good(self, ledger: Ledger):
         build_id = _build(ledger)
         pending = ledger.releases.prepare(build_id, "a1", "checkpoint")
         staged = [_stage(ledger, pending, "model", b"w")]
         ledger.clock.now += 120
         with pytest.raises(ReleaseRejected):
+            ledger.releases.accept(pending.release_id, staged)
+        # Nothing took the build over, yet a runner that merely stalled is fenced too.
+        assert not ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+        writable_until = ledger.clock() + 3600
+        assert not ledger.builds.open_attempt(
+            build_id, "a1", writable_until=writable_until, lease_owner="runner-1"
+        )
+        with pytest.raises(ReleaseRejected):
             ledger.releases.prepare(build_id, "a1", "checkpoint")
-        # A runner that merely stalled renews its lease and goes on.
-        assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
-        assert ledger.releases.accept(pending.release_id, staged).release.state == "accepted"
+        assert ledger.releases.get(pending.release_id).state == "rejected"
 
-        # One whose build was reclaimed is fenced for good: the build has no attempt.
-        late = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        # The build goes on in a new attempt, which renews as any live lease does.
+        assert ledger.builds.open_attempt(
+            build_id, "a2", writable_until=writable_until, lease_owner="runner-1"
+        )
+        ledger.clock.now += 30
+        assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+        ledger.clock.now += 50
+        late = ledger.releases.prepare(build_id, "a2", "checkpoint")
+        assert ledger.releases.accept(late.release_id, []).release.state == "accepted"
+
+        # One whose build was reclaimed is fenced as well: the build has no attempt.
+        late = ledger.releases.prepare(build_id, "a2", "checkpoint")
         staged = [_stage(ledger, late, "model", b"w2")]
         ledger.clock.now += 120
         assert ledger.builds.reclaim_expired_build(build_id, "runner-2", 60.0)
@@ -620,7 +636,7 @@ class TestAttemptsAndFences:
         assert ledger.releases.get(late.release_id).state == "rejected"
         assert not ledger.builds.renew_lease(build_id, "runner-1", 60.0)
         with pytest.raises(ReleaseRejected):
-            ledger.releases.prepare(build_id, "a1", "checkpoint")
+            ledger.releases.prepare(build_id, "a2", "checkpoint")
 
     def test_only_its_own_attempt_abandons_attaches_or_marks_a_release(self, ledger: Ledger):
         build_id = _build(ledger)
@@ -789,11 +805,12 @@ class TestAttemptsAndFences:
         retried: list[ReleaseBundle] = []
 
         def settle_after_a_retry(self, release_id: str, state: str) -> None:
-            # Between the fence's rollback and the rejection, the runner renews its
-            # lease and the caller's retry is accepted.
+            # Between the fence's rollback and the rejection, a caller whose clock lags
+            # sees the lease live and its retry is accepted.
             if not retried:
-                assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+                ledger.clock.now -= 120
                 retried.append(ledger.releases.accept(release_id, staged))
+                ledger.clock.now += 120
             real_settle(self, release_id, state)
 
         monkeypatch.setattr(ReleaseStore, "_settle", settle_after_a_retry)
