@@ -112,8 +112,10 @@ How the old process ended decides when you can resume:
 - **It was killed.** Its lease holds until `lease_seconds` (60 by default) after its
   last renewal. Until then `resume` refuses with "another attempt's lease on it is
   live". Pass `Ledger(..., lease_seconds=...)` to shorten the wait.
-- **It ended before any checkpoint.** The execution failed, and `find` no longer
-  returns it, so the next run starts fresh.
+- **It left the `with` block before any checkpoint.** The execution failed, and
+  `find` no longer returns it, so the next run starts fresh. A process killed before
+  any checkpoint fails nothing: `find` still returns its execution, and once its lease
+  lapses a resume starts it over, in the same execution.
 
 Once a new attempt holds the execution, the old process is fenced. Its saves are
 refused, and so are its `set_head`, `observe` and `finish` calls.
@@ -280,9 +282,11 @@ the archive, schema and opset versions, the torch version and the range constrai
 interpreted.
 
 An observation never changes a node, so the model's and program's ids stay the same.
-The same program exported again under the same scope and coverage is one version: the
-comparison covers its graph, weights and constants, not its example inputs or the zip's
-timestamps. Like a save, `observe` needs the lease.
+The same program exported again by the same attempt, under the same scope and
+coverage, from example inputs of the same shapes, is one version: the example values
+and the zip's timestamps are not compared. Example inputs of another shape change the
+graph the archive records, so they make a new version, and so does an export after a
+resume, since each attempt records its own. Like a save, `observe` needs the lease.
 
 ## Signed checkpoints
 
@@ -425,8 +429,10 @@ Since an unsigned manifest cannot be told from a stripped one, a gate that sees
 A ledger verifies with one key. After a rotation, train new runs with the new signing
 key and verify them with the new public key. Keep the old public key for as long as
 anything must still load checkpoints signed with it: a gate that reads an old head
-opens a `Ledger` with the old key. Collect or re-run what you no longer trust. A
-checkpoint is never re-signed, because versions are immutable.
+opens a `Ledger` with the old key. A checkpoint is never re-signed, because versions
+are immutable. To retire checkpoints signed with a key you no longer trust, move every
+head off them and finish or re-run their executions; `collect` then takes them, as it
+takes any checkpoint nothing keeps. It cannot pick checkpoints out by key.
 
 ### What is not signed
 

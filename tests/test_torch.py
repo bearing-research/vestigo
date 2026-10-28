@@ -1625,6 +1625,18 @@ def _said(result: subprocess.CompletedProcess[str], pattern: str) -> str:
     return match.group(1)
 
 
+def test_keys_replaces_neither_key_of_a_pair(tmp_path: Path):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    (keys / "verify.key").write_text("the key old checkpoints verify with\n")
+
+    refused = _example("keys.py", str(keys))
+
+    assert refused.returncode == 1 and "verify.key exists" in refused.stderr
+    assert (keys / "verify.key").read_text() == "the key old checkpoints verify with\n"
+    assert not (keys / "signing.key").exists()
+
+
 def test_the_gate_ships_what_the_trainer_signed_and_refuses_a_forgery(tmp_path: Path):
     root, keys = str(tmp_path / "ledger"), tmp_path / "keys"
     made = _example("keys.py", str(keys))

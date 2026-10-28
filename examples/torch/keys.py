@@ -25,7 +25,11 @@ def main() -> None:
 
     key = Ed25519PrivateKey.generate()
     args.dir.mkdir(parents=True, exist_ok=True)
-    # O_EXCL: a second run must not replace the key earlier checkpoints were signed with.
+    # Neither may be replaced: earlier checkpoints were signed with, and are verified
+    # with, the pair already there.
+    for name in ("signing.key", "verify.key"):
+        if (args.dir / name).exists():
+            raise SystemExit(f"{args.dir / name} exists; keep it, or move it aside to rotate")
     try:
         fd = os.open(args.dir / "signing.key", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as exc:
@@ -33,7 +37,8 @@ def main() -> None:
     with os.fdopen(fd, "w") as private:
         private.write(key.private_bytes_raw().hex() + "\n")
     public = key.public_key().public_bytes_raw().hex()
-    (args.dir / "verify.key").write_text(public + "\n")
+    with open(args.dir / "verify.key", "x") as verify:
+        verify.write(public + "\n")
     print(f"wrote {args.dir / 'signing.key'} (private) and {args.dir / 'verify.key'} {public}")
 
 

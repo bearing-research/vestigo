@@ -1405,9 +1405,10 @@ class Run:
         not the training loop, the update or the checkpointing) and *coverage* how much
         of it (``complete_under_declared_constraints``); the ledger records both and
         reads neither. No node changes, so neither the program's nor the model's id
-        moves. The same program exported again under the same scope and coverage is
-        one version: its graph, weights and constants are compared, not its example
-        inputs or the zip's timestamps.
+        moves. The same program exported again by the same attempt under the same
+        scope and coverage, from example inputs of the same shapes, is one version:
+        the example values and the zip's timestamps are not compared. Inputs of
+        another shape change the recorded graph, and each attempt records its own.
 
         Raises:
             BuildLeaseLost: this attempt no longer holds the execution (it finished,

@@ -33,8 +33,9 @@ All notable changes to vestigo are recorded here. The format follows
   no definition moves. A stale or finished attempt records nothing, an
   archive that fails to store is failed for cleanup, and the archive goes
   through a temporary file rather than memory. The same program exported
-  again under one scope and coverage is one version (graph, weights and
-  constants compared, not the example inputs). `Ledger.observations` lists
+  again by one attempt under one scope and coverage, from example inputs of
+  the same shapes, is one version (the example values and the zip's
+  timestamps are not compared). `Ledger.observations` lists
   an execution's own records (#31, #32).
 - `Ledger.collect(keep=)`, the latest-k policy for checkpoints
   (Investigation 09 §5.6): of each unfinished execution its newest `keep`
@@ -93,6 +94,13 @@ All notable changes to vestigo are recorded here. The format follows
   `evaluate.py` (a gate that verifies, scores held-out data and ships
   safetensors) and `tamper.py` (a drill that changes a weight and its
   database row, which an unkeyed gate ships and a keyed one refuses) (#39).
+- The torch guide's corrections from a review: an export deduplicates only
+  within one attempt and one example-input shape; a process killed before
+  its first checkpoint leaves its execution resumable; two branches of one
+  release share a computation key; retiring checkpoints of an untrusted key;
+  and `is not signed` can mean a stripped signature. `keys.py` refuses when
+  either key file exists, where it overwrote a lone `verify.key`, and the
+  README's `Ledger` signature is complete (#42).
 
 ### Fixed
 
