@@ -685,8 +685,9 @@ class Ledger:
         checkpoint again returns the release already there and stores nothing.
 
         Raises:
-            ValueError: *from_release* is not an accepted checkpoint, or *name* or
-                *outputs* is empty.
+            ValueError: *from_release* is not an accepted checkpoint, *name* or
+                *outputs* is empty, or *name* was derived from a later checkpoint of
+                the execution, whose outputs this would replace as current.
         """
         if not name or not outputs or not all(outputs):
             raise ValueError("a derived release needs a name and labelled outputs")
@@ -695,6 +696,21 @@ class Ledger:
         if existing is not None:
             return existing
         execution_id = self.checkpoint_id(from_release).split("/")[1]
+        source = self.releases.get(from_release)
+        assert source is not None
+        # A trimmed derivation is not found again, so this also refuses to redo one.
+        prefix = f"torch_{execution_id}@derived={quote(name, safe='')}@output="
+        for origin in {
+            v.params["from"]
+            for v in self.store.list_versions_by_id_prefix(prefix)
+            if v.state == "ready"
+        }:
+            later = self.releases.get(origin)
+            if later is not None and later.sequence > source.sequence:
+                raise ValueError(
+                    f"{name!r} is derived from a later checkpoint of execution "
+                    f"{execution_id}; derive the earlier one under another name"
+                )
         key, spec = self._derivation(from_release, name)
 
         build_id = uuid.uuid4().hex
@@ -786,9 +802,12 @@ class Ledger:
         Kept: of each unfinished execution, its newest *keep* checkpoints and the one
         its attempt resumed from; the release each unfinished branch starts from; the
         checkpoint a finished execution ended on; any release a head points at. The
-        files a fenced or ended attempt staged and never released are failed and
-        collected (``orphaned`` counts them; a dry run only counts); an attempt still
-        holding its execution keeps every row it is writing. Observations stay.
+        rows staged for a save that can no longer be released are failed and collected
+        (``orphaned`` counts them; a dry run only counts): every row a fenced or ended
+        attempt staged and never released, and of an attempt still holding its
+        execution, those under an abandoned release and those of a step at or before
+        the newest it accepted. Failed rows go too, but for the placeholder a build
+        still names (a finished execution's record). Observations stay.
 
         A branch opened while this runs may lose the release it starts from; run it
         with *min_idle_seconds* or while none opens.
@@ -804,13 +823,44 @@ class Ledger:
             for v in versions
             if (match := _PLACEHOLDER.fullmatch(v.id))
         }
-        orphans = []
+        # From the listing itself: a release accepted before it holds no row it shows
+        # unreleased, and a step accepted takes no later save.
+        accepted: dict[tuple[str, str], int] = {}
         for v in versions:
+            match = _STAGED.fullmatch(v.id)
+            if match is not None and v.state == "ready" and v.params.get("manifest"):
+                attempt = (match.group(1), match.group(2))
+                accepted[attempt] = max(v.params["step"], accepted.get(attempt, -1))
+        settled: dict[str, bool] = {}
+
+        def given_up(release_id: str) -> bool:
+            if release_id not in settled:
+                release = self.releases.get(release_id)
+                settled[release_id] = release is not None and release.state in (
+                    "abandoned",
+                    "rejected",
+                )
+            return settled[release_id]
+
+        orphans, failed = [], []
+        for v in versions:
+            if v.state == "failed":
+                # A placeholder its build still names is that build's record.
+                match = _PLACEHOLDER.fullmatch(v.id)
+                build = builds.get(match.group(1)) if match is not None else None
+                if build is None or (build.artifact_id, build.version) != (v.id, v.version):
+                    failed.append((v.id, v.version))
+                continue
             match = _STAGED.match(v.id)
             if match is None or v.state != "building":
                 continue
             build = builds.get(match.group(1))
             if build is None or build.state != "building" or build.attempt != match.group(2):
+                orphans.append((v.id, v.version))
+            elif v.release_id is not None:
+                if given_up(v.release_id):
+                    orphans.append((v.id, v.version))
+            elif v.params["step"] <= accepted.get((match.group(1), match.group(2)), -1):
                 orphans.append((v.id, v.version))
         spare = []
         for build in builds.values():
@@ -824,7 +874,7 @@ class Ledger:
             for artifact_id, version in orphans:
                 self.store.fail_artifact(artifact_id, version)
         result = self.store.garbage_collect(
-            collectable=[*self.releases.collectable_checkpoints(keep=keep), *orphans],
+            collectable=[*self.releases.collectable_checkpoints(keep=keep), *orphans, *failed],
             spare=spare,
             min_idle_seconds=min_idle_seconds,
             dry_run=dry_run,

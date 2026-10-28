@@ -109,10 +109,12 @@ The package exports nothing at its top level; a consumer imports each module.
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
   checkpoints no execution needs: an unfinished run keeps its newest `keep`
   and the one it resumed from, a finished run the one it ended on, heads and
-  a branch's source stay, and an ended attempt's staged files go.
+  a branch's source stay, and the staged files of a save that can no longer
+  be released go, as do failed rows.
   `Ledger.derive(from_release, name, outputs)` publishes what was computed
   from an accepted checkpoint (an export, evaluation metrics) as a release of
-  its own, which keeps only its own outputs; `Ledger.derived` finds it again.
+  its own, which keeps only its own outputs; `Ledger.derived` finds it again,
+  and a name derived from a later checkpoint is derived from no earlier one.
   `Ledger(signing_key=)` (the `sign` extra) has each rank sign its report and
   rank 0 sign each checkpoint's manifest with Ed25519, and `verify_key=` makes
   every load take the files from the signed manifest and check their bytes

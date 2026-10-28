@@ -5378,11 +5378,16 @@ class ArtifactStore:
             pending: list[tuple[str, int]] = []
             # Pointers before their canonicals, so a canonical goes only once nothing reads it;
             # folder files after their manifests, so a file goes only once its folders did;
-            # an id's lower versions before its top, which goes only once they did.
+            # an id's lower versions before its top, which goes only once they did. A failed
+            # file is in no folder, but the claim below still sees its manifest's edge.
+            required = {
+                (row["to_artifact_id"], row["to_version"])
+                for row in conn.execute("SELECT to_artifact_id, to_version FROM retention_edges")
+            }
             ordered = sorted(
                 chosen.values(),
                 key=lambda r: (
-                    (r["id"], r["version"]) in namers,
+                    (r["id"], r["version"]) in required,
                     r["superseded_by"] is None,
                     r["version"],
                 ),

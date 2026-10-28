@@ -136,6 +136,21 @@ All notable changes to vestigo are recorded here. The format follows
   or a collected checkpoint, and failed only at `restore`; they now refuse
   it before opening anything. `derive` returns an existing derivation even
   once its checkpoint is collected, as documented (#41).
+- `collect` left a running attempt's dead saves behind: the files and
+  reports of a save whose acceptance failed or was rejected, and the leftover
+  files of a step the attempt saved again or saved past. They are now failed
+  and collected; the save being written stays (#43).
+- `collect` never deleted a failed row: an observation or derivation that
+  failed to store, a finished derivation's placeholder, or an orphan an
+  earlier pass failed but spared as recently used. It now deletes them, but
+  for the placeholder a finished execution's build row names (#43).
+- `garbage_collect` took a failed file a failed manifest required only in a
+  later pass: its order put a manifest's files after it only when they were
+  ready, so the claim refused the file while the manifest stood (#43).
+- `derive` from a checkpoint earlier than one the name was already derived
+  from made the earlier outputs current again, as did re-deriving one that
+  `garbage_collect(keep_superseded=)` had trimmed; it now raises
+  `ValueError` (#43).
 
 ### Verified
 

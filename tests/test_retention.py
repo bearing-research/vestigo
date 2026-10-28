@@ -258,6 +258,20 @@ class TestRequirements:
         assert store.get_artifact(*whole) is None
         assert _edges(store) == set()
 
+    def test_failed_files_go_in_the_sweep_that_takes_their_failed_manifest(self, store):
+        def failed(artifact_id: str, requires=()) -> tuple[str, int]:
+            version = store.create_artifact(artifact_id, f"prov-{artifact_id}", requires=requires)
+            store.fail_artifact(artifact_id, version)
+            _idle(store, artifact_id, version)
+            return artifact_id, version
+
+        # Older than the manifest, so the sweep meets them first.
+        parts = [failed(f"part-{n}") for n in range(2)]
+        failed("whole", requires=parts)
+
+        assert _sweep(store) == 3
+        assert _edges(store) == set()
+
     def test_a_requirement_stays_while_its_requirer_is_used(self, store):
         parts = [_ready(store) for _ in range(2)]
         whole = _ready(store, requires=parts)
