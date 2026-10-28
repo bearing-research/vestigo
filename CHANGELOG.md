@@ -37,6 +37,13 @@ All notable changes to vestigo are recorded here. The format follows
   constants compared, not the example inputs). `Ledger.observations` lists
   an execution's own records (#31, #32).
 
+### Documentation
+
+- `docs/torch.md`, the guide to `vestigo.torch`, and `examples/torch/`: a
+  run that stops, resumes in the same execution and records its exported
+  forward pass; a branch that fine-tunes from the best epoch; two ranks under
+  `torchrun`. The torch job runs the examples (#33).
+
 ## 0.2.1 - 2026-10-27
 
 ### Fixed

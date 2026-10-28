@@ -103,6 +103,8 @@ The package exports nothing at its top level; a consumer imports each module.
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
   node changes), `Ledger.observations` lists them.
+  [`docs/torch.md`](docs/torch.md) is the guide; [`examples/torch/`](examples/torch/)
+  trains, resumes after a crash, branches, and runs on two ranks under `torchrun`.
 
 ## Install
 

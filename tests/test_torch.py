@@ -12,6 +12,9 @@ import io
 import json
 import multiprocessing
 import os
+import re
+import socket
+import subprocess
 import sys
 import zipfile
 from collections.abc import Iterator
@@ -751,3 +754,76 @@ def test_an_archive_without_torch_s_metadata_entries_reads_as_none(tmp_path: Pat
     assert metadata["archive_version"] is None and metadata["serialization_id"] is None
     assert metadata["programs"]["model"]["torch_version"] == "x"
     assert metadata["programs"]["model"]["schema_version"] is None
+
+
+# --- The examples ---
+
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "torch"
+
+
+def _example(script: str, *args: str, ranks: int = 1) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(EXAMPLES / script), *args]
+    if ranks > 1:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        launch = ["-m", "torch.distributed.run", f"--nproc-per-node={ranks}"]
+        rendezvous = ["--master-addr=127.0.0.1", f"--master-port={port}"]
+        command = [sys.executable, *launch, *rendezvous, *command[1:]]
+    return subprocess.run(command, capture_output=True, text=True, timeout=300)
+
+
+def _said(result: subprocess.CompletedProcess[str], pattern: str) -> str:
+    match = re.search(pattern, result.stdout)
+    assert match is not None, result.stdout + result.stderr
+    return match.group(1)
+
+
+def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: Path):
+    root = str(tmp_path / "ledger")
+    stopped = _example("train.py", root, "--epochs=4", "--crash-at=2")
+    assert stopped.returncode == 1 and "stopped after epoch 2" in stopped.stderr
+    execution = _said(stopped, r"started (\w+)")
+
+    resumed = _example("train.py", root, "--epochs=4")
+    assert resumed.returncode == 0, resumed.stderr
+    assert _said(resumed, r"resumed (\w+) after epoch 2") == execution
+
+    with Ledger(Path(root)) as ledger:
+        assert ledger.builds.get_build(execution).state == "ready"
+        assert [r.sequence for r in ledger.releases.releases_of(execution, "checkpoint")] == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        head = ledger.releases.reference("regression/best")
+        assert head is not None
+        assert ledger.releases.get(head[0]).build_id == execution
+        [observed] = ledger.observations(execution)
+        assert observed.params["observed"] == "model_forward"
+
+    branched = _example("branch.py", root, "--epochs=1")
+    assert branched.returncode == 0, branched.stderr
+    branch = _said(branched, r"branched (\w+) from release")
+    with Ledger(Path(root)) as ledger:
+        assert branch != execution
+        assert ledger.builds.get_build(branch).params["init"] == head[0]
+
+
+def test_the_distributed_example_releases_every_ranks_files_and_resumes(tmp_path: Path):
+    root = str(tmp_path / "ledger")
+    stopped = _example("distributed.py", root, "--epochs=2", "--crash-at=1", ranks=2)
+    assert stopped.returncode == 0, stopped.stderr
+    resumed = _example("distributed.py", root, "--epochs=2", ranks=2)
+    assert resumed.returncode == 0, resumed.stderr
+    execution = _said(resumed, r"resumed (\w+) after epoch 1")
+
+    with Ledger(Path(root)) as ledger:
+        assert ledger.builds.get_build(execution).state == "ready"
+        for step in (1, 2):
+            release = ledger.release_of(execution, step)
+            assert release is not None
+            outputs = ledger.releases.bundle(release.release_id).outputs
+            files = {v.params["file"] for v in outputs if "file" in v.params}
+            assert files == {f"{k}_{r}.pt" for k in ("model", "optim", "epoch") for r in (0, 1)}
