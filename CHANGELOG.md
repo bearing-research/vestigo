@@ -45,6 +45,15 @@ All notable changes to vestigo are recorded here. The format follows
   checkpoint goes, and so do the files a fenced or ended attempt staged and
   never released; a live attempt's rows stay. `branch` records a use of its
   source, so `min_idle_seconds` spares it until the branch loads (#34).
+- `Ledger.derive(from_release, name, outputs)`, derived releases
+  (Investigation 09 §5.5): an export or evaluation computed from an accepted
+  checkpoint is the final release of a build of its own, keyed by the
+  checkpoint's release and the name, its outputs current together. The
+  checkpoint is named in each output's spec, not recorded as an input, so a
+  head or pin on a derived release keeps only its outputs. The same name
+  derived again returns the release already there; `Ledger.derived` finds it,
+  also after the checkpoint is collected. A failed derivation fails its rows
+  and build; one slower than its lease is still accepted (#36).
 
 ### Documentation
 

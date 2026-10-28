@@ -106,7 +106,10 @@ The package exports nothing at its top level; a consumer imports each module.
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
   checkpoints no execution needs: an unfinished run keeps its newest `keep`,
-  heads and a branch's source stay, and an ended attempt's staged files go. `Run.observe(exported_program,
+  heads and a branch's source stay, and an ended attempt's staged files go.
+  `Ledger.derive(from_release, name, outputs)` publishes what was computed
+  from an accepted checkpoint (an export, evaluation metrics) as a release of
+  its own, which keeps only its own outputs; `Ledger.derived` finds it again. `Run.observe(exported_program,
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
   node changes), `Ledger.observations` lists them.
