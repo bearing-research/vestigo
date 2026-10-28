@@ -25,7 +25,7 @@ deserializes.
 Saves may be synchronous or asynchronous (the writer then runs in a subprocess, which is
 why everything the writer holds is a picklable description of the ledger, opened per
 call), on one rank or many (rank and world size from the default process group, else
-``RANK`` and ``WORLD_SIZE``).
+``RANK`` and ``WORLD_SIZE``, read when each rank configures its manager).
 
 An ``ExportedProgram`` the run captured is recorded beside its checkpoints as an
 observed implementation: the archive with its versions and constraints, and a declared
@@ -76,7 +76,14 @@ from vestigo.provenance import (
     derive_subkey,
     run_output_key,
 )
-from vestigo.releases import Release, ReleaseBundle, ReleaseRejected, ReleaseStore, lease_held
+from vestigo.releases import (
+    UNSETTLED,
+    Release,
+    ReleaseBundle,
+    ReleaseRejected,
+    ReleaseStore,
+    lease_held,
+)
 from vestigo.sql_backend import PostgresDialect
 from vestigo.store import ArtifactStore, ArtifactVersion, BuildLeaseLost, StagedVersion
 
@@ -180,8 +187,8 @@ def _file_digest(path: Path) -> tuple[int, str]:
 def _rank() -> tuple[int, int]:
     """This process's rank and the world size: the process group's, else the launcher's.
 
-    An asynchronous writer's subprocess has no process group, but inherits the
-    environment ``torchrun`` set.
+    Read when a rank configures its manager: an asynchronous writer's subprocess has
+    no process group, nor the environment when the group was given its rank directly.
     """
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank(), dist.get_world_size()
@@ -450,17 +457,17 @@ class Ledger:
     def branch(
         self, program: Definition, from_release: str, inputs: Mapping[str, str] | None = None
     ) -> Run:
-        """A new execution starting from *from_release*, an accepted release of any run.
+        """A new execution starting from *from_release*, an accepted checkpoint of any run.
 
         The release is part of the computation, so a branch never dedups against its
         source or another branch of it; :meth:`Run.restore` names it.
 
         Raises:
-            ValueError: *from_release* is not an accepted release.
+            ValueError: *from_release* is not an accepted checkpoint, or was collected.
         """
+        self.checkpoint_id(from_release)
         source = self.releases.bundle(from_release)
-        if source is None or source.release.state != "accepted":
-            raise ValueError(f"release {from_release} is not an accepted release")
+        assert source is not None
         # A use now, so a collection with min_idle_seconds spares it until the load.
         for output in source.outputs:
             self.store.record_use(output.id, output.version)
@@ -515,7 +522,8 @@ class Ledger:
 
         Raises:
             ValueError: the execution does not exist, is finished, another attempt's
-                lease on it is live, or *from_release* is not an accepted release of it.
+                lease on it is live, or *from_release* is not an accepted checkpoint of
+                it, or was collected.
         """
         build = self.builds.get_build(execution_id)
         if build is None or build.computation_key is None:
@@ -523,6 +531,8 @@ class Ledger:
         if from_release is None:
             latest = self.releases.latest_accepted(execution_id)
             from_release = latest.release_id if latest is not None else None
+        if from_release is not None:
+            self.checkpoint_id(from_release)
         attempt = uuid.uuid4().hex
         self.releases.resume(
             execution_id,
@@ -566,14 +576,14 @@ class Ledger:
         """The checkpoint id an accepted release loads from.
 
         Raises:
-            ValueError: the release is not an accepted checkpoint.
+            ValueError: the release is not an accepted checkpoint, or was collected.
         """
         release = self.releases.get(release_id)
         if release is not None and release.state == "accepted":
             for step, bundle in self._accepted(release.build_id):
                 if bundle.release.release_id == release_id:
                     return f"{ROOT}/{release.build_id}/{release.attempt}/step-{step}"
-        raise ValueError(f"release {release_id} is not an accepted checkpoint")
+        raise ValueError(f"release {release_id} is not an accepted checkpoint, or was collected")
 
     def configure(self, config: Any) -> Any:
         """Point a ``CheckpointManager.Config`` at the ledger for loads only; returns it.
@@ -680,11 +690,12 @@ class Ledger:
         """
         if not name or not outputs or not all(outputs):
             raise ValueError("a derived release needs a name and labelled outputs")
-        execution_id = self.checkpoint_id(from_release).split("/")[1]
-        key, spec = self._derivation(from_release, name)
+        # Before the checkpoint is looked up: it may since have been collected.
         existing = self.derived(from_release, name)
         if existing is not None:
             return existing
+        execution_id = self.checkpoint_id(from_release).split("/")[1]
+        key, spec = self._derivation(from_release, name)
 
         build_id = uuid.uuid4().hex
         placeholder = f"torch_{build_id}"
@@ -927,8 +938,9 @@ class Ledger:
         assert stored is not None
         return stored
 
-    def _report(self, writer: Checkpoints, at: _Location, files: list[dict[str, Any]]) -> None:
-        rank, _ = _rank()
+    def _report(
+        self, writer: Checkpoints, at: _Location, rank: int, files: list[dict[str, Any]]
+    ) -> None:
         artifact_id, version = self._stage(writer, at, f"rank={rank}", {"rank": rank})
         # Signed by the rank that hashed the bytes, so rank 0 signs no digest a bucket
         # writer swapped in between this report and the acceptance.
@@ -956,12 +968,11 @@ class Ledger:
             raise OSError(f"{what} is signed for another checkpoint")
         return report["files"]
 
-    def _accept(self, writer: Checkpoints, at: _Location) -> Release:
+    def _accept(self, writer: Checkpoints, at: _Location, world: int) -> Release:
         for step, bundle in self._accepted(at.execution_id):
             if step == at.step and bundle.release.attempt == at.attempt:
                 # The writer retried a finalize whose acceptance had landed.
                 return bundle.release
-        _, world = _rank()
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -982,6 +993,12 @@ class Ledger:
         if len({entry["file"] for entry in files}) != len(files):
             raise ValueError(f"two ranks wrote one file of step {at.step}")
 
+        # A release that neither settled nor was abandoned (the database failed under
+        # both) would hold up every later one; a writer has one save in flight, so it
+        # is dead.
+        for stale in self.releases.releases_of(at.execution_id, "checkpoint"):
+            if stale.attempt == at.attempt and stale.state in UNSETTLED:
+                self.releases.abandon(stale.release_id, at.attempt)
         release = self.releases.prepare(at.execution_id, at.attempt, "checkpoint")
         try:
             outputs = [(e["artifact_id"], e["version"]) for e in files] + [
@@ -1054,9 +1071,11 @@ class Checkpoints:
         """Point a ``CheckpointManager.Config`` at the ledger; returns it.
 
         Sets its storage, both write callbacks and ``write_to_temp_dir=False`` (the
-        barrier stays: rank 0 accepts only after every rank has written).
+        barrier stays: rank 0 accepts only after every rank has written). Call it once
+        the process group is up: the rank and world size are read here.
         """
-        config.storage_config = LedgerStorageConfig(self.ledger, self)
+        rank, world = _rank()
+        config.storage_config = LedgerStorageConfig(self.ledger, self, rank, world)
         config.pre_finalize_callback = report
         config.finalize_callback = self
         config.save.writer_config.write_to_temp_dir = False
@@ -1064,10 +1083,12 @@ class Checkpoints:
 
     def __call__(self, args: Any) -> None:
         """``finalize_callback``: on rank 0, make the step a release."""
-        if _rank()[0] != 0:
+        at = self._own(args.path)
+        storage = _ledger_storage(args)
+        if storage.rank != 0:
             return
         with self.ledger.open() as ledger:
-            ledger._accept(self, self._own(args.path))
+            ledger._accept(self, at, storage.world)
 
     def _own(self, path: Path | str) -> _Location:
         at = _Location.of(path)
@@ -1078,10 +1099,14 @@ class Checkpoints:
 
 def report(args: Any) -> None:
     """``pre_finalize_callback``: this rank records what it wrote of the step."""
+    _ledger_storage(args).report(Path(args.path))
+
+
+def _ledger_storage(args: Any) -> LedgerStorage:
     storage = args.storage
     if not isinstance(storage, LedgerStorage):
         raise TypeError("the writer's storage is not the ledger; use Checkpoints.configure")
-    storage.report(Path(args.path))
+    return storage
 
 
 @dataclass
@@ -1089,9 +1114,11 @@ class LedgerStorageConfig(StorageConfig):
     ledger: LedgerConfig
     # None for a storage that only loads (Ledger.configure).
     checkpoints: Checkpoints | None = None
+    rank: int = 0
+    world: int = 1
 
     def create_storage(self) -> LedgerStorage:
-        return LedgerStorage(self.ledger, self.checkpoints)
+        return LedgerStorage(self.ledger, self.checkpoints, self.rank, self.world)
 
 
 class _Upload(io.RawIOBase):
@@ -1169,9 +1196,16 @@ class LedgerStorage(Storage):
     without *checkpoints* (:meth:`Ledger.configure`) only loads.
     """
 
-    def __init__(self, ledger: LedgerConfig, checkpoints: Checkpoints | None = None) -> None:
+    def __init__(
+        self,
+        ledger: LedgerConfig,
+        checkpoints: Checkpoints | None = None,
+        rank: int = 0,
+        world: int = 1,
+    ) -> None:
         self.ledger = ledger
         self.checkpoints = checkpoints
+        self.rank, self.world = rank, world
         self._lock = threading.Lock()
         self._written: dict[_Location, list[dict[str, Any]]] = {}
 
@@ -1204,7 +1238,9 @@ class LedgerStorage(Storage):
     def _wrote(self, at: _Location, entry: dict[str, Any]) -> None:
         step = _Location(at.execution_id, at.attempt, at.step, None)
         with self._lock:
-            self._written.setdefault(step, []).append(entry)
+            # A save of the step that failed before its report wrote some files too.
+            written = self._written.setdefault(step, [])
+            written[:] = [e for e in written if e["file"] != entry["file"]] + [entry]
 
     def report(self, path: Path) -> None:
         """Record, as this rank's report for the step, every file it wrote of it."""
@@ -1213,7 +1249,7 @@ class LedgerStorage(Storage):
         with self._lock:
             files = self._written.pop(at, [])
         with self.ledger.open() as ledger:
-            ledger._report(writer, at, files)
+            ledger._report(writer, at, self.rank, files)
 
     def mkdir(self, path: Path, recursive: bool = True) -> None:
         # Ids, not directories: nothing to make.
@@ -1302,6 +1338,9 @@ class Run:
     finished: bool = False
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renewal: threading.Thread | None = field(default=None, repr=False)
+    # Held by a renewal and by finish's final release, so no renewal reads a finish
+    # as a lost lease.
+    _renewing: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self._renewal = threading.Thread(
@@ -1324,9 +1363,23 @@ class Run:
     def _renew(self) -> None:
         every = self.ledger.lease_seconds / 3
         while not self._stop.wait(every):
-            if not self.ledger.builds.renew_lease(
-                self.execution_id, self.attempt, self.ledger.lease_seconds
-            ):
+            with self._renewing:
+                if self._stop.is_set():
+                    return
+                try:
+                    renewed = self.ledger.builds.renew_lease(
+                        self.execution_id, self.attempt, self.ledger.lease_seconds
+                    )
+                except Exception:
+                    # A locked database, a dropped connection: the next tick retries.
+                    logger.warning(
+                        "Attempt %s could not renew its lease on execution %s",
+                        self.attempt,
+                        self.execution_id,
+                        exc_info=True,
+                    )
+                    continue
+            if not renewed:
                 logger.warning("Attempt %s lost execution %s", self.attempt, self.execution_id)
                 return
 
@@ -1407,9 +1460,10 @@ class Run:
         )
         operations = [AdvanceReference(f"{ROOT}/{self.execution_id}", ended_on)] if ended_on else []
         release = self.ledger.releases.prepare(self.execution_id, self.attempt, "final")
-        self.ledger.releases.accept(release.release_id, [], operations)
-        self.finished = True
-        self._stop.set()
+        with self._renewing:
+            self.ledger.releases.accept(release.release_id, [], operations)
+            self.finished = True
+            self._stop.set()
 
     def close(self) -> None:
         """Stop renewing. An unfinished execution with a checkpoint stays resumable,

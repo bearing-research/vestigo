@@ -126,7 +126,7 @@ restored if it saved none) stays under the reference `vestigo-torch/<execution>`
 
 ## Branch
 
-Start a new execution from any accepted release, of this run or another:
+Start a new execution from any accepted checkpoint, of this run or another:
 
 ```python
 with ledger.branch(finetune_program, release_id, inputs) as run:
@@ -134,8 +134,13 @@ with ledger.branch(finetune_program, release_id, inputs) as run:
     state = manager.load(run.restore(), into={"model": model.state_dict()})
 ```
 
-The release is part of the branch's computation. A branch never dedups against the run
-it came from, or against another branch of the same release.
+The release is part of the branch's computation, so a branch never dedups against the
+run it came from. Two branches of one release with the same program and inputs do share
+a computation key: each `branch` call opens an execution of its own, and
+`ledger.find(program, inputs, init=release_id)` finds the newest unfinished one.
+
+`branch` and `resume(from_release=)` refuse a release that is not a checkpoint (a final
+or derived release) and a checkpoint `collect` has taken, before opening anything.
 
 ## Heads
 
@@ -233,8 +238,11 @@ Each rank writes its own files (`model_0.pt`, `model_1.pt`, ...) and loads its o
 Rank 0 accepts a step only after the barrier has seen every rank write. If a rank dies
 before writing, the barrier times out, and that step never becomes a release.
 
-The ranks find their rank and world size from the default process group. In the async
-writer subprocess they read it from `RANK` and `WORLD_SIZE`.
+Each rank reads its rank and the world size when it calls `configure`, from the default
+process group, else from `RANK` and `WORLD_SIZE`, so configure after
+`init_process_group`. The async writer subprocess uses what `configure` read: it has no
+process group, and when the group was given its rank directly (as with `mp.spawn`), no
+such variables either.
 
 ## Where the ledger lives
 
