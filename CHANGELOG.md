@@ -36,6 +36,15 @@ All notable changes to vestigo are recorded here. The format follows
   again under one scope and coverage is one version (graph, weights and
   constants compared, not the example inputs). `Ledger.observations` lists
   an execution's own records (#31, #32).
+- `Ledger.collect(keep=)`, the latest-k policy for checkpoints
+  (Investigation 09 §5.6): of each unfinished execution its newest `keep`
+  checkpoints and the one its attempt resumed from stay, as do every head,
+  the release each unfinished branch starts from, and the checkpoint a
+  finished execution ended on, which `finish` now keeps under the reference
+  `vestigo-torch/<execution>` (`Ledger.final_checkpoint`). Every other
+  checkpoint goes, and so do the files a fenced or ended attempt staged and
+  never released; a live attempt's rows stay. `branch` records a use of its
+  source, so `min_idle_seconds` spares it until the branch loads (#34).
 
 ### Documentation
 

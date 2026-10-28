@@ -481,6 +481,164 @@ def test_a_run_that_ends_before_a_checkpoint_fails(ledger: Ledger):
     assert ledger.find(trainer.program) is None
 
 
+# --- Retention ---
+
+
+def _steps(ledger: Ledger, run: Run) -> dict[int, list[tuple[str, int]]]:
+    """Every accepted step's outputs, read before a collection removes any."""
+    steps = {}
+    for step in range(1, STEPS + 1):
+        release = ledger.release_of(run.execution_id, step)
+        if release is not None:
+            outputs = ledger.releases.bundle(release.release_id).outputs
+            steps[step] = [(v.id, v.version) for v in outputs]
+    return steps
+
+
+def _stored(ledger: Ledger, steps: dict[int, list[tuple[str, int]]]) -> list[int]:
+    return [
+        step
+        for step, outputs in steps.items()
+        if all(ledger.store.get_artifact(*output) is not None for output in outputs)
+    ]
+
+
+def test_collect_keeps_an_unfinished_run_s_newest_checkpoints_and_its_heads(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, STEPS)
+        run.set_head("tiny/best", run.release_of(2).release_id)
+        steps = _steps(ledger, run)
+
+        result = ledger.collect(keep=2)
+
+        assert _stored(ledger, steps) == [2, 5, 6]
+        assert result["deleted_count"] == sum(len(steps[s]) for s in (1, 3, 4))
+    with ledger.resume(run.execution_id) as resumed:
+        fresh = Trainer(ledger)
+        fresh.restore(resumed)
+        assert fresh.step == STEPS and _same(fresh.weights(), trainer.weights())
+
+
+def test_a_dry_run_collects_nothing(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+        steps = _steps(ledger, run)
+
+        result = ledger.collect(keep=1, dry_run=True)
+
+        collected = {(c["artifact_id"], c["version"]) for c in result["collected"]}
+        assert collected == set(steps[1] + steps[2])
+        assert _stored(ledger, steps) == [1, 2, 3]
+
+
+def test_a_finished_run_keeps_the_checkpoint_it_ended_on(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+        steps = _steps(ledger, run)
+        run.finish()
+
+    ledger.collect(keep=1)
+
+    final = ledger.final_checkpoint(run.execution_id)
+    assert final == run.release_of(3) and _stored(ledger, steps) == [3]
+    with ledger.branch(trainer.program, final.release_id) as branch:
+        fresh = Trainer(ledger)
+        fresh.restore(branch)
+        assert _same(fresh.weights(), trainer.weights())
+
+
+def test_a_resume_that_finishes_without_saving_keeps_what_it_restored(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+    with ledger.resume(run.execution_id) as resumed:
+        resumed.finish()
+
+    assert ledger.final_checkpoint(run.execution_id) == run.release_of(2)
+
+
+def test_an_unfinished_branch_keeps_the_release_it_starts_from(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+        steps = _steps(ledger, run)
+        run.finish()
+    # Opened, and killed before its first checkpoint: its resume restores the source.
+    branch = ledger.branch(trainer.program, run.release_of(1).release_id)
+    try:
+        ledger.collect(keep=1)
+
+        assert _stored(ledger, steps) == [1, 3]
+        Trainer(ledger).restore(branch)
+    finally:
+        branch.close()
+
+
+def test_a_branch_marks_its_source_used_before_it_loads(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        run.finish()
+    source = run.release_of(1).release_id
+    conn = ledger.store._get_connection()
+    try:
+        # Long idle, as an old checkpoint is.
+        conn.execute(
+            "UPDATE artifact_versions SET last_used_at = 0 WHERE release_id = ?", (source,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with ledger.branch(trainer.program, source):
+        conn = ledger.store._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT last_used_at FROM artifact_versions WHERE release_id = ?", (source,)
+            ).fetchall()
+        finally:
+            conn.close()
+
+    assert rows and all(row["last_used_at"] > 0 for row in rows)
+
+
+def test_collect_takes_what_an_ended_attempt_staged_and_spares_a_live_one(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    first = ledger.start(trainer.program)
+    trainer.train(first, 1)
+    real = ArtifactStore.open_blob_writer
+    calls = []
+
+    def second_fails(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return real(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ArtifactStore, "open_blob_writer", second_fails)
+        with pytest.raises(OSError):
+            trainer.train(first, 2)
+    prefix = f"torch_{first.execution_id}@attempt={first.attempt}@step=2"
+    staged = [(v.id, v.version) for v in ledger.store.list_versions_by_id_prefix(prefix)]
+    assert staged
+
+    assert ledger.collect(keep=1)["orphaned"] == 0
+    assert all(ledger.store.get_artifact(*v).state == "building" for v in staged)
+
+    first.close()
+    with ledger.resume(first.execution_id):
+        result = ledger.collect(keep=1)
+
+    assert result["orphaned"] == len(staged)
+    assert all(ledger.store.get_artifact(*v) is None for v in staged)
+
+
 # --- Asynchronous saves ---
 
 
@@ -785,9 +943,10 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
     assert stopped.returncode == 1 and "stopped after epoch 2" in stopped.stderr
     execution = _said(stopped, r"started (\w+)")
 
-    resumed = _example("train.py", root, "--epochs=4")
+    resumed = _example("train.py", root, "--epochs=4", "--keep=1")
     assert resumed.returncode == 0, resumed.stderr
     assert _said(resumed, r"resumed (\w+) after epoch 2") == execution
+    final = _said(resumed, r"finished \w+ on release (\w+)")
 
     with Ledger(Path(root)) as ledger:
         assert ledger.builds.get_build(execution).state == "ready"
@@ -802,6 +961,10 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
         assert ledger.releases.get(head[0]).build_id == execution
         [observed] = ledger.observations(execution)
         assert observed.params["observed"] == "model_forward"
+        # Collected as it went: what is left is the last epoch and the best.
+        manifests = ledger.store.list_versions_by_id_prefix(f"torch_{execution}@")
+        kept = {v.release_id for v in manifests if v.params.get("manifest")}
+        assert kept == {final, head[0]}
 
     branched = _example("branch.py", root, "--epochs=1")
     assert branched.returncode == 0, branched.stderr

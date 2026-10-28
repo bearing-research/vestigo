@@ -82,6 +82,9 @@ PROGRAM_DOMAIN = "torch/training-program"
 ROOT = "vestigo-torch"
 
 _STEP_DIR = re.compile(r"step-(\d+)")
+# An execution's placeholder, and any output a step of one of its attempts staged.
+_PLACEHOLDER = re.compile(r"torch_([0-9a-f]{32})")
+_STAGED = re.compile(r"torch_([0-9a-f]{32})@attempt=([0-9a-f]{32})@step=\d+")
 _CHUNK = 8 * 1024 * 1024
 
 
@@ -385,9 +388,12 @@ class Ledger:
         Raises:
             ValueError: *from_release* is not an accepted release.
         """
-        source = self.releases.get(from_release)
-        if source is None or source.state != "accepted":
+        source = self.releases.bundle(from_release)
+        if source is None or source.release.state != "accepted":
             raise ValueError(f"release {from_release} is not an accepted release")
+        # A use now, so a collection with min_idle_seconds spares it until the load.
+        for output in source.outputs:
+            self.store.record_use(output.id, output.version)
         return self._open(program, dict(inputs or {}), from_release)
 
     def _open(self, program: Definition, inputs: dict[str, str], init: str | None) -> Run:
@@ -481,6 +487,11 @@ class Ledger:
                 return bundle.release
         return None
 
+    def final_checkpoint(self, execution_id: str) -> Release | None:
+        """The checkpoint a finished execution ended on, which :meth:`collect` keeps."""
+        head = self.releases.reference(f"{ROOT}/{execution_id}")
+        return self.releases.get(head[0]) if head is not None else None
+
     def checkpoint_id(self, release_id: str) -> str:
         """The checkpoint id an accepted release loads from.
 
@@ -500,6 +511,59 @@ class Ledger:
             if step == at.step and bundle.release.attempt == at.attempt:
                 return {v.params["file"]: v for v in bundle.outputs if "file" in v.params}
         return None
+
+    # --- Retention ---
+
+    def collect(self, *, keep: int, min_idle_seconds: float = 0.0, dry_run: bool = False) -> dict:
+        """Delete the checkpoints no execution needs any more; ``garbage_collect``'s counts.
+
+        Kept: of each unfinished execution, its newest *keep* checkpoints and the one
+        its attempt resumed from; the release each unfinished branch starts from; the
+        checkpoint a finished execution ended on; any release a head points at. The
+        files a fenced or ended attempt staged and never released are failed and
+        collected (``orphaned`` counts them; a dry run only counts); an attempt still
+        holding its execution keeps every row it is writing. Observations stay.
+
+        A branch opened while this runs may lose the release it starts from; run it
+        with *min_idle_seconds* or while none opens.
+
+        Raises:
+            ValueError: *keep* is below 1.
+        """
+        # Versions before builds: a row listed here was staged by an attempt the build
+        # read below already names, so a live attempt's rows are never taken for orphans.
+        versions = self.store.list_versions_by_id_prefix("torch_")
+        builds = {
+            match.group(1): self.builds.get_build(match.group(1))
+            for v in versions
+            if (match := _PLACEHOLDER.fullmatch(v.id))
+        }
+        orphans = []
+        for v in versions:
+            match = _STAGED.match(v.id)
+            if match is None or v.state != "building":
+                continue
+            build = builds.get(match.group(1))
+            if build is None or build.state != "building" or build.attempt != match.group(2):
+                orphans.append((v.id, v.version))
+        spare = []
+        for build in builds.values():
+            if build is None or build.state != "building":
+                continue
+            init = (build.params or {}).get("init")
+            source = self.releases.bundle(init) if init else None
+            if source is not None:
+                spare += [(v.id, v.version) for v in source.outputs]
+        if not dry_run:
+            for artifact_id, version in orphans:
+                self.store.fail_artifact(artifact_id, version)
+        result = self.store.garbage_collect(
+            collectable=[*self.releases.collectable_checkpoints(keep=keep), *orphans],
+            spare=spare,
+            min_idle_seconds=min_idle_seconds,
+            dry_run=dry_run,
+        )
+        return {**result, "orphaned": len(orphans)}
 
     def _stage(
         self, writer: Checkpoints, at: _Location, label: str, params: dict[str, Any], **kw: Any
@@ -1023,11 +1087,24 @@ class Run:
     def finish(self) -> None:
         """End the execution: an empty final release completes it; nothing resumes it.
 
+        The checkpoint it ended on (this attempt's last, else the one it restored)
+        stays, under the reference ``vestigo-torch/<execution>``;
+        :meth:`Ledger.final_checkpoint` names it.
+
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
         """
+        ended_on = next(
+            (
+                bundle.release.release_id
+                for _, bundle in self.ledger._accepted(self.execution_id)
+                if bundle.release.attempt == self.attempt
+            ),
+            self.restores_from,
+        )
+        operations = [AdvanceReference(f"{ROOT}/{self.execution_id}", ended_on)] if ended_on else []
         release = self.ledger.releases.prepare(self.execution_id, self.attempt, "final")
-        self.ledger.releases.accept(release.release_id, [])
+        self.ledger.releases.accept(release.release_id, [], operations)
         self.finished = True
         self._stop.set()
 
