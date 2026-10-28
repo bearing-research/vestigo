@@ -109,6 +109,25 @@ All notable changes to vestigo are recorded here. The format follows
   hide a signed file by renaming its row. A garbled manifest (not JSON, not
   an object, a signature that is not hex, two manifest rows) is an `OSError`
   refusal rather than an unhandled error (#40).
+- An asynchronous save on several ranks could accept a checkpoint missing
+  a rank's files: the writer's subprocess read its rank from `RANK` and
+  `WORLD_SIZE`, so where the process group was given its rank directly
+  (`mp.spawn`) every rank was rank 0 of 1. Each rank's rank and world size
+  are now read when it calls `configure` (#41).
+- One failed lease renewal (a locked database, a dropped connection) ended
+  the renewal thread for good, so every later save was rejected and another
+  process could resume the live run; a failure is now logged and retried.
+  A finish no longer logs a false "lost execution" (#41).
+- A checkpoint release the database left unsettled (its acceptance and its
+  abandonment both failed) held up every later checkpoint of the run with
+  `ReleaseOutOfOrder`; the attempt now abandons its own unsettled
+  checkpoints before preparing the next (#41).
+- Saving a step again after a save of it failed midway raised "two ranks
+  wrote one file"; the later write of a file now replaces the earlier (#41).
+- `branch` and `resume(from_release=)` accepted a final or derived release,
+  or a collected checkpoint, and failed only at `restore`; they now refuse
+  it before opening anything. `derive` returns an existing derivation even
+  once its checkpoint is collected, as documented (#41).
 
 ### Verified
 

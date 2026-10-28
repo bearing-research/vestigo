@@ -3,7 +3,7 @@
     uv run python examples/torch/train.py ledger
     uv run python examples/torch/branch.py ledger --lr 1e-3
 
-A branch starts from any accepted release. Its computation names that release, so it
+A branch starts from any accepted checkpoint. Its computation names that release, so it
 never deduplicates against the run it came from; its program (the same model under a
 lower learning rate) is a different node over the same model node.
 """
