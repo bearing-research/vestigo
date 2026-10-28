@@ -48,6 +48,14 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Documentation
 
+- `docs/ledger.md`, the guide to the ledger: opening one on SQLite or
+  Postgres and a blob backend, storing and finding a result by provenance,
+  names and aliases, lineage and the structural graph, builds and attempts,
+  releases with resume and typed operations, retention. `examples/ledger/`
+  has `cache.py` (three steps computed once, named, traced) and
+  `releases.py` (checkpoints, a stalled worker fenced by a resume, a head
+  moved by compare-and-set, a final release); `tests/test_examples.py` runs
+  them (#35).
 - `docs/torch.md`, the guide to `vestigo.torch`, and `examples/torch/`: a
   run that stops, resumes in the same execution and records its exported
   forward pass; a branch that fine-tunes from the best epoch; two ranks under

@@ -40,6 +40,10 @@ was written under.
 
 ## API
 
+[`docs/ledger.md`](docs/ledger.md) is the guide to the ledger, with runnable
+scripts in [`examples/ledger/`](examples/ledger/); [`docs/torch.md`](docs/torch.md)
+is the PyTorch adapter's.
+
 The package exports nothing at its top level; a consumer imports each module.
 
 - `vestigo.store`: `ArtifactStore(artifact_dir, blob_store=None, dialect=None,
