@@ -653,7 +653,7 @@ def test_an_exported_program_is_recorded_with_its_scope_and_versions(ledger: Led
             run.attempt,
         )
         [program] = params["programs"].values()
-        assert program["torch_version"] == torch.__version__.split("+")[0]
+        assert program["torch_version"] == torch.__version__
         assert program["schema_version"]["major"] >= 8
         assert "aten" in program["opset_version"]
         assert params["serialization_id"]
