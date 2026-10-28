@@ -70,6 +70,14 @@ All notable changes to vestigo are recorded here. The format follows
   forward pass; a branch that fine-tunes from the best epoch; two ranks under
   `torchrun`. The torch job runs the examples (#33).
 
+### Verified
+
+- `vestigo.torch` checkpoints on every object store: one test trains,
+  resumes and reloads through `RemoteBlobs` on S3 (MinIO, in place of moto),
+  GCS (fake-gcs-server) and Azure (Azurite), so the GCS and Azure paths of
+  `RemoteBlobs` and their `BlobSettings` run for the first time. The
+  emulators are `conftest.py` fixtures, one container of each per session (#37).
+
 ## 0.2.1 - 2026-10-27
 
 ### Fixed

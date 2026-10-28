@@ -17,10 +17,6 @@ from pathlib import Path
 import pytest
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ServiceRequestError
 from botocore.exceptions import ClientError, EndpointConnectionError
-from testcontainers.community.azurite import AzuriteContainer
-from testcontainers.core.container import DockerContainer
-from testcontainers.core.docker_client import DockerClient
-from testcontainers.core.wait_strategies import HttpWaitStrategy, LogMessageWaitStrategy
 
 from vestigo.blob_store import (
     AzureBlobStore,
@@ -31,17 +27,6 @@ from vestigo.blob_store import (
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
-MINIO_IMAGE = (
-    "cgr.dev/chainguard/minio"
-    "@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1"
-)
-FAKE_GCS_IMAGE = (
-    "fsouza/fake-gcs-server@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef"
-)
-AZURITE_IMAGE = (
-    "mcr.microsoft.com/azure-storage/azurite"
-    "@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5"
-)
 BUCKET = "vestigo-blobs"
 LARGE = os.urandom(1024) * (9 * 1024)  # 9 MiB: past the S3 multipart and GCS resumable thresholds
 
@@ -91,67 +76,28 @@ def _azure_endpoint(container) -> str:
     return f"http://{host}:{container.get_exposed_port(container.blob_service_port)}"
 
 
-@pytest.fixture(scope="module")
-def minio_endpoint(docker_daemon):
-    # Not testcontainers' MinioContainer: that imports the minio client package.
-    container = (
-        DockerContainer(MINIO_IMAGE)
-        .with_env("MINIO_ROOT_USER", "minioadmin")
-        .with_env("MINIO_ROOT_PASSWORD", "minioadmin")
-        .with_command("server /data --address :9000")
-        .with_exposed_ports(9000)
-        .waiting_for(HttpWaitStrategy(9000, "/minio/health/live"))
-    )
-    with container:
-        endpoint = f"http://{container.get_container_host_ip()}:{container.get_exposed_port(9000)}"
-        _minio_store(endpoint)._client.create_bucket(Bucket=BUCKET)
-        yield endpoint
+# The containers are conftest's, one per session; this module makes its bucket in each.
 
 
 @pytest.fixture(scope="module")
 def minio(minio_endpoint):
-    return _minio_store(minio_endpoint)
-
-
-@pytest.fixture(scope="module")
-def fake_gcs_endpoint(docker_daemon):
-    # A resumable upload's session URL is built from the external URL, so the port is
-    # chosen here and bound explicitly rather than mapped at random.
-    host = DockerClient().host()
-    port = _free_port()
-    container = (
-        DockerContainer(FAKE_GCS_IMAGE)
-        .with_bind_ports(4443, port)
-        .with_command(
-            f"-scheme http -port 4443 -external-url http://{host}:{port} -public-host {host}:{port}"
-        )
-        .waiting_for(LogMessageWaitStrategy("server started"))
-    )
-    with container:
-        endpoint = f"http://{host}:{port}"
-        _gcs_store(endpoint)._client.create_bucket(BUCKET)
-        yield endpoint
+    store = _minio_store(minio_endpoint)
+    store._client.create_bucket(Bucket=BUCKET)
+    return store
 
 
 @pytest.fixture(scope="module")
 def fake_gcs(fake_gcs_endpoint):
-    return _gcs_store(fake_gcs_endpoint)
-
-
-@pytest.fixture(scope="module")
-def azurite_container(docker_daemon):
-    # The SDK speaks a newer API version than the emulator admits to; the check is skipped.
-    container = AzuriteContainer(AZURITE_IMAGE).with_command(
-        "azurite --skipApiVersionCheck --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0"
-    )
-    with container:
-        _azure_store(container)._client.create_container()
-        yield container
+    store = _gcs_store(fake_gcs_endpoint)
+    store._client.create_bucket(BUCKET)
+    return store
 
 
 @pytest.fixture(scope="module")
 def azurite(azurite_container):
-    return _azure_store(azurite_container)
+    store = _azure_store(azurite_container)
+    store._client.create_container()
+    return store
 
 
 @pytest.fixture(params=["minio", "fake_gcs", "azurite"])
