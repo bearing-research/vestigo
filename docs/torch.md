@@ -118,7 +118,10 @@ How the old process ended decides when you can resume:
   lapses a resume starts it over, in the same execution.
 
 Once a new attempt holds the execution, the old process is fenced. Its saves are
-refused, and so are its `set_head`, `observe` and `finish` calls.
+refused, and so are its `set_head`, `observe` and `finish` calls. A process that stalls
+past `lease_seconds` without renewing (a long pause, a database locked throughout) is
+fenced the same way, even if nothing took over: a lapsed lease is never renewed, so
+resume the execution in a new process.
 
 `finish()` completes the execution, and nothing resumes it after that. `find` returns
 only unfinished executions, so the same computation started again after a finish is a

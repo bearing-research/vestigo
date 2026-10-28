@@ -553,7 +553,7 @@ class TestLeases:
         assert build_store.claim_build(build_id, owner, lease_duration_seconds=seconds)
         return build_id
 
-    def test_a_lapsed_lease_is_listed_oldest_first_and_still_renewable(self, build_store, clock):
+    def test_a_lapsed_lease_is_listed_oldest_first_and_never_renewed(self, build_store, clock):
         later = self._building(build_store, seconds=120.0)
         sooner = self._building(build_store, seconds=60.0)
         live = self._building(build_store, seconds=600.0)
@@ -564,11 +564,16 @@ class TestLeases:
         assert [b.build_id for b in build_store.list_expired_leases(limit=1)] == [sooner]
         assert build_store.get_build(live).lease_expires_at > clock()
 
-        # No expiry check: the owner that merely stalled keeps its build by renewing.
-        assert build_store.renew_lease(sooner, "runner-a", 60.0)
-        assert build_store.get_build(sooner).lease_expires_at == clock() + 60.0
-        assert [b.build_id for b in build_store.list_expired_leases()] == [later]
-        assert not build_store.renew_lease(later, "runner-b", 60.0)
+        # An owner that merely stalled has lost its build: a reclaim may be on its way.
+        expired_at = build_store.get_build(sooner).lease_expires_at
+        assert not build_store.renew_lease(sooner, "runner-a", 60.0)
+        assert build_store.get_build(sooner).lease_expires_at == expired_at
+        assert [b.build_id for b in build_store.list_expired_leases()] == [sooner, later]
+        assert build_store.renew_lease(live, "runner-a", 60.0)
+        assert build_store.get_build(live).lease_expires_at == clock() + 60.0
+        # Renewable up to and at its deadline, which a live check reads as live.
+        clock.now = build_store.get_build(live).lease_expires_at
+        assert build_store.renew_lease(live, "runner-a", 60.0)
 
     def test_a_live_lease_is_not_reclaimed(self, build_store, clock):
         build_id = self._building(build_store)
@@ -627,7 +632,11 @@ class TestLeases:
         }
         assert not build_store.reclaim_expired_build(external, "runner-b")
         assert build_store.get_build(external).attempt == "a1"
-        assert build_store.renew_lease(external, "notebook", 60.0)
+        # The consumer goes on in a new attempt; the lapsed one is not renewed.
+        assert not build_store.renew_lease(external, "notebook", 60.0)
+        assert build_store.open_attempt(
+            external, "a2", writable_until=clock() + 3600, lease_owner="notebook"
+        )
 
         clock.now += 120
         assert build_store.reclaim_expired_build(external, "notebook-2", dispatch="external")

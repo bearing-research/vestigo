@@ -168,8 +168,10 @@ says the caller runs the work itself. The default, `runner`, lists the build for
 runner that claims it (`list_runnable_builds`, `claim_build`).
 
 An attempt holds the build under a lease, which the worker renews with
-`builds.renew_lease(build_id, lease_owner)` well inside its duration. `writable_until`
-bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
+`builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
+lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
+and its releases are rejected, so the build goes on only in a new attempt (a resume)
+or a reclaim. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
 build again after a crash.
 
 ## Releases
