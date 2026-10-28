@@ -10,6 +10,7 @@ ledger. You keep training with
 - branches that start a new run from any accepted checkpoint;
 - named heads, such as the best epoch so far;
 - reads that serve only accepted checkpoints and check every byte against its digest;
+- signed checkpoints that a separate job verifies before it loads or ships them;
 - metadata on SQLite or Postgres, bytes on local disk, S3, GCS or Azure;
 - one checkpoint across every rank of a distributed job.
 
@@ -278,46 +279,147 @@ timestamps. Like a save, `observe` needs the lease.
 ## Signed checkpoints
 
 torch-checkpointing deserializes every file with `torch.load(..., weights_only=False)`
-and its metadata with `pickle`, so loading a tampered checkpoint runs whatever the
-tamperer put in it. Every load checks each file's sha256 against the digest recorded
-when the checkpoint was accepted, before any of it is deserialized. That stops anyone
-who can write only the blob store.
+and its metadata with `pickle`. Loading a tampered checkpoint therefore runs whatever
+the tamperer put in it, and a subtler change (a shifted weight) loads and serves
+without anyone noticing. Signing lets a job that loads checkpoints prove that the
+training job wrote them, whoever else can write the stores.
 
-Someone who can also write the metadata database could rewrite the recorded digest
-along with the bytes. Against that, sign:
+### What each check stops
+
+Every load checks each file's sha256 before any of it is deserialized. Without a key,
+the digest it checks against is the one the database recorded when the checkpoint was
+accepted. With a verify key, it is the one in the manifest the training job signed.
+
+| Who can write | Without signing | With signing |
+| --- | --- | --- |
+| the bucket (an object PUT) | refused: the bytes differ from the recorded digest | refused |
+| the bucket and the database (a PUT and an UPDATE) | **loaded**: the forger rewrites the recorded digest too | refused: the signed manifest names the old digest, and rewriting it breaks the signature |
+| the database only, pointing a head or a resume at an older checkpoint | loaded | **loaded**: the older checkpoint is genuinely signed |
+| whoever holds the signing key | loaded | **loaded** |
+
+So signing protects you against a compromised or careless store. It does not protect
+you against the training job itself or a stolen key, and it says nothing about which
+signed checkpoint is the newest.
+
+### A promotion gate, end to end
+
+The usual setup is two jobs. A training job holds the signing key. A gate (an
+evaluation, an export, a deploy step) holds only the public key and loads the
+checkpoint before anything ships. The scripts in [`examples/torch/`](../examples/torch/)
+run it on one machine:
+
+```bash
+uv run python examples/torch/keys.py keys            # keys/signing.key (0600), keys/verify.key
+uv run python examples/torch/train.py ledger --signing-key keys/signing.key
+uv run python examples/torch/evaluate.py ledger --verify-key keys/verify.key \
+    --out model.safetensors                          # verified, scored, shipped
+```
+
+To see what the signature catches, run the drill. `tamper.py` does what an insider
+with bucket and database access could do. It shifts one bias of the best checkpoint's
+model file, by little enough that the held-out score barely moves, and rewrites the
+digest the database records for it:
+
+```bash
+uv run python examples/torch/tamper.py ledger
+uv run python examples/torch/evaluate.py ledger --out forged.safetensors     # ships the forgery
+uv run python examples/torch/evaluate.py ledger --verify-key keys/verify.key \
+    --out model.safetensors                          # refused, nothing written
+```
+
+The gate writes safetensors rather than a pickle, so the server that loads the
+weights unpickles nothing.
+
+### Keys
+
+A key is 32 raw bytes. `keys.py` writes each one as hex:
 
 ```python
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 key = Ed25519PrivateKey.generate()
-signing_key = key.private_bytes_raw()  # 32 bytes; keep it in a secret store
-verify_key = key.public_key().public_bytes_raw()
-
-ledger = Ledger("ledger", signing_key=signing_key)  # the training job
-reader = Ledger("ledger", verify_key=verify_key)  # an evaluation job, another team
+signing_key = key.private_bytes_raw()  # secret: the training job only
+verify_key = key.public_key().public_bytes_raw()  # public: every job that loads
 ```
 
-With a signing key, rank 0 signs each checkpoint's manifest as it accepts it. The
-signature covers the execution, the attempt, the step, the release id, the
-computation key, and every file's id, version, size and digest. A ledger with a
-verify key (a signing ledger verifies with its own public half) loads a file only when
-all of these hold:
+- **The signing key** belongs in a secret manager, and reaches the training job as a
+  mounted file or an environment variable. Read it with `bytes.fromhex(...)`, as
+  `train.py --signing-key` does. It never appears in a `LedgerConfig`'s repr.
+- **The verify key** is public. Commit it beside the gate's configuration, or put it
+  in the job's environment.
+- **One key per trust boundary**, such as one per team or per project. Every job that
+  holds the signing key can produce checkpoints the gate accepts.
 
-- the manifest's signature verifies;
-- the manifest names this checkpoint, so one signed for another step is refused;
-- the manifest lists this file as this version;
-- the bytes match the manifest's digest, not the database's.
+### The training job
 
-An unsigned checkpoint, or one signed with another key, is refused with `OSError`.
+```python
+ledger = Ledger("ledger", signing_key=bytes.fromhex(Path("/secrets/signing.key").read_text()))
+```
 
-A reader with only the verify key cannot sign, so the checkpoints its own runs save
-are unsigned, and it refuses to load them. A run that saves needs the signing key.
-The key travels with `Checkpoints` to every rank and to the async writer, so give it
-to the training job and never to readers.
+Nothing else changes. Rank 0 signs each checkpoint's manifest as it accepts it, and
+the signature covers the execution, the attempt, the step, the release id, the
+computation key, and every file's id, version, size and digest. A signing ledger also
+verifies its own loads with its own public key, so a resume or branch refuses a
+checkpoint that was changed after it was signed.
 
-Signing proves who wrote a checkpoint, not that it is the newest. Someone who can
-write the database can still point a resume at an older checkpoint that is genuinely
-signed. Derived releases and observations are not signed.
+The key goes wherever the ledger's description goes:
+
+- to every rank, inside the `Checkpoints` that rank 0 broadcasts over the process
+  group;
+- to the async writer subprocess, pickled.
+
+Treat every machine in the training job as holding the key.
+
+### Jobs that only load
+
+A gate needs no run. `ledger.configure` points a `CheckpointManager.Config` at a
+storage that loads and refuses to save. It holds no lease, and opens no execution:
+
+```python
+reader = Ledger("ledger", verify_key=bytes.fromhex(Path("verify.key").read_text()))
+release_id, _ = reader.releases.reference("regression/best")
+manager = reader.configure(CheckpointManager.Config.with_sync_save()).build()
+try:
+    state = manager.load(reader.checkpoint_id(release_id), into={"model": model.state_dict()})
+except OSError as exc:
+    raise SystemExit(f"refused {release_id}: {exc}")
+finally:
+    manager.close()
+```
+
+A ledger with only the verify key cannot sign. If such a ledger opens a run, that
+run's saves are unsigned, and its own loads refuse them. Give a job that trains the
+signing key.
+
+### When a load is refused
+
+Each refusal is an `OSError`, raised before any of the file is deserialized:
+
+| Message | Means |
+| --- | --- |
+| `... is not signed` | the training job ran without a signing key, or the checkpoint predates signing |
+| `the signature on ... does not verify` | it was signed with another key (a rotation, another team), or its manifest was rewritten |
+| `the manifest of ... is signed for another checkpoint` | another checkpoint's genuine manifest was copied into this one |
+| `the signed manifest of ... does not name ...` | a file was added, or swapped for another version |
+| `... differs from the checkpoint the ledger accepted` | the bytes are not the ones that were signed |
+
+### Rotating a key
+
+A ledger verifies with one key. After a rotation, train new runs with the new signing
+key and verify them with the new public key. Keep the old public key for as long as
+anything must still load checkpoints signed with it: a gate that reads an old head
+opens a `Ledger` with the old key. Collect or re-run what you no longer trust. A
+checkpoint is never re-signed, because versions are immutable.
+
+### What is not signed
+
+- **Which checkpoint is current.** Heads, `final_checkpoint` and resume targets are
+  database rows, so a database writer can point them at an older, genuinely signed
+  checkpoint. When it matters which one ships, have the training job report the
+  release id it finished on through a channel the database cannot rewrite (its job
+  log, a CI output), and have the gate load that id rather than a head.
+- **Derived releases and observations.** These go through `Ledger.derive` and
+  `Run.observe`, and are checked against the database's digests only.
 
 ## What the storage refuses
 

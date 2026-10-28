@@ -9,6 +9,11 @@ deleting after each epoch every checkpoint but the newest one and the best.
 The lowest-loss epoch is the reference ``regression/best``, which ``branch.py``
 fine-tunes from. Before finishing, the run records the model's exported forward pass;
 after, an evaluation of the last checkpoint is a release derived from it.
+
+    uv run python examples/torch/train.py ledger --signing-key keys/signing.key
+
+With a signing key (``keys.py`` makes one), every checkpoint's manifest is signed, and
+``evaluate.py`` with the public key loads only what this job signed.
 """
 
 from __future__ import annotations
@@ -40,7 +45,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--crash-at", type=int, help="stop after saving this epoch")
     parser.add_argument("--keep", type=int, help="checkpoints to keep beyond the heads")
+    parser.add_argument("--signing-key", type=Path, help="a hex Ed25519 private key file")
     args = parser.parse_args()
+    signing_key = bytes.fromhex(args.signing_key.read_text()) if args.signing_key else None
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
@@ -48,7 +55,7 @@ def main() -> None:
     shuffle = torch.Generator().manual_seed(2)
     x, y = data()
 
-    with Ledger(args.ledger) as ledger:
+    with Ledger(args.ledger, signing_key=signing_key) as ledger:
         program = ledger.define_program(
             ledger.define_model(model, version="regression-v1"),
             loss=nn.MSELoss(),
