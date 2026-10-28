@@ -43,10 +43,11 @@ The package has no required dependency. `vestigo[postgres]` brings psycopg,
 `[s3]` boto3, `[gcs]` google-cloud-storage, `[azure]` the Azure SDKs; a
 backend asked for without its extra raises one `ImportError` naming it.
 `[torch]` pins the torch and `torch-checkpointing` that `vestigo.torch` is
-tested against (CPU wheels from the PyTorch index in development); the module
-itself imports neither, so ty and CI's matrix run without them
-(`--no-extra torch`, `--ignore=tests/test_torch.py`) and a separate `torch`
-job runs `tests/test_torch.py`.
+built on (CPU wheels from the PyTorch index in development); importing the
+module without them raises one `ImportError` naming the extra. CI's matrix runs
+without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
+job installs it for ty, and a separate `torch` job runs `tests/test_torch.py`
+on SQLite, Postgres and S3 (moto), one rank and two.
 
 ## Build & Development
 
@@ -77,7 +78,7 @@ containers on the runner. ty checks `src` only.
 | `provenance` | `TransformSpec`, `compute_provenance_hash`, `derive_subkey` and the labelled output keys |
 | `uris` | the URI grammar and the per-process scheme (`set_uri_scheme`, default `vestigo`) |
 | `tables`, `file_modes` | the tables the ledger owns in copy order; private directory and file modes |
-| `torch` | the PyTorch adapter: model and program nodes, executions as builds, each `torch_checkpointing` checkpoint a release of its files under a manifest, accepted from `finalize_callback` under the run's lease |
+| `torch` | the PyTorch adapter: model and program nodes, executions as builds, `LedgerStorage` (`torch_checkpointing`'s storage over the ledger: each file a `building` version before its bytes, any blob backend), each checkpoint a release of every rank's report under a manifest, accepted by rank 0 after the barrier under the run's lease |
 
 The README's API section is the public surface; keep it in step when a
 module gains an entry point.

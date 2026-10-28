@@ -22,9 +22,8 @@ jobs:
         with:
           python-version: "3.12"
           version: "latest"
-      # ty resolves the extras' SDKs through the project venv; vestigo.torch imports
-      # nothing of torch, so that extra stays out.
-      - run: uv sync --all-extras --no-extra torch --locked
+      # ty resolves the extras' SDKs through the project venv, torch's (CPU) included.
+      - run: uv sync --all-extras --locked
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/pre-commit
@@ -75,6 +74,9 @@ jobs:
         with:
           python-version: "3.12"
           version: "latest"
-      # CPU torch, from the index pyproject.toml names for it.
-      - run: uv sync --extra torch --locked
+      # CPU torch, from the index pyproject.toml names for it; Postgres and S3 (moto)
+      # for the ledgers the adapter writes to.
+      - run: uv sync --extra torch --extra postgres --extra s3 --locked
       - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py
+        env:
+          VESTIGO_REQUIRE_DOCKER: "1"
