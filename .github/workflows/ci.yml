@@ -76,7 +76,7 @@ jobs:
           version: "latest"
       # CPU torch, from the index pyproject.toml names for it; Postgres and the three
       # object stores (their emulators, in Docker) for the ledgers the adapter writes to.
-      - run: uv sync --extra torch --extra postgres --extra s3 --extra gcs --extra azure --locked
+      - run: uv sync --extra torch --extra sign --extra postgres --extra s3 --extra gcs --extra azure --locked
       - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py
         env:
           VESTIGO_REQUIRE_DOCKER: "1"

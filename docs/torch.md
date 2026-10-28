@@ -15,6 +15,7 @@ ledger. You keep training with
 
 ```bash
 uv add "vestigo[torch]"   # torch and the pinned torch-checkpointing
+uv add "vestigo[torch,sign]"  # and Ed25519 signatures on checkpoints
 ```
 
 The scripts in [`examples/torch/`](../examples/torch/) run everything below, and the
@@ -273,6 +274,50 @@ An observation never changes a node, so the model's and program's ids stay the s
 The same program exported again under the same scope and coverage is one version: the
 comparison covers its graph, weights and constants, not its example inputs or the zip's
 timestamps. Like a save, `observe` needs the lease.
+
+## Signed checkpoints
+
+torch-checkpointing deserializes every file with `torch.load(..., weights_only=False)`
+and its metadata with `pickle`, so loading a tampered checkpoint runs whatever the
+tamperer put in it. Every load checks each file's sha256 against the digest recorded
+when the checkpoint was accepted, before any of it is deserialized. That stops anyone
+who can write only the blob store.
+
+Someone who can also write the metadata database could rewrite the recorded digest
+along with the bytes. Against that, sign:
+
+```python
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+key = Ed25519PrivateKey.generate()
+signing_key = key.private_bytes_raw()  # 32 bytes; keep it in a secret store
+verify_key = key.public_key().public_bytes_raw()
+
+ledger = Ledger("ledger", signing_key=signing_key)  # the training job
+reader = Ledger("ledger", verify_key=verify_key)  # an evaluation job, another team
+```
+
+With a signing key, rank 0 signs each checkpoint's manifest as it accepts it. The
+signature covers the execution, the attempt, the step, the release id, the
+computation key, and every file's id, version, size and digest. A ledger with a
+verify key (a signing ledger verifies with its own public half) loads a file only when
+all of these hold:
+
+- the manifest's signature verifies;
+- the manifest names this checkpoint, so one signed for another step is refused;
+- the manifest lists this file as this version;
+- the bytes match the manifest's digest, not the database's.
+
+An unsigned checkpoint, or one signed with another key, is refused with `OSError`.
+
+A reader with only the verify key cannot sign, so the checkpoints its own runs save
+are unsigned, and it refuses to load them. A run that saves needs the signing key.
+The key travels with `Checkpoints` to every rank and to the async writer, so give it
+to the training job and never to readers.
+
+Signing proves who wrote a checkpoint, not that it is the newest. Someone who can
+write the database can still point a resume at an older checkpoint that is genuinely
+signed. Derived releases and observations are not signed.
 
 ## What the storage refuses
 
