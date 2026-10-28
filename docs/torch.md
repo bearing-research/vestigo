@@ -142,6 +142,35 @@ it came from, or against another branch of the same release.
 the ledger, so give each one a prefix (`regression/best`). A head keeps its release
 through every collection.
 
+## Derived releases
+
+An export, evaluation metrics or an inference package is computed once a checkpoint
+has been accepted, so it cannot join that checkpoint's release. It becomes a release
+of its own, derived from it:
+
+```python
+evaluation = ledger.derive(
+    release_id,
+    "eval",
+    {"metrics": json.dumps(metrics).encode(), "weights": Path("export.safetensors")},
+)
+ledger.derived(release_id, "eval")  # the same ReleaseBundle, found again
+```
+
+`outputs` maps a label to bytes or a file. The outputs become current together, as
+the final release of a small build of their own. Each output's spec names the
+checkpoint it came from (`params["from"]`), and that is the only edge. It is not an
+input, so keeping a derived release (a head, a pin) keeps only its own outputs, never
+the optimizer state of the checkpoint behind it. `collect` leaves derived releases
+alone, and `derived` still finds one after its checkpoint is gone.
+
+Deriving the same name from the same checkpoint again returns the release already
+there and stores nothing. The outputs' ids are per execution and name
+(`torch_<execution>@derived=eval@output=metrics`), so a derivation from a later
+checkpoint becomes their current value, and the earlier versions stay readable until
+`garbage_collect(keep_superseded=)` trims them. `train.py` derives an evaluation of
+the checkpoint it finished on.
+
 ## Keep the latest checkpoints
 
 Every save stores a full copy of what you pass it, and nothing is deleted until you

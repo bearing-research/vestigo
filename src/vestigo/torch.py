@@ -76,6 +76,7 @@ from vestigo.store import ArtifactStore, ArtifactVersion, BuildLeaseLost, Staged
 logger = logging.getLogger(__name__)
 
 EXECUTOR = "vestigo.torch/train@v1"
+DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
 MODEL_DOMAIN = "torch/model"
 PROGRAM_DOMAIN = "torch/training-program"
 # The root of every checkpoint id; a path under it names no file on any disk.
@@ -511,6 +512,114 @@ class Ledger:
             if step == at.step and bundle.release.attempt == at.attempt:
                 return {v.params["file"]: v for v in bundle.outputs if "file" in v.params}
         return None
+
+    # --- Derived releases ---
+
+    def derive(
+        self, from_release: str, name: str, outputs: Mapping[str, bytes | Path]
+    ) -> ReleaseBundle:
+        """Publish what was computed from an accepted checkpoint as a release of its own.
+
+        An export, evaluation metrics, an inference package: made once the checkpoint
+        was accepted, so never part of it. *outputs* maps a label to the bytes or a
+        file. They become current together, as the final release of a build keyed by
+        the checkpoint's release and *name*, which each output's spec names (``from``).
+        That is the only edge: it is not an input, so keeping a derived release keeps
+        only its own outputs, never the checkpoint. Deriving *name* from the same
+        checkpoint again returns the release already there and stores nothing.
+
+        Raises:
+            ValueError: *from_release* is not an accepted checkpoint, or *name* or
+                *outputs* is empty.
+        """
+        if not name or not outputs or not all(outputs):
+            raise ValueError("a derived release needs a name and labelled outputs")
+        execution_id = self.checkpoint_id(from_release).split("/")[1]
+        key, spec = self._derivation(from_release, name)
+        existing = self.derived(from_release, name)
+        if existing is not None:
+            return existing
+
+        build_id = uuid.uuid4().hex
+        placeholder = f"torch_{build_id}"
+        target = self.store.create_artifact(
+            placeholder,
+            run_output_key(key, build_id, "derived"),
+            spec,
+            minted=True,
+            computation_key=key,
+        )
+        self.builds.create_build(
+            build_id,
+            placeholder,
+            target,
+            executor_ref=DERIVE_EXECUTOR,
+            params=spec.params,
+            computation_key=key,
+            dispatch="external",
+        )
+        attempt = uuid.uuid4().hex
+        self.builds.open_attempt(
+            build_id,
+            attempt,
+            writable_until=time.time() + self.config.writable_seconds,
+            lease_owner=attempt,
+            lease_duration_seconds=self.lease_seconds,
+        )
+        release = self.releases.prepare(build_id, attempt, "final")
+        created: list[tuple[str, int]] = []
+        try:
+            staged = []
+            for label, value in outputs.items():
+                artifact_id = (
+                    f"torch_{execution_id}@derived={quote(name, safe='')}"
+                    f"@output={quote(label, safe='')}"
+                )
+                version = self.store.create_artifact(
+                    artifact_id,
+                    derive_subkey(key, f"output={quote(label, safe='')}"),
+                    TransformSpec(DERIVE_EXECUTOR, {**spec.params, "output": label}, []),
+                    computation_key=key,
+                    release_id=release.release_id,
+                )
+                created.append((artifact_id, version))
+                if isinstance(value, Path):
+                    size, digest = _file_digest(value)
+                    self.store.publish_blob_from_path(artifact_id, version, value)
+                    staged.append(StagedVersion(artifact_id, version, "", None, size, digest))
+                else:
+                    staged.append(self._write_small(artifact_id, version, value))
+            # Nothing resumes a derivation, so its lease need only be live at acceptance,
+            # however long the uploads took.
+            self.builds.renew_lease(build_id, attempt, self.lease_seconds)
+            return self.releases.accept(release.release_id, staged)
+        except BaseException:
+            self.releases.abandon(release.release_id, attempt)
+            for artifact_id, version in created:
+                self.store.fail_artifact(artifact_id, version)
+            self.builds.fail_build(build_id, "derivation failed", lease_owner=attempt)
+            raise
+
+    def derived(self, from_release: str, name: str) -> ReleaseBundle | None:
+        """The release derived from *from_release* under *name*, or None.
+
+        Found by the derivation's key alone, so still once the checkpoint is collected.
+        """
+        key, _ = self._derivation(from_release, name)
+        stored = [v for v in self.store.versions_of_computation(key) if v.release_id]
+        if not stored:
+            return None
+        # Two racing derivations: the later holds the outputs ready, the earlier superseded.
+        stored.sort(key=lambda v: v.state != "ready")
+        release_id = stored[0].release_id
+        assert release_id is not None
+        return self.releases.bundle(release_id)
+
+    @staticmethod
+    def _derivation(from_release: str, name: str) -> tuple[str, TransformSpec]:
+        """The key and spec of *name* derived from a release; its id is unique, so enough."""
+        spec = TransformSpec(DERIVE_EXECUTOR, {"from": from_release, "name": name}, [])
+        return compute_provenance_hash([], spec), spec
 
     # --- Retention ---
 

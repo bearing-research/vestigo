@@ -16,6 +16,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -479,6 +480,143 @@ def test_a_run_that_ends_before_a_checkpoint_fails(ledger: Ledger):
 
     assert ledger.builds.get_build(run.execution_id).state == "failed"
     assert ledger.find(trainer.program) is None
+
+
+# --- Derived releases ---
+
+
+def _manifest(ledger: Ledger, release_id: str):
+    [manifest] = [v for v in ledger.releases.bundle(release_id).outputs if v.params.get("manifest")]
+    return manifest
+
+
+def _export(trainer: Trainer, tmp_path: Path) -> Path:
+    path = tmp_path / "export.pt"
+    torch.save(trainer.model.state_dict(), path)
+    return path
+
+
+def test_a_derived_release_holds_its_outputs_linked_to_the_checkpoint(
+    ledger: Ledger, tmp_path: Path
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+        source = run.release_of(2).release_id
+        export = _export(trainer, tmp_path)
+
+        bundle = ledger.derive(source, "eval", {"metrics": b'{"loss": 0.1}', "weights": export})
+
+    assert (bundle.release.kind, bundle.release.state) == ("final", "accepted")
+    outputs = {v.params["output"]: v for v in bundle.outputs}
+    assert ledger.store.read_blob(outputs["metrics"].id, 1) == b'{"loss": 0.1}'
+    assert ledger.store.read_blob(outputs["weights"].id, 1) == export.read_bytes()
+    # Named by the spec, not an input: nothing walks from an output to the checkpoint.
+    assert {v.params["from"] for v in bundle.outputs} == {source}
+    assert all(v.input_versions in (None, "{}") for v in bundle.outputs)
+    assert ledger.derived(source, "eval").release == bundle.release
+    assert ledger.derived(source, "export") is None
+
+
+def test_deriving_the_same_name_again_stores_nothing(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+    source = run.release_of(1).release_id
+    first = ledger.derive(source, "eval", {"metrics": b"1"})
+
+    again = ledger.derive(source, "eval", {"metrics": b"2"})
+
+    assert again.release == first.release
+    [version] = ledger.store.list_versions_by_id_prefix(first.outputs[0].id)
+    assert ledger.store.read_blob(version.id, version.version) == b"1"
+
+
+def test_a_later_checkpoint_s_derivation_is_the_output_s_current_value(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+    one = ledger.derive(run.release_of(1).release_id, "eval", {"metrics": b"1"})
+    two = ledger.derive(run.release_of(2).release_id, "eval", {"metrics": b"2"})
+
+    assert one.release != two.release and one.outputs[0].id == two.outputs[0].id
+    current = ledger.store.get_latest_version(one.outputs[0].id)
+    assert (current.version, current.release_id) == (2, two.release.release_id)
+
+
+def test_keeping_a_derived_release_does_not_keep_its_checkpoint(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+        steps = _steps(ledger, run)
+        run.finish()
+    source = run.release_of(1).release_id
+    derived = ledger.derive(source, "eval", {"metrics": b"1"})
+    [output] = derived.outputs
+    ledger.store.retain(output.id, output.version, kind="pin", holder="report")
+    manifest = _manifest(ledger, source)
+
+    ledger.collect(keep=1)
+
+    assert _stored(ledger, steps) == [3]
+    assert ledger.store.get_artifact(manifest.id, manifest.version) is None
+    assert ledger.store.read_blob(output.id, output.version) == b"1"
+    assert ledger.derived(source, "eval").release == derived.release
+
+
+def test_only_an_accepted_checkpoint_is_derived_from(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        run.finish()
+    final = ledger.releases.latest_accepted(run.execution_id, "final")
+
+    for release_id in (final.release_id, "no-such-release"):
+        with pytest.raises(ValueError, match="not an accepted checkpoint"):
+            ledger.derive(release_id, "eval", {"metrics": b"1"})
+    with pytest.raises(ValueError, match="labelled outputs"):
+        ledger.derive(run.release_of(1).release_id, "eval", {})
+
+
+def test_a_derivation_that_fails_leaves_nothing_current(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+    source = run.release_of(1).release_id
+
+    def full(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ArtifactStore, "publish_blob_from_path", full)
+    with pytest.raises(OSError):
+        ledger.derive(source, "eval", {"metrics": b"1", "weights": _export(trainer, tmp_path)})
+
+    assert ledger.derived(source, "eval") is None
+    staged = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@derived=")
+    assert staged and {v.state for v in staged} == {"failed"}
+
+
+def test_a_derivation_slower_than_its_lease_is_still_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    with Ledger(tmp_path / "ledger", lease_seconds=0.2) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+        real = ArtifactStore.publish_blob_from_path
+
+        def slow(self, *args, **kwargs):
+            time.sleep(0.5)  # an upload outlasting the lease
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(ArtifactStore, "publish_blob_from_path", slow)
+        bundle = ledger.derive(
+            run.release_of(1).release_id, "export", {"weights": _export(trainer, tmp_path)}
+        )
+
+        assert bundle.release.state == "accepted"
 
 
 # --- Retention ---
@@ -965,6 +1103,9 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
         manifests = ledger.store.list_versions_by_id_prefix(f"torch_{execution}@")
         kept = {v.release_id for v in manifests if v.params.get("manifest")}
         assert kept == {final, head[0]}
+        evaluation = ledger.derived(final, "eval")
+        assert evaluation is not None
+        assert evaluation.release.release_id == _said(resumed, r"as release (\w+)")
 
     branched = _example("branch.py", root, "--epochs=1")
     assert branched.returncode == 0, branched.stderr

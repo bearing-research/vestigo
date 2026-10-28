@@ -7,12 +7,14 @@ The first command stops after epoch 3; the second finds that run again by its
 computation (the program and its inputs), resumes it from epoch 3 and finishes it,
 deleting after each epoch every checkpoint but the newest one and the best.
 The lowest-loss epoch is the reference ``regression/best``, which ``branch.py``
-fine-tunes from. Before finishing, the run records the model's exported forward pass.
+fine-tunes from. Before finishing, the run records the model's exported forward pass;
+after, an evaluation of the last checkpoint is a release derived from it.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -117,6 +119,14 @@ def main() -> None:
             final = ledger.final_checkpoint(run.execution_id)
             assert final is not None
             print(f"finished {run.execution_id} on release {final.release_id}")
+
+            # Computed after the checkpoint was accepted, so a release of its own.
+            with torch.no_grad():
+                metrics = {"mse": nn.functional.mse_loss(model(x), y).item()}
+            evaluation = ledger.derive(
+                final.release_id, "eval", {"metrics": json.dumps(metrics).encode()}
+            )
+            print(f"derived eval {metrics} as release {evaluation.release.release_id}")
 
 
 if __name__ == "__main__":
