@@ -54,6 +54,17 @@ All notable changes to vestigo are recorded here. The format follows
   derived again returns the release already there; `Ledger.derived` finds it,
   also after the checkpoint is collected. A failed derivation fails its rows
   and build; one slower than its lease is still accepted (#36).
+- Signed checkpoints, behind a new `sign` extra (`cryptography`):
+  `Ledger(signing_key=)` has rank 0 sign each checkpoint's manifest with
+  Ed25519 as it accepts it, over the execution, attempt, step, release,
+  computation key and every file's id, version, size and digest. A ledger
+  with the verify key (`verify_key=`, or a signing ledger's own public half)
+  loads a file only once the signature verifies, the manifest names this
+  checkpoint and this file as this version, and the bytes match the
+  manifest's digest rather than the database's; unsigned or foreign
+  checkpoints are refused. torch-checkpointing unpickles what it loads, so a
+  writer of both the blob store and the metadata database can no longer
+  change what a load deserializes (#38).
 
 ### Documentation
 

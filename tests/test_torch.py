@@ -8,6 +8,7 @@ asynchronously, on one rank and on two (gloo, one process each).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import multiprocessing
@@ -26,13 +27,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from torch import nn
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 
 from vestigo.blob_store import BlobSettings
 from vestigo.releases import ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost
-from vestigo.torch import Checkpoints, Definition, Ledger, RemoteBlobs, Run, _archive_metadata
+from vestigo.torch import (
+    Checkpoints,
+    Definition,
+    Ledger,
+    RemoteBlobs,
+    Run,
+    _archive_metadata,
+    _canonical,
+)
 
 STEPS = 6
 
@@ -341,6 +351,148 @@ def test_a_load_refuses_bytes_that_differ_from_the_release(ledger: Ledger):
     with ledger.branch(trainer.program, release.release_id) as branch:
         with pytest.raises(OSError, match="differs from the checkpoint"):
             Trainer(ledger).restore(branch)
+
+
+# --- Signed checkpoints ---
+
+
+def _keypair() -> tuple[bytes, bytes]:
+    private = Ed25519PrivateKey.generate()
+    return private.private_bytes_raw(), private.public_key().public_bytes_raw()
+
+
+def _tamper(ledger: Ledger, run: Run, step: int) -> bytes:
+    """Rewrite step's model file and the digest its row records, as a database writer can."""
+    [model] = [v for v in _outputs(ledger, run, step) if v.params.get("file") == "model_0.pt"]
+    forged = io.BytesIO()
+    torch.save({k: torch.zeros_like(v) for k, v in _model().state_dict().items()}, forged)
+    data = forged.getvalue()
+    ledger.store.write_blob(model.id, model.version, data)
+    conn = ledger.store._get_connection()
+    try:
+        conn.execute(
+            "UPDATE artifact_versions SET content_sha256 = ?, byte_size = ? "
+            "WHERE id = ? AND version = ?",
+            (hashlib.sha256(data).hexdigest(), len(data), model.id, model.version),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return data
+
+
+def test_a_signed_checkpoint_resumes_and_a_reader_verifies_it(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        expected = _uninterrupted(ledger)
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as first:
+            trainer.train(first, 3)
+        with ledger.resume(first.execution_id) as resumed:
+            trainer = Trainer(ledger)
+            trainer.restore(resumed)
+            trainer.train(resumed, STEPS)
+            resumed.finish()
+        assert _same(trainer.weights(), expected)
+        source = first.release_of(3).release_id
+
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        with reader.branch(trainer.program, source) as branch:
+            Trainer(reader).restore(branch)
+
+
+def test_a_database_writer_cannot_change_a_signed_checkpoint(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+        _tamper(ledger, run, 1)
+        source = run.release_of(1).release_id
+
+    # Without a key the forgery loads: bytes and row agree.
+    with Ledger(tmp_path / "ledger") as unkeyed:
+        with unkeyed.branch(trainer.program, source) as branch:
+            fooled = Trainer(unkeyed)
+            fooled.restore(branch)
+            assert not any(w.any() for w in fooled.weights())
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        with reader.branch(trainer.program, source) as branch:
+            with pytest.raises(OSError, match="differs from the checkpoint"):
+                Trainer(reader).restore(branch)
+
+
+def test_a_rewritten_manifest_does_not_verify(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+        forged = _tamper(ledger, run, 1)
+        # The forger fixes the manifest too, keeping the old signature.
+        [manifest] = [v for v in _outputs(ledger, run, 1) if v.params.get("manifest")]
+        content = json.loads(ledger.store.read_blob(manifest.id, manifest.version))
+        for entry in content["files"]:
+            if entry["file"] == "model_0.pt":
+                entry["sha256"] = hashlib.sha256(forged).hexdigest()
+        ledger.store.write_blob(manifest.id, manifest.version, json.dumps(content).encode())
+        source = run.release_of(1).release_id
+
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        with reader.branch(trainer.program, source) as branch:
+            with pytest.raises(OSError, match="does not verify"):
+                Trainer(reader).restore(branch)
+
+
+def test_a_manifest_signed_for_another_step_is_refused(tmp_path: Path):
+    signing, verify = _keypair()
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 2)
+        # Step 2's genuine manifest and signature, put where step 1's was.
+        [one] = [v for v in _outputs(ledger, run, 1) if v.params.get("manifest")]
+        [two] = [v for v in _outputs(ledger, run, 2) if v.params.get("manifest")]
+        ledger.store.write_blob(one.id, one.version, ledger.store.read_blob(two.id, two.version))
+        source = run.release_of(1).release_id
+
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        with reader.branch(trainer.program, source) as branch:
+            with pytest.raises(OSError, match="signed for another checkpoint"):
+                Trainer(reader).restore(branch)
+
+
+def test_a_verifying_ledger_refuses_unsigned_and_foreign_checkpoints(tmp_path: Path):
+    with Ledger(tmp_path / "unsigned") as plain:
+        trainer = Trainer(plain)
+        with plain.start(trainer.program) as run:
+            trainer.train(run, 1)
+        unsigned = run.release_of(1).release_id
+    with Ledger(tmp_path / "unsigned", verify_key=_keypair()[1]) as reader:
+        with reader.branch(trainer.program, unsigned) as branch:
+            with pytest.raises(OSError, match="is not signed"):
+                Trainer(reader).restore(branch)
+
+    with Ledger(tmp_path / "signed", signing_key=_keypair()[0]) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+        signed = run.release_of(1).release_id
+    with Ledger(tmp_path / "signed", verify_key=_keypair()[1]) as stranger:
+        with stranger.branch(trainer.program, signed) as branch:
+            with pytest.raises(OSError, match="does not verify"):
+                Trainer(stranger).restore(branch)
+
+
+def test_keys_are_checked_and_the_private_one_is_never_shown(tmp_path: Path):
+    signing, verify = _keypair()
+    with pytest.raises(ValueError, match="public half"):
+        Ledger(tmp_path / "ledger", signing_key=signing, verify_key=_keypair()[1])
+    with pytest.raises(ValueError):
+        Ledger(tmp_path / "ledger", verify_key=b"short")
+    with Ledger(tmp_path / "ledger", signing_key=signing) as ledger:
+        assert ledger.config.verify_key == verify
+        assert signing.hex() not in repr(ledger.config) and repr(signing) not in repr(ledger.config)
 
 
 # --- Authority ---
@@ -784,7 +936,8 @@ def test_collect_takes_what_an_ended_attempt_staged_and_spares_a_live_one(
     reason="torch_checkpointing 0.1.1 stages for CUDA whenever an accelerator exists, MPS too",
 )
 def test_asynchronous_saves_release_in_order_and_resume(tmp_path: Path):
-    with Ledger(tmp_path / "ledger") as ledger:
+    # Signed: the key reaches the writer subprocess, which signs.
+    with Ledger(tmp_path / "ledger", signing_key=_keypair()[0]) as ledger:
         expected = _uninterrupted(ledger)
         trainer = Trainer(ledger)
         first = ledger.start(trainer.program)
@@ -867,7 +1020,12 @@ def _rank_main(rank: int, world: int, root: str, die_at: int | None) -> None:
     dist.init_process_group(
         "gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=world
     )
-    ledger = Ledger(Path(root) / "ledger") if rank == 0 else None
+    signing = Ed25519PrivateKey.generate()
+    ledger = (
+        Ledger(Path(root) / "ledger", signing_key=signing.private_bytes_raw())
+        if rank == 0
+        else None
+    )
     model = _model()
     run = None
     shared: list[object] = [None]
@@ -881,7 +1039,11 @@ def _rank_main(rank: int, world: int, root: str, die_at: int | None) -> None:
     config = checkpoints.configure(CheckpointManager.Config.with_sync_save())
     config.save.writer_config.checkpoint_write_barrier_timeout_sec = 5
     manager = config.build()
-    outcome: dict[str, object] = {"execution": checkpoints.execution_id, "saved": []}
+    outcome: dict[str, object] = {
+        "execution": checkpoints.execution_id,
+        "saved": [],
+        "verify_key": signing.public_key().public_bytes_raw().hex(),
+    }
     for step in (1, 2):
         if rank == 1 and step == die_at:
             os._exit(3)  # dies before writing: rank 0 never passes the barrier
@@ -924,6 +1086,12 @@ def test_two_ranks_make_one_release_from_rank_zero(tmp_path: Path):
                 "model_1.pt",
             }
             assert {v.params["rank"] for v in outputs if "rank" in v.params} == {0, 1}
+            # Rank 0 signed over both ranks' files.
+            [manifest] = [v for v in outputs if v.params.get("manifest")]
+            content = json.loads(ledger.store.read_blob(manifest.id, manifest.version))
+            assert {e["file"] for e in content["files"]} == {"model_0.pt", "model_1.pt"}
+            public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(outcome["verify_key"]))
+            public.verify(bytes.fromhex(content.pop("signature")), _canonical(content))
 
 
 def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):

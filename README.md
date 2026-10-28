@@ -109,7 +109,10 @@ The package exports nothing at its top level; a consumer imports each module.
   heads and a branch's source stay, and an ended attempt's staged files go.
   `Ledger.derive(from_release, name, outputs)` publishes what was computed
   from an accepted checkpoint (an export, evaluation metrics) as a release of
-  its own, which keeps only its own outputs; `Ledger.derived` finds it again. `Run.observe(exported_program,
+  its own, which keeps only its own outputs; `Ledger.derived` finds it again.
+  `Ledger(signing_key=)` (the `sign` extra) signs each checkpoint's manifest
+  with Ed25519 as rank 0 accepts it, and `verify_key=` makes every load check
+  the signature, the file's entry and its bytes before deserializing. `Run.observe(exported_program,
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
   node changes), `Ledger.observations` lists them.
@@ -122,6 +125,7 @@ The package exports nothing at its top level; a consumer imports each module.
 uv add vestigo            # or: pip install vestigo; no dependencies beyond the stdlib
 uv add "vestigo[postgres]"  # PostgreSQL metadata; [s3], [gcs], [azure] bring each blob backend's SDK
 uv add "vestigo[torch]"     # the PyTorch adapter's torch and torch-checkpointing
+uv add "vestigo[torch,sign]"  # and Ed25519 signatures on its checkpoints (cryptography)
 ```
 
 ## Development

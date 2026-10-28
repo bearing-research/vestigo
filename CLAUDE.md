@@ -42,8 +42,9 @@ records what a version holds or requires.
 The package has no required dependency. `vestigo[postgres]` brings psycopg,
 `[s3]` boto3, `[gcs]` google-cloud-storage, `[azure]` the Azure SDKs; a
 backend asked for without its extra raises one `ImportError` naming it.
-`[torch]` pins the torch and `torch-checkpointing` that `vestigo.torch` is
-built on (CPU wheels from the PyTorch index in development); importing the
+`[sign]` brings `cryptography` for `vestigo.torch`'s Ed25519 checkpoint
+signatures, imported only when a key is given. `[torch]` pins the torch and
+`torch-checkpointing` that `vestigo.torch` is built on (CPU wheels from the PyTorch index in development); importing the
 module without them raises one `ImportError` naming the extra. CI's matrix runs
 without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
 job installs it for ty, and a separate `torch` job runs `tests/test_torch.py`

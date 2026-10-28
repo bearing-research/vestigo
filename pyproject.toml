@@ -34,6 +34,10 @@ azure = [
     "azure-storage-blob>=12.20.0",
     "azure-identity>=1.25.3",
 ]
+# Ed25519 signatures on vestigo.torch checkpoints.
+sign = [
+    "cryptography>=44.0.0",
+]
 # vestigo.torch implements torch_checkpointing's Storage; the library is pre-1.0
 # and its callback shape has changed before, hence the pin.
 torch = [
