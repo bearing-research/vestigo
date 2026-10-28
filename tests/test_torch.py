@@ -1021,6 +1021,30 @@ def test_a_later_checkpoint_s_derivation_is_the_output_s_current_value(ledger: L
     assert (current.version, current.release_id) == (2, two.release.release_id)
 
 
+def test_a_name_derived_from_a_later_checkpoint_is_derived_from_no_earlier_one(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+    one, two, three = (run.release_of(step).release_id for step in (1, 2, 3))
+    with monkeypatch.context() as patch:
+        patch.setattr(ArtifactStore, "publish_blob_from_path", lambda *a, **k: _raise(OSError))
+        with pytest.raises(OSError):
+            ledger.derive(three, "eval-2", {"weights": _export(trainer, tmp_path)})
+    [output] = ledger.derive(one, "eval", {"metrics": b"1"}).outputs
+    ledger.derive(three, "eval", {"metrics": b"3"})
+    ledger.store.garbage_collect(keep_superseded=0)
+    assert ledger.store.get_artifact(output.id, output.version) is None
+
+    for earlier in (one, two):
+        with pytest.raises(ValueError, match="later checkpoint"):
+            ledger.derive(earlier, "eval", {"metrics": b"0"})
+
+    assert ledger.store.get_latest_version(output.id).params["from"] == three
+    assert ledger.derive(two, "eval-2", {"metrics": b"2"}).release.state == "accepted"
+
+
 def test_keeping_a_derived_release_does_not_keep_its_checkpoint(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
@@ -1252,6 +1276,108 @@ def test_collect_takes_what_an_ended_attempt_staged_and_spares_a_live_one(
 
     assert result["orphaned"] == len(staged)
     assert all(ledger.store.get_artifact(*v) is None for v in staged)
+
+
+def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    written = LedgerStorage.stream_write
+    calls: list[Path] = []
+
+    def second_fails(self: LedgerStorage, path: Path) -> io.IOBase:
+        calls.append(path)
+        if len(calls) % 2 == 0:
+            raise OSError("upload failed")
+        return written(self, path)
+
+    def rejected(self: ReleaseStore, release_id: str, *args: object) -> None:
+        # The lease lapsed at acceptance; the renewal took it back after.
+        self._settle(release_id, "rejected")
+        raise ReleaseRejected("lease lapsed")
+
+    def staged(run: Run, step: int) -> set[tuple[str, int]]:
+        prefix = f"torch_{run.execution_id}@attempt={run.attempt}@step={step}"
+        return {
+            (v.id, v.version)
+            for v in ledger.store.list_versions_by_id_prefix(prefix)
+            if v.state == "building"
+        }
+
+    with ledger.start(trainer.program) as run:
+        manager = _manager(run)
+
+        def save(step: int, patch: tuple[type, str, object] | None = None) -> None:
+            state = {"model": trainer.model.state_dict(), "step": step}
+            if patch is None:
+                manager.save(run.checkpoint_id(step), state)
+                return
+            with monkeypatch.context() as patched:
+                patched.setattr(*patch)
+                with pytest.raises((OSError, ReleaseRejected)):
+                    manager.save(run.checkpoint_id(step), state)
+
+        upload_fails = (LedgerStorage, "stream_write", second_fails)
+        try:
+            save(0, upload_fails)
+            # Nothing accepted yet: step 0 may still be saved again.
+            assert ledger.collect(keep=1)["orphaned"] == 0
+            save(1, (ReleaseStore, "accept", lambda *a, **k: _raise(OSError)))
+            save(2, (ReleaseStore, "accept", rejected))
+            save(3, upload_fails)
+            save(3)
+            save(4, upload_fails)
+        finally:
+            manager.close()
+        dead = [staged(run, step) for step in range(4)]
+        pending = staged(run, 4)
+        assert all(dead) and pending
+        dead = set().union(*dead)
+
+        result = ledger.collect(keep=1)
+
+        assert result["orphaned"] == len(dead)
+        assert all(ledger.store.get_artifact(*v) is None for v in dead)
+        assert all(ledger.store.get_artifact(*v).state == "building" for v in pending)
+        assert all(ledger.store.get_artifact(v.id, v.version) for v in _outputs(ledger, run, 3))
+
+
+def test_collect_takes_failed_rows_but_the_placeholder_a_finished_run_s_record_names(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        with monkeypatch.context() as patch:
+            patch.setattr(ArtifactStore, "publish_blob_from_path", lambda *a, **k: _raise(OSError))
+            with pytest.raises(OSError):
+                run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+        run.finish()
+    derived = ledger.derive(run.release_of(1).release_id, "eval", {"metrics": b"1"})
+    failed = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@observed=")
+    with ledger.start(trainer.program) as ended:
+        with monkeypatch.context() as patch:
+            patch.setattr(ReleaseStore, "accept", lambda *a, **k: _raise(OSError))
+            with pytest.raises(OSError):
+                Trainer(ledger).train(ended, 1)
+    # Failed by a pass whose idle floor kept them.
+    assert ledger.collect(keep=1, min_idle_seconds=3600)["orphaned"] > 0
+    failed += [
+        v
+        for v in ledger.store.list_versions_by_id_prefix(f"torch_{ended.execution_id}@")
+        if v.state == "failed"
+    ]
+    placeholders = [f"torch_{run.execution_id}", f"torch_{derived.release.build_id}"]
+    assert [ledger.store.get_artifact(p, 1).state for p in placeholders] == ["failed"] * 2
+
+    ledger.collect(keep=1)
+
+    assert failed and all(ledger.store.get_artifact(v.id, v.version) is None for v in failed)
+    assert ledger.store.get_artifact(placeholders[1], 1) is None
+    assert ledger.store.get_artifact(placeholders[0], 1).state == "failed"
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+    assert ledger.builds.get_build(derived.release.build_id) is not None
+    assert ledger.derived(run.release_of(1).release_id, "eval") == derived
 
 
 # --- Asynchronous saves ---

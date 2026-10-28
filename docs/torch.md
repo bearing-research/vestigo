@@ -177,8 +177,11 @@ Deriving the same name from the same checkpoint again returns the release alread
 there and stores nothing. The outputs' ids are per execution and name
 (`torch_<execution>@derived=eval@output=metrics`), so a derivation from a later
 checkpoint becomes their current value, and the earlier versions stay readable until
-`garbage_collect(keep_superseded=)` trims them. `train.py` derives an evaluation of
-the checkpoint it finished on.
+`garbage_collect(keep_superseded=)` trims them. Once a name is derived from a
+checkpoint, deriving it from an earlier one of the execution raises `ValueError`, since
+that would make the earlier checkpoint's outputs current again; this also holds when
+the earlier derivation was trimmed. Give such a derivation its own name. `train.py`
+derives an evaluation of the checkpoint it finished on.
 
 ## Keep the latest checkpoints
 
@@ -198,12 +201,16 @@ ledger.collect(keep=2)
 - every release a head points at.
 
 Every other checkpoint's files, rank reports and manifest are deleted. So are the files
-a fenced or ended attempt staged but never released (a step that crashed mid-save). An
-attempt that still holds its execution keeps everything it is writing, so you can
-collect while runs train. `examples/torch/train.py --keep 1` collects after every epoch.
+a fenced or ended attempt staged but never released (a step that crashed mid-save), and
+those of a save that can no longer be released in an attempt still running: one whose
+acceptance failed, or one of a step at or before the newest the attempt accepted. The
+save the attempt is writing now stays, so you can collect while runs train. Failed
+rows go too (an observation that failed to store, a derivation that failed), except
+the placeholder a finished execution's build row still names, which stays with it.
+`examples/torch/train.py --keep 1` collects after every epoch.
 
 `collect` returns the store's counts (`deleted_count`, `deleted_bytes`) plus `orphaned`,
-the staged files of ended attempts it failed. `dry_run=True` deletes nothing and lists
+the staged files it failed. `dry_run=True` deletes nothing and lists
 what it would take under `collected`. Loading a checkpoint, or branching from it,
 counts as a use, and `min_idle_seconds=` spares whatever was used that recently. Pass
 it when branches may open while `collect` runs, since a branch opened after `collect`
