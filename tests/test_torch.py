@@ -13,6 +13,7 @@ import json
 import multiprocessing
 import os
 import sys
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ from torch_checkpointing.checkpoint_manager import CheckpointManager
 from vestigo.blob_store import BlobSettings
 from vestigo.releases import ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost
-from vestigo.torch import Checkpoints, Definition, Ledger, RemoteBlobs, Run
+from vestigo.torch import Checkpoints, Definition, Ledger, RemoteBlobs, Run, _archive_metadata
 
 STEPS = 6
 
@@ -645,6 +646,7 @@ def test_an_exported_program_is_recorded_with_its_scope_and_versions(ledger: Led
         )
 
         assert _node_count(ledger) == nodes
+        assert ledger.store.definition_of(recorded.id, recorded.version) == trainer.program.node_id
         assert ledger.observations(run.execution_id) == [recorded]
         params = recorded.params
         assert (params["observed"], params["coverage"], params["attempt"]) == (
@@ -664,34 +666,88 @@ def test_an_exported_program_is_recorded_with_its_scope_and_versions(ledger: Led
         assert torch.equal(loaded(x), trainer.model(x))
 
 
-def test_an_observation_changes_no_definition(ledger: Ledger):
+def test_the_same_program_exported_again_is_one_version(ledger: Ledger):
     trainer = Trainer(ledger)
-    with ledger.start(trainer.program, {"train": "data@v=1"}) as run:
-        run.observe(_exported(trainer.model), scope="model_forward", coverage="partial")
+    with ledger.start(trainer.program) as run:
+        # Two exports: other example inputs, another serialization id, one program.
+        first = run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+        second = run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
 
-        again = _program(ledger, _model(), torch.optim.AdamW(_model().parameters(), lr=1e-2))
-        assert again.node_id == trainer.program.node_id
-        assert run.computation_key == ledger.computation_key(again, {"train": "data@v=1"})
+        assert (second.id, second.version) == (first.id, first.version)
+        other = run.observe(_exported(trainer.model), scope="model_forward", coverage="partial")
+        assert ledger.observations(run.execution_id) == [first, other]
 
 
-def test_the_same_archive_recorded_twice_is_one_version(ledger: Ledger):
+def test_one_program_under_two_scopes_is_two_records(ledger: Ledger):
     trainer = Trainer(ledger)
     exported = _exported(trainer.model)
     with ledger.start(trainer.program) as run:
-        first = run.observe(exported, scope="model_forward", coverage="complete")
-        second = run.observe(exported, scope="model_forward", coverage="complete")
+        forward = run.observe(exported, scope="model_forward", coverage="complete")
+        compiled = run.observe(exported, scope="model_forward_compiled", coverage="complete")
 
-        assert (second.id, second.version) == (first.id, first.version)
-        other = run.observe(exported, scope="model_forward", coverage="partial")
-        assert ledger.observations(run.execution_id) == [first, other]
+        assert [v.params["observed"] for v in ledger.observations(run.execution_id)] == [
+            "model_forward",
+            "model_forward_compiled",
+        ]
+        assert forward.id != compiled.id
+
+
+def test_observations_are_the_execution_s_own(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as one, ledger.start(trainer.program) as two:
+        one.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+
+        assert one.computation_key == two.computation_key
+        assert ledger.observations(two.execution_id) == []
 
 
 def test_a_stale_attempt_cannot_record_an_observation(ledger: Ledger):
     trainer = Trainer(ledger)
+    exported = _exported(trainer.model)
     first = ledger.start(trainer.program)
     trainer.train(first, 1)
+    recorded = first.observe(exported, scope="model_forward", coverage="complete")
     first.close()
     with ledger.resume(first.execution_id):
-        with pytest.raises(BuildLeaseLost):
-            first.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
-        assert ledger.observations(first.execution_id) == []
+        # Not even the record it made before: the attempt no longer speaks for the run.
+        with pytest.raises(BuildLeaseLost, match="no longer holds"):
+            first.observe(exported, scope="model_forward", coverage="complete")
+        with pytest.raises(BuildLeaseLost, match="no longer holds"):
+            first.observe(exported, scope="model_forward", coverage="other")
+
+    staged = ledger.store.list_versions_by_id_prefix(f"torch_{first.execution_id}@observed=")
+    assert [(v.version, v.state) for v in staged] == [(recorded.version, "ready")]
+
+
+def test_a_finished_run_says_so_when_it_observes(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        run.finish()
+        with pytest.raises(BuildLeaseLost, match="it finished"):
+            run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+
+
+def test_an_observation_that_fails_to_store_is_failed_for_cleanup(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        with monkeypatch.context() as patch:
+            patch.setattr(ArtifactStore, "publish_blob_from_path", lambda *a, **k: _raise(OSError))
+            with pytest.raises(OSError):
+                run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+
+        [staged] = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@observed=")
+        assert staged.state == "failed"
+
+
+def test_an_archive_without_torch_s_metadata_entries_reads_as_none(tmp_path: Path):
+    archive = tmp_path / "bare.pt2"
+    with zipfile.ZipFile(archive, "w") as bare:
+        bare.writestr("archive/models/model.json", json.dumps({"torch_version": "x"}))
+
+    metadata = _archive_metadata(archive)
+
+    assert metadata["archive_version"] is None and metadata["serialization_id"] is None
+    assert metadata["programs"]["model"]["torch_version"] == "x"
+    assert metadata["programs"]["model"]["schema_version"] is None

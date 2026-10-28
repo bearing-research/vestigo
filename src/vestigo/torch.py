@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -70,7 +71,7 @@ from vestigo.provenance import (
 )
 from vestigo.releases import Release, ReleaseBundle, ReleaseRejected, ReleaseStore, lease_held
 from vestigo.sql_backend import PostgresDialect
-from vestigo.store import ArtifactStore, ArtifactVersion, StagedVersion
+from vestigo.store import ArtifactStore, ArtifactVersion, BuildLeaseLost, StagedVersion
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ PROGRAM_DOMAIN = "torch/training-program"
 ROOT = "vestigo-torch"
 
 _STEP_DIR = re.compile(r"step-(\d+)")
+_CHUNK = 8 * 1024 * 1024
 
 
 def _canonical(value: Any) -> bytes:
@@ -92,32 +94,46 @@ def _fqn(obj: object) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
 
-def _archive_metadata(data: bytes) -> dict[str, Any]:
-    """What a PT2 archive says of itself: its own versions, and each program's."""
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        names = archive.namelist()
-        root = names[0].split("/", 1)[0]
+def _archive_metadata(path: Path) -> dict[str, Any]:
+    """What a PT2 archive says of itself: its own versions, and each program's.
 
-        def text(name: str) -> str:
-            return archive.read(f"{root}/{name}").decode().strip()
+    The layout is torch's and unversioned; what an archive lacks is None.
+    """
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        root = names[0].split("/", 1)[0] if names else ""
+
+        def text(name: str) -> str | None:
+            try:
+                return archive.read(f"{root}/{name}").decode().strip()
+            except KeyError:
+                return None
 
         programs = {}
         for name in names:
-            path = PurePosixPath(name)
-            if path.parent == PurePosixPath(root, "models") and path.suffix == ".json":
+            entry = PurePosixPath(name)
+            if entry.parent == PurePosixPath(root, "models") and entry.suffix == ".json":
                 program = json.loads(archive.read(name))
-                programs[path.stem] = {
-                    "schema_version": program["schema_version"],
-                    "opset_version": program["opset_version"],
-                    "torch_version": program["torch_version"],
-                    "range_constraints": program["range_constraints"],
-                    "verifiers": program["verifiers"],
+                programs[entry.stem] = {
+                    "schema_version": program.get("schema_version"),
+                    "opset_version": program.get("opset_version"),
+                    "torch_version": program.get("torch_version"),
+                    "range_constraints": program.get("range_constraints"),
+                    "verifiers": program.get("verifiers"),
                     "guards": len(program.get("guards_code") or []),
                 }
-        # The zip's own timestamps differ per save; its entries do not.
+        # The program's identity is its graph, weights and constants: the zip's
+        # timestamps differ per save, the sample inputs and serialization id per export.
         contents = hashlib.sha256()
         for name in sorted(names):
-            contents.update(f"{name}\0{hashlib.sha256(archive.read(name)).hexdigest()}\0".encode())
+            inner = name.split("/", 1)[-1]
+            if inner.startswith("data/sample_inputs/") or inner == ".data/serialization_id":
+                continue
+            entry_hash = hashlib.sha256()
+            with archive.open(name) as stream:
+                while chunk := stream.read(_CHUNK):
+                    entry_hash.update(chunk)
+            contents.update(f"{name}\0{entry_hash.hexdigest()}\0".encode())
         return {
             "contents_sha256": contents.hexdigest(),
             "archive_version": text("archive_version"),
@@ -125,6 +141,16 @@ def _archive_metadata(data: bytes) -> dict[str, Any]:
             "serialization_id": text(".data/serialization_id"),
             "programs": programs,
         }
+
+
+def _file_digest(path: Path) -> tuple[int, str]:
+    hasher = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        while chunk := f.read(_CHUNK):
+            hasher.update(chunk)
+            size += len(chunk)
+    return size, hasher.hexdigest()
 
 
 def _rank() -> tuple[int, int]:
@@ -507,23 +533,40 @@ class Ledger:
         build = self.builds.get_build(execution_id)
         if build is None or build.computation_key is None:
             raise ValueError(f"execution {execution_id} does not exist")
+        # Every execution of one computation shares its key; the id is the execution's.
+        prefix = f"torch_{execution_id}@observed="
         return [
             v
             for v in self.store.versions_of_computation(build.computation_key)
-            if v.state == "ready" and "observed" in v.params
+            if v.state == "ready" and v.id.startswith(prefix)
         ]
 
+    def _require_lease(self, writer: Checkpoints) -> None:
+        conn = self.store._get_connection()
+        try:
+            held = lease_held(conn, writer.execution_id, writer.attempt, time.time())
+        finally:
+            conn.close()
+        if not held:
+            raise BuildLeaseLost(
+                f"attempt {writer.attempt} no longer holds execution {writer.execution_id}: "
+                "it finished, or another attempt took it over"
+            )
+
     def _observe(
-        self, writer: Checkpoints, data: bytes, scope: str, coverage: str
+        self, writer: Checkpoints, archive: Path, scope: str, coverage: str
     ) -> ArtifactVersion:
-        metadata = _archive_metadata(data)
+        # Before anything is looked up or staged: a stale attempt records nothing.
+        self._require_lease(writer)
+        metadata = _archive_metadata(archive)
         artifact_id = f"torch_{writer.execution_id}@observed={quote(scope, safe='')}"
         key = derive_subkey(
             writer.computation_key,
             f"build={writer.execution_id}",
             f"attempt={writer.attempt}",
-            f"observed={metadata['contents_sha256']}",
+            f"scope={quote(scope, safe='')}",
             f"coverage={quote(coverage, safe='')}",
+            f"observed={metadata['contents_sha256']}",
         )
         recorded = self.store.find_version_by_provenance(artifact_id, key)
         if recorded is not None:
@@ -544,18 +587,24 @@ class Ledger:
             definition=[writer.program],
             computation_key=writer.computation_key,
         )
-        self.store.write_blob(artifact_id, version, data)
-        stored = self.store.finalize_artifact(
-            artifact_id,
-            version,
-            "",
-            None,
-            len(data),
-            hashlib.sha256(data).hexdigest(),
-            fence=lambda conn, *_: lease_held(
-                conn, writer.execution_id, writer.attempt, time.time()
-            ),
-        )
+        size, digest = _file_digest(archive)
+        try:
+            self.store.publish_blob_from_path(artifact_id, version, archive)
+            stored = self.store.finalize_artifact(
+                artifact_id,
+                version,
+                "",
+                None,
+                size,
+                digest,
+                fence=lambda conn, *_: lease_held(
+                    conn, writer.execution_id, writer.attempt, time.time()
+                ),
+            )
+        except Exception:
+            # Failed, not left building: cleanup takes the row and its archive.
+            self.store.fail_artifact(artifact_id, version)
+            raise
         assert stored is not None
         return stored
 
@@ -936,15 +985,19 @@ class Run:
         not the training loop, the update or the checkpointing) and *coverage* how much
         of it (``complete_under_declared_constraints``); the ledger records both and
         reads neither. No node changes, so neither the program's nor the model's id
-        moves. The same program recorded twice is one version (its archive's entries
-        are compared, not the zip's timestamps).
+        moves. The same program exported again under the same scope and coverage is
+        one version: its graph, weights and constants are compared, not its example
+        inputs or the zip's timestamps.
 
         Raises:
-            BuildLeaseLost: this attempt no longer holds the execution.
+            BuildLeaseLost: this attempt no longer holds the execution (it finished,
+                or another attempt took it over).
         """
-        buffer = io.BytesIO()
-        torch.export.save(program, buffer)
-        return self.ledger._observe(self.checkpoints, buffer.getvalue(), scope, coverage)
+        # On disk, not in memory: an archive carries the weights.
+        with tempfile.TemporaryDirectory() as scratch:
+            archive = Path(scratch) / "program.pt2"
+            torch.export.save(program, archive)
+            return self.ledger._observe(self.checkpoints, archive, scope, coverage)
 
     def release_of(self, step: int) -> Release | None:
         """This execution's accepted checkpoint of *step*, once its save has completed."""
