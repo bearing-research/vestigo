@@ -122,6 +122,10 @@ module gains an entry point.
 - Fixtures yield and close their stores; a test closes any connection or
   response body it opens. The suite passes under `-W error`; keep it so.
 - Every new test is teeth-checked: it fails on the code it pins.
+- `docs/ledger.md` and `docs/torch.md` are the user guides; `examples/ledger/` and
+  `examples/torch/` are their scripts, which `tests/test_examples.py` (matrix) and
+  `tests/test_torch.py` (torch job) run as subprocesses. An API change updates the
+  guide and the script with the code.
 - Strata's `tests/contract/` pins the cross-repository contract (hash
   vectors, operation schemas, output keys, provenance classes, table
   inventory). A change to any of those needs a vestigo release and a Strata
