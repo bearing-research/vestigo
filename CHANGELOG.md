@@ -21,7 +21,7 @@ All notable changes to vestigo are recorded here. The format follows
   resumed run and a branch end on the weights of an uninterrupted one; a
   crash before acceptance leaves an orphan, never an authority. Local
   filesystem and synchronous saves; the extra pins `torch-checkpointing`
-  0.1.1, and the module imports nothing of torch (#PR).
+  0.1.1, and the module imports nothing of torch (#29).
 
 ## 0.2.1 - 2026-10-27
 
