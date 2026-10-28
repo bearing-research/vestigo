@@ -25,7 +25,7 @@ All notable changes to vestigo are recorded here. The format follows
   branch end on the weights of an uninterrupted one; a crash before
   acceptance leaves an orphan, never an authority; a rank that dies before
   writing leaves no release. The extra pins `torch-checkpointing` 0.1.1
-  (#29, #PR).
+  (#29, #30).
 
 ## 0.2.1 - 2026-10-27
 
