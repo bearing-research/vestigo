@@ -24,6 +24,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Iterator
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,6 +52,7 @@ from vestigo.torch import (
 )
 
 STEPS = 6
+ASYNC = CheckpointManager.Config.with_async_save()
 
 
 @pytest.fixture(
@@ -83,13 +85,8 @@ def _program(ledger: Ledger, model: nn.Module, optimizer: torch.optim.Optimizer)
     )
 
 
-def _manager(checkpoints: Run | Checkpoints, asynchronous: bool = False) -> CheckpointManager:
-    config = (
-        CheckpointManager.Config.with_async_save()
-        if asynchronous
-        else CheckpointManager.Config.with_sync_save()
-    )
-    return checkpoints.configure(config).build()
+def _manager(checkpoints: Checkpoints) -> CheckpointManager:
+    return checkpoints.configure(CheckpointManager.Config.with_sync_save()).build()
 
 
 class Trainer:
@@ -105,49 +102,32 @@ class Trainer:
         self.shuffle = torch.Generator().manual_seed(2)
         self.step = 0
 
-    def train(self, run: Run, until: int, asynchronous: bool = False) -> None:
-        manager = _manager(run, asynchronous)
-        try:
-            while self.step < until:
-                self.step += 1
-                for batch in torch.randperm(64, generator=self.shuffle).split(16):
-                    self.optimizer.zero_grad()
-                    nn.functional.mse_loss(self.model(self.x[batch]), self.y[batch]).backward()
-                    self.optimizer.step()
-                pending = manager.save(
-                    run.checkpoint_id(self.step),
-                    {
-                        "model": self.model.state_dict(),
-                        "optim": self.optimizer.state_dict(),
-                        "shuffle": self.shuffle.get_state(),
-                        "step": self.step,
-                    },
-                )
-                if pending is not None and self.step == until:
-                    pending.result()
-        finally:
-            manager.close()
-
-    def restore(self, run: Run) -> None:
-        checkpoint = run.restore()
-        assert checkpoint is not None
-        manager = _manager(run)
-        try:
-            loaded = manager.load(
-                checkpoint,
-                into={
-                    "model": self.model.state_dict(),
-                    "optim": None,
-                    "shuffle": None,
-                    "step": None,
+    def train(self, run: Run, until: int) -> None:
+        while self.step < until:
+            self.step += 1
+            for batch in torch.randperm(64, generator=self.shuffle).split(16):
+                self.optimizer.zero_grad()
+                nn.functional.mse_loss(self.model(self.x[batch]), self.y[batch]).backward()
+                self.optimizer.step()
+            pending = run.save(
+                self.step,
+                {
+                    "model": self.model,
+                    "optim": self.optimizer,
+                    "shuffle": self.shuffle.get_state(),
+                    "step": self.step,
                 },
             )
-        finally:
-            manager.close()
-        self.model.load_state_dict(loaded["model"])
-        self.optimizer.load_state_dict(loaded["optim"])
-        self.shuffle.set_state(loaded["shuffle"])
-        self.step = loaded["step"]
+            if isinstance(pending, Future) and self.step == until:
+                pending.result()
+
+    def restore(self, run: Run) -> None:
+        assert run.restores_from is not None
+        state = run.restore(
+            {"model": self.model, "optim": self.optimizer, "shuffle": None, "step": None}
+        )
+        self.shuffle.set_state(state["shuffle"])
+        self.step = state["step"]
 
     def weights(self) -> list[torch.Tensor]:
         return [p.detach().clone() for p in self.model.parameters()]
@@ -169,6 +149,177 @@ def _outputs(ledger: Ledger, run: Run, step: int):
     release = run.release_of(step)
     assert release is not None
     return ledger.releases.bundle(release.release_id).outputs
+
+
+# --- The run API ---
+
+
+def _run(ledger: Ledger, trainer: Trainer, **kwargs) -> Run:
+    return ledger.run(
+        trainer.model,
+        trainer.optimizer,
+        loss=nn.MSELoss(),
+        version="tiny-v1",
+        inputs={"train": "data@v=1"},
+        config={"batch": 16},
+        **kwargs,
+    )
+
+
+def _state(trainer: Trainer) -> dict:
+    return {"model": trainer.model, "optim": trainer.optimizer, "step": 0}
+
+
+def test_run_resumes_the_unfinished_execution_and_starts_after_a_finish(ledger: Ledger):
+    expected = _uninterrupted(ledger)
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as first:
+        assert first.restore(_state(trainer)) == _state(trainer)
+        trainer.train(first, 3)
+
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as resumed:
+        assert resumed.execution_id == first.execution_id
+        assert resumed.computation_key == ledger.computation_key(
+            trainer.program, {"train": "data@v=1"}
+        )
+        state = resumed.restore(_state(trainer))
+        assert state["model"] is trainer.model and state["optim"] is trainer.optimizer
+        assert state["step"] == 3
+        assert trainer.optimizer.state_dict()["state"], "the optimizer is loaded in place"
+        trainer.step = state["step"]
+        trainer.shuffle.set_state(resumed.restore({"shuffle": None})["shuffle"])
+        trainer.train(resumed, STEPS)
+        resumed.finish()
+    assert _same(trainer.weights(), expected)
+
+    with _run(ledger, Trainer(ledger)) as again:
+        assert again.execution_id != first.execution_id
+        assert again.restores_from is None
+
+
+def test_run_from_a_release_branches_and_resumes_the_branch(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as source:
+        trainer.train(source, 2)
+        source.finish()
+    origin = ledger.release_of(source.execution_id, 2)
+    assert origin is not None
+
+    branched = Trainer(ledger)
+    with _run(ledger, branched, from_release=origin.release_id) as branch:
+        assert branch.execution_id != source.execution_id
+        assert branch.restores_from == origin.release_id
+        branch.restore({"model": branched.model})
+        assert _same(branched.weights(), trainer.weights())
+        branched.train(branch, 1)  # its own step 1, then the process stops
+    with _run(ledger, Trainer(ledger), from_release=origin.release_id) as again:
+        assert again.execution_id == branch.execution_id
+        assert again.restores_from == branch.release_of(1).release_id
+
+
+def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        release = run.save(1, {"model": trainer.model, "note": "plain"})
+        assert release == run.release_of(1)
+        assert release.state == "accepted"
+        files = {
+            v.params.get("file", "") for v in ledger.releases.bundle(release.release_id).outputs
+        }
+        assert any(f.startswith("model") for f in files)
+        assert ledger.load(release.release_id, {"note": None}) == {"note": "plain"}
+
+
+def test_a_run_shares_no_manager_config_with_another(ledger: Ledger):
+    shared = CheckpointManager.Config.with_sync_save()
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, checkpointing=shared) as one:
+        one.manager  # built first, so the next run's configure would rewire it
+        with ledger.start(trainer.program, checkpointing=shared) as two:
+            two.manager
+            assert one.save(1, {"step": 1}).build_id == one.execution_id
+            assert two.save(1, {"step": 1}).build_id == two.execution_id
+    assert shared.storage_config is None
+
+
+def test_finish_and_close_wait_for_the_save_in_flight_while_the_lease_holds(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    events: list[str] = []
+    prepare = ReleaseStore.prepare
+
+    def preparing(self, build_id, attempt, kind, *args, **kwargs):
+        events.append(kind)
+        return prepare(self, build_id, attempt, kind, *args, **kwargs)
+
+    def closing(run: Run):
+        close = run.manager.close
+
+        def closed() -> None:
+            build = ledger.builds.get_build(run.execution_id)
+            events.append("close, held" if build.lease_expires_at > time.time() else "close")
+            close()
+
+        monkeypatch.setattr(run.manager, "close", closed)
+
+    monkeypatch.setattr(ReleaseStore, "prepare", preparing)
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        trainer.train(run, 1)
+        closing(run)
+        events.clear()
+        run.finish()
+    assert events[:2] == ["close, held", "final"]
+
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        trainer.train(run, 1)
+        closing(run)
+        events.clear()
+    assert events[:1] == ["close, held"]
+
+
+def test_a_failed_manager_close_still_drops_the_lease(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    run = _run(ledger, trainer)
+    trainer.train(run, 1)
+    monkeypatch.setattr(run.manager, "close", lambda: _raise(OSError("the write failed")))
+    with pytest.raises(OSError, match="the write failed"):
+        run.close()
+    with ledger.resume(run.execution_id) as resumed:  # no live lease in the way
+        assert resumed.restores_from == run.release_of(1).release_id
+
+
+def test_load_reads_an_accepted_checkpoint_into_live_objects(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    closed: list[CheckpointManager] = []
+    close = CheckpointManager.close
+
+    def closing(self: CheckpointManager) -> None:
+        closed.append(self)
+        close(self)
+
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        trainer.train(run, 2)
+        run.finish()
+    release = ledger.final_checkpoint(run.execution_id)
+    assert release is not None
+    model = _model(hidden=8)
+    nn.init.zeros_(model[0].weight)
+    monkeypatch.setattr(CheckpointManager, "close", closing)
+    state = ledger.load(release.release_id, {"model": model, "step": None})
+    assert state["model"] is model and state["step"] == 2
+    assert _same([p.detach() for p in model.parameters()], trainer.weights())
+    with pytest.raises(FileNotFoundError, match="never-saved"):
+        ledger.load(release.release_id, {"never-saved": None})
+    assert len(closed) == 2, "each load closes its manager, a failed one too"
+    with pytest.raises(ValueError, match="not an accepted checkpoint"):
+        ledger.load("no-such-release", {"model": model})
 
 
 # --- Identity ---
@@ -247,9 +398,11 @@ def test_a_checkpoint_is_one_release_of_its_files_under_a_manifest(ledger: Ledge
 
 def _finalize(run: Run, step: int) -> None:
     """Call the finalize callback as the writer does, with a storage *run* configured."""
-    config = run.configure(CheckpointManager.Config())
+    config = run.checkpoints.configure(CheckpointManager.Config())
     storage = config.storage_config.create_storage()
-    config.finalize_callback(SimpleNamespace(path=run.checkpoint_id(step), storage=storage))
+    config.finalize_callback(
+        SimpleNamespace(path=run.checkpoints.checkpoint_id(step), storage=storage)
+    )
 
 
 def test_a_retried_finalize_returns_the_accepted_release(ledger: Ledger):
@@ -264,14 +417,14 @@ def test_a_retried_finalize_returns_the_accepted_release(ledger: Ledger):
 def test_an_attempt_writes_only_its_own_checkpoints(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run, ledger.start(trainer.program) as other:
-        manager = _manager(run)
+        manager = _manager(run.checkpoints)
         try:
             with pytest.raises(PermissionError):
-                manager.save(other.checkpoint_id(1), {"step": 1})
+                manager.save(other.checkpoints.checkpoint_id(1), {"step": 1})
         finally:
             manager.close()
         with pytest.raises(PermissionError):
-            run.checkpoints(SimpleNamespace(path=other.checkpoint_id(1)))
+            run.checkpoints(SimpleNamespace(path=other.checkpoints.checkpoint_id(1)))
 
 
 def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
@@ -286,10 +439,12 @@ def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
         written = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@")
         assert any(ledger.store.blob_exists(v.id, v.version) for v in written)
 
-        storage = run.configure(CheckpointManager.Config()).storage_config.create_storage()
-        assert not storage.exists(Path(run.checkpoint_id(1)))
+        storage = run.checkpoints.configure(
+            CheckpointManager.Config()
+        ).storage_config.create_storage()
+        assert not storage.exists(Path(run.checkpoints.checkpoint_id(1)))
         with pytest.raises(FileNotFoundError):
-            storage.getsize(Path(run.checkpoint_id(1)) / "model_0.pt")
+            storage.getsize(Path(run.checkpoints.checkpoint_id(1)) / "model_0.pt")
 
 
 def test_only_rank_zero_accepts_by_the_rank_it_configured_with(
@@ -299,13 +454,15 @@ def test_only_rank_zero_accepts_by_the_rank_it_configured_with(
     with ledger.start(trainer.program) as run:
         monkeypatch.setenv("RANK", "1")
         monkeypatch.setenv("WORLD_SIZE", "2")
-        config = run.configure(CheckpointManager.Config())
+        config = run.checkpoints.configure(CheckpointManager.Config())
         # An async writer's subprocess may see neither a process group nor the variables.
         monkeypatch.delenv("RANK")
         monkeypatch.delenv("WORLD_SIZE")
         storage = config.storage_config.create_storage()
 
-        config.finalize_callback(SimpleNamespace(path=run.checkpoint_id(1), storage=storage))
+        config.finalize_callback(
+            SimpleNamespace(path=run.checkpoints.checkpoint_id(1), storage=storage)
+        )
 
         assert (storage.rank, storage.world) == (1, 2)
         assert ledger.releases.releases_of(run.execution_id, "checkpoint") == []
@@ -574,7 +731,9 @@ def test_a_load_only_ledger_reads_a_checkpoint_and_writes_nothing(tmp_path: Path
         manager = reader.configure(CheckpointManager.Config.with_sync_save()).build()
         try:
             with pytest.raises(PermissionError, match="only loads"):
-                manager.save(run.checkpoint_id(3), {"model": trainer.model.state_dict()})
+                manager.save(
+                    run.checkpoints.checkpoint_id(3), {"model": trainer.model.state_dict()}
+                )
         finally:
             manager.close()
 
@@ -608,11 +767,11 @@ def _save_meddled(ledger: Ledger, run: Run, step: int, meddle) -> None:
         report(args)
         meddle()
 
-    config = run.configure(CheckpointManager.Config.with_sync_save())
+    config = run.checkpoints.configure(CheckpointManager.Config.with_sync_save())
     config.pre_finalize_callback = reported
     manager = config.build()
     try:
-        manager.save(run.checkpoint_id(step), {"model": _model().state_dict()})
+        manager.save(run.checkpoints.checkpoint_id(step), {"model": _model().state_dict()})
     finally:
         manager.close()
 
@@ -738,7 +897,8 @@ def test_a_stale_attempt_cannot_publish_after_a_resume(ledger: Ledger):
     stale = Trainer(ledger)
     first = ledger.start(stale.program)
     stale.train(first, 1)
-    first.close()  # its lease lapses: a pause, a partition
+    # Its lease lapses (a pause, a partition) while the process goes on saving.
+    ledger.builds.renew_lease(first.execution_id, first.attempt, lease_duration_seconds=0.0)
     with ledger.resume(first.execution_id) as resumed:
         with pytest.raises(ReleaseRejected):
             stale.train(first, 2)
@@ -748,6 +908,7 @@ def test_a_stale_attempt_cannot_publish_after_a_resume(ledger: Ledger):
         fresh.restore(resumed)
         fresh.train(resumed, 2)
         assert resumed.release_of(2).attempt == resumed.attempt
+    first.close()
 
 
 class _Crash(BaseException):
@@ -807,11 +968,11 @@ def test_a_crash_while_writing_leaves_only_rows_to_collect(
 def test_a_write_that_fails_midway_commits_no_bytes(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
-        manager = _manager(run)
+        manager = _manager(run.checkpoints)
         try:
             with pytest.raises(Exception, match="pickle"):
                 # torch.save writes its archive header before the lambda refuses to pickle.
-                manager.save(run.checkpoint_id(1), {"bad": {"f": lambda: 0}})
+                manager.save(run.checkpoints.checkpoint_id(1), {"bad": {"f": lambda: 0}})
         finally:
             manager.close()
 
@@ -869,13 +1030,13 @@ def test_a_step_saved_again_after_a_failed_write_is_released(
 
     state = {"model": trainer.model.state_dict(), "step": 1}
     with ledger.start(trainer.program) as run:
-        manager = _manager(run)
+        manager = _manager(run.checkpoints)
         try:
             with monkeypatch.context() as patch:
                 patch.setattr(LedgerStorage, "stream_write", second_fails)
                 with pytest.raises(OSError, match="upload failed"):
-                    manager.save(run.checkpoint_id(1), state)
-            manager.save(run.checkpoint_id(1), state)
+                    manager.save(run.checkpoints.checkpoint_id(1), state)
+            manager.save(run.checkpoints.checkpoint_id(1), state)
         finally:
             manager.close()
 
@@ -1305,17 +1466,17 @@ def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
         }
 
     with ledger.start(trainer.program) as run:
-        manager = _manager(run)
+        manager = _manager(run.checkpoints)
 
         def save(step: int, patch: tuple[type, str, object] | None = None) -> None:
             state = {"model": trainer.model.state_dict(), "step": step}
             if patch is None:
-                manager.save(run.checkpoint_id(step), state)
+                manager.save(run.checkpoints.checkpoint_id(step), state)
                 return
             with monkeypatch.context() as patched:
                 patched.setattr(*patch)
                 with pytest.raises((OSError, ReleaseRejected)):
-                    manager.save(run.checkpoint_id(step), state)
+                    manager.save(run.checkpoints.checkpoint_id(step), state)
 
         upload_fails = (LedgerStorage, "stream_write", second_fails)
         try:
@@ -1392,16 +1553,16 @@ def test_asynchronous_saves_release_in_order_and_resume(tmp_path: Path):
     with Ledger(tmp_path / "ledger", signing_key=_keypair()[0]) as ledger:
         expected = _uninterrupted(ledger)
         trainer = Trainer(ledger)
-        first = ledger.start(trainer.program)
-        trainer.train(first, 3, asynchronous=True)
+        first = ledger.start(trainer.program, checkpointing=ASYNC)
+        trainer.train(first, 3)
         first.close()
 
         releases = ledger.releases.releases_of(first.execution_id, "checkpoint")
         assert [(r.sequence, r.state) for r in releases] == [(n, "accepted") for n in (1, 2, 3)]
         trainer = Trainer(ledger)
-        with ledger.resume(first.execution_id) as resumed:
+        with ledger.resume(first.execution_id, checkpointing=ASYNC) as resumed:
             trainer.restore(resumed)
-            trainer.train(resumed, STEPS, asynchronous=True)
+            trainer.train(resumed, STEPS)
             resumed.finish()
         assert _same(trainer.weights(), expected)
 

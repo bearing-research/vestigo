@@ -15,7 +15,6 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch_checkpointing.checkpoint_manager import CheckpointManager
 from train import HEAD, INPUTS, data
 
 from vestigo.torch import Ledger
@@ -37,32 +36,28 @@ def main() -> None:
         if head is None:
             raise SystemExit(f"no {HEAD} yet: run train.py first")
         source, _revision = head
-        program = ledger.define_program(
-            ledger.define_model(model, version="regression-v1"),
+        # Run again after a crash, and this resumes the branch instead of starting one.
+        with ledger.run(
+            model,
+            optimizer,
             loss=nn.MSELoss(),
-            optimizer=optimizer,
+            version="regression-v1",
+            inputs=INPUTS,
             config={"batch": 32},
-        )
-        with ledger.branch(program, source, INPUTS) as run:
-            manager = run.configure(CheckpointManager.Config.with_sync_save()).build()
-            try:
-                checkpoint = run.restore()
-                assert checkpoint is not None
-                # Only the weights: the optimizer starts fresh under the new rate.
-                state = manager.load(checkpoint, into={"model": model.state_dict()})
-                model.load_state_dict(state["model"])
-                print(f"branched {run.execution_id} from release {source}")
-                for epoch in range(1, args.epochs + 1):
-                    for batch in torch.randperm(len(x)).split(32):
-                        optimizer.zero_grad()
-                        nn.functional.mse_loss(model(x[batch]), y[batch]).backward()
-                        optimizer.step()
-                    manager.save(run.checkpoint_id(epoch), {"model": model.state_dict()})
-                    with torch.no_grad():
-                        loss = nn.functional.mse_loss(model(x), y).item()
-                    print(f"epoch {epoch}: loss {loss:.4f}")
-            finally:
-                manager.close()
+            from_release=source,
+        ) as run:
+            # Only the weights: the optimizer starts fresh under the new rate.
+            run.restore({"model": model})
+            print(f"branched {run.execution_id} from release {run.restores_from}")
+            for epoch in range(1, args.epochs + 1):
+                for batch in torch.randperm(len(x)).split(32):
+                    optimizer.zero_grad()
+                    nn.functional.mse_loss(model(x[batch]), y[batch]).backward()
+                    optimizer.step()
+                run.save(epoch, {"model": model})
+                with torch.no_grad():
+                    loss = nn.functional.mse_loss(model(x), y).item()
+                print(f"epoch {epoch}: loss {loss:.4f}")
             run.finish()
 
 

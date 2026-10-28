@@ -34,6 +34,7 @@ scope and coverage. It never enters a node, so no definition changes because of 
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Generator, Iterator, Mapping
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -56,6 +58,7 @@ from urllib.parse import quote
 try:
     import torch.distributed as dist
     import torch.export
+    from torch_checkpointing.checkpoint_manager import CheckpointManager
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
 except ImportError as exc:
     raise ImportError("vestigo.torch needs the torch extra: install vestigo[torch]") from exc
@@ -182,6 +185,38 @@ def _file_digest(path: Path) -> tuple[int, str]:
             hasher.update(chunk)
             size += len(chunk)
     return size, hasher.hexdigest()
+
+
+def _stateful(value: object) -> bool:
+    """A module, optimizer or scheduler: saved by its ``state_dict``, loaded through it."""
+    return callable(getattr(value, "state_dict", None)) and callable(
+        getattr(value, "load_state_dict", None)
+    )
+
+
+def _saved(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value.state_dict() if _stateful(value) else value for key, value in state.items()}
+
+
+def _load(manager: Any, checkpoint_id: str, state: Mapping[str, Any]) -> dict[str, Any]:
+    """*state* loaded from the checkpoint: objects in place, plain values replaced."""
+    # A module's own tensors are the template, so its weights load where they live; an
+    # optimizer's state is empty until a step, so it is read as saved and loaded.
+    into = {
+        key: value.state_dict() if isinstance(value, torch.nn.Module) else None
+        for key, value in state.items()
+    }
+    loaded = manager.load(checkpoint_id, into=into)
+    restored = {}
+    for key, value in state.items():
+        if isinstance(value, torch.nn.Module):
+            restored[key] = value
+        elif _stateful(value):
+            value.load_state_dict(loaded[key])
+            restored[key] = value
+        else:
+            restored[key] = loaded[key]
+    return restored
 
 
 def _rank() -> tuple[int, int]:
@@ -450,17 +485,66 @@ class Ledger:
             [],
         )
 
-    def start(self, program: Definition, inputs: Mapping[str, str] | None = None) -> Run:
+    def run(
+        self,
+        model: Any,
+        optimizer: Any,
+        *,
+        loss: Any,
+        version: str,
+        inputs: Mapping[str, str] | None = None,
+        config: Mapping[str, Any] | None = None,
+        from_release: str | None = None,
+        checkpointing: Any = None,
+    ) -> Run:
+        """Resume this computation's unfinished execution, or start one.
+
+        The computation is the program over *model* (:meth:`define_model` under
+        *version*; :meth:`define_program` with *loss*, *optimizer* and *config*), its
+        *inputs*, and *from_release*, an accepted checkpoint of any run to branch from.
+        *checkpointing* is the ``CheckpointManager.Config`` the run saves and loads
+        with, synchronous saves when None.
+
+        Raises:
+            ValueError: the unfinished execution's lease is live under another attempt
+                (the old process is still running, or was killed under
+                ``lease_seconds`` ago), or *from_release* is not an accepted checkpoint.
+        """
+        program = self.define_program(
+            self.define_model(model, version=version),
+            loss=loss,
+            optimizer=optimizer,
+            config=config,
+        )
+        execution = self.find(program, inputs, from_release)
+        if execution is not None:
+            return self.resume(execution, checkpointing=checkpointing)
+        if from_release is not None:
+            return self.branch(program, from_release, inputs, checkpointing=checkpointing)
+        return self.start(program, inputs, checkpointing=checkpointing)
+
+    def start(
+        self,
+        program: Definition,
+        inputs: Mapping[str, str] | None = None,
+        *,
+        checkpointing: Any = None,
+    ) -> Run:
         """A new execution of *program* on *inputs*, in its first attempt."""
-        return self._open(program, dict(inputs or {}), None)
+        return self._open(program, dict(inputs or {}), None, checkpointing)
 
     def branch(
-        self, program: Definition, from_release: str, inputs: Mapping[str, str] | None = None
+        self,
+        program: Definition,
+        from_release: str,
+        inputs: Mapping[str, str] | None = None,
+        *,
+        checkpointing: Any = None,
     ) -> Run:
         """A new execution starting from *from_release*, an accepted checkpoint of any run.
 
         The release is part of the computation, so a branch never dedups against its
-        source or another branch of it; :meth:`Run.restore` names it.
+        source or another branch of it; :meth:`Run.restore` loads it.
 
         Raises:
             ValueError: *from_release* is not an accepted checkpoint, or was collected.
@@ -471,9 +555,11 @@ class Ledger:
         # A use now, so a collection with min_idle_seconds spares it until the load.
         for output in source.outputs:
             self.store.record_use(output.id, output.version)
-        return self._open(program, dict(inputs or {}), from_release)
+        return self._open(program, dict(inputs or {}), from_release, checkpointing)
 
-    def _open(self, program: Definition, inputs: dict[str, str], init: str | None) -> Run:
+    def _open(
+        self, program: Definition, inputs: dict[str, str], init: str | None, checkpointing: Any
+    ) -> Run:
         spec = self._spec(program, inputs, init)
         key = compute_provenance_hash([], spec)
         build_id = uuid.uuid4().hex
@@ -505,7 +591,8 @@ class Ledger:
             lease_owner=attempt,
             lease_duration_seconds=self.lease_seconds,
         )
-        return Run(self, Checkpoints(self.config, build_id, attempt, key, program.spec), init)
+        checkpoints = Checkpoints(self.config, build_id, attempt, key, program.spec)
+        return Run(self, checkpoints, init, checkpointing)
 
     def find(
         self, program: Definition, inputs: Mapping[str, str] | None = None, init: str | None = None
@@ -514,7 +601,9 @@ class Ledger:
         build = self.builds.find_open_build(self.computation_key(program, inputs or {}, init))
         return build.build_id if build is not None else None
 
-    def resume(self, execution_id: str, from_release: str | None = None) -> Run:
+    def resume(
+        self, execution_id: str, from_release: str | None = None, *, checkpointing: Any = None
+    ) -> Run:
         """Continue *execution_id* in a new attempt, fencing every earlier one.
 
         *from_release* defaults to the execution's latest accepted checkpoint; with
@@ -547,7 +636,7 @@ class Ledger:
         checkpoints = Checkpoints(
             self.config, execution_id, attempt, build.computation_key, program.spec
         )
-        return Run(self, checkpoints, from_release or params.get("init"))
+        return Run(self, checkpoints, from_release or params.get("init"), checkpointing)
 
     # --- Checkpoints ---
 
@@ -584,6 +673,25 @@ class Ledger:
                 if bundle.release.release_id == release_id:
                     return f"{ROOT}/{release.build_id}/{release.attempt}/step-{step}"
         raise ValueError(f"release {release_id} is not an accepted checkpoint, or was collected")
+
+    def load(self, release_id: str, state: Mapping[str, Any]) -> dict[str, Any]:
+        """*state* loaded from the accepted checkpoint *release_id*, as :meth:`Run.restore` does.
+
+        For a job that loads and saves nothing, such as an evaluation or an export: no
+        run and no lease. With a verify key, the load checks the signature.
+
+        Raises:
+            ValueError: the release is not an accepted checkpoint, or was collected.
+            FileNotFoundError: the checkpoint saved nothing under a key of *state*.
+            OSError: with a verify key, the checkpoint is unsigned, signed with another
+                key, or changed since it was signed.
+        """
+        checkpoint_id = self.checkpoint_id(release_id)
+        manager = self.configure(CheckpointManager.Config.with_sync_save()).build()
+        try:
+            return _load(manager, checkpoint_id, state)
+        finally:
+            manager.close()
 
     def configure(self, config: Any) -> Any:
         """Point a ``CheckpointManager.Config`` at the ledger for loads only; returns it.
@@ -1102,8 +1210,8 @@ class Checkpoints:
     """One attempt's checkpoints, as every rank and writer process sees them.
 
     Rank 0 has it from its :class:`Run`; the others receive it (it pickles, as
-    ``torch.distributed.broadcast_object_list`` needs) and pass it to
-    :meth:`configure` like rank 0.
+    ``torch.distributed.broadcast_object_list`` needs), and every rank builds its
+    manager from :meth:`configure`.
     """
 
     ledger: LedgerConfig
@@ -1375,16 +1483,20 @@ class LedgerStorage(Storage):
 
 @dataclass
 class Run:
-    """One attempt at an execution, held by rank 0: its lease, heads and end.
+    """One attempt at an execution, held by rank 0: its lease, saves, heads and end.
 
     Renews its lease from a thread until :meth:`finish` or :meth:`close`; use it as a
     context manager. ``restores_from`` is the accepted release the attempt starts from.
+    ``checkpointing`` is the ``CheckpointManager.Config`` :attr:`manager` is built from,
+    synchronous saves when None.
     """
 
     ledger: Ledger
     checkpoints: Checkpoints
     restores_from: str | None = None
+    checkpointing: Any = None
     finished: bool = False
+    _manager: Any = field(default=None, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renewal: threading.Thread | None = field(default=None, repr=False)
     # Held by a renewal and by finish's final release, so no renewal reads a finish
@@ -1438,12 +1550,44 @@ class Run:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def configure(self, config: Any) -> Any:
-        """As :meth:`Checkpoints.configure`."""
-        return self.checkpoints.configure(config)
+    @property
+    def manager(self) -> CheckpointManager:
+        """The run's ``CheckpointManager``, built on first use; the run closes it."""
+        if self._manager is None:
+            # A copy: configure sets the storage and callbacks on it, which are this run's.
+            config = copy.copy(self.checkpointing or CheckpointManager.Config.with_sync_save())
+            self._manager = self.checkpoints.configure(config).build()
+        return self._manager
 
-    def checkpoint_id(self, step: int) -> str:
-        return self.checkpoints.checkpoint_id(step)
+    def save(self, step: int, state: Mapping[str, Any]) -> Release | Future[Any]:
+        """Save *state* as checkpoint *step*, each module or optimizer by its ``state_dict``.
+
+        A synchronous save returns the accepted release. An asynchronous one returns
+        the write's future; once it resolves, :meth:`release_of` names the release.
+
+        Raises:
+            ReleaseRejected: this attempt no longer holds the execution.
+        """
+        pending = self.manager.save(self.checkpoints.checkpoint_id(step), _saved(state))
+        if pending is not None:
+            return pending
+        release = self.release_of(step)
+        assert release is not None
+        return release
+
+    def restore(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """*state* as of ``restores_from``; as given when the attempt starts fresh.
+
+        Each module, optimizer or scheduler is loaded in place and returned as itself;
+        each other value is a default, replaced by the one saved under its key. Keys
+        not in *state* are not read.
+
+        Raises:
+            FileNotFoundError: the checkpoint saved nothing under a key of *state*.
+        """
+        if self.restores_from is None:
+            return dict(state)
+        return _load(self.manager, self.ledger.checkpoint_id(self.restores_from), state)
 
     def observe(self, program: Any, *, scope: str, coverage: str) -> ArtifactVersion:
         """Record an ``ExportedProgram`` this attempt captured, as what it observed.
@@ -1473,12 +1617,6 @@ class Run:
         """This execution's accepted checkpoint of *step*, once its save has completed."""
         return self.ledger.release_of(self.execution_id, step)
 
-    def restore(self) -> str | None:
-        """The checkpoint id of ``restores_from``, for ``CheckpointManager.load``; or None."""
-        if self.restores_from is None:
-            return None
-        return self.ledger.checkpoint_id(self.restores_from)
-
     def set_head(self, name: str, release_id: str) -> None:
         """Point the reference *name* at an accepted release (a best-validation head).
 
@@ -1497,9 +1635,13 @@ class Run:
         stays, under the reference ``vestigo-torch/<execution>``;
         :meth:`Ledger.final_checkpoint` names it.
 
+        Waits first for the save in flight, which lands as a release before the final one.
+
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
         """
+        if self._manager is not None:
+            self._manager.close()
         ended_on = next(
             (
                 bundle.release.release_id
@@ -1516,8 +1658,16 @@ class Run:
             self._stop.set()
 
     def close(self) -> None:
-        """Stop renewing. An unfinished execution with a checkpoint stays resumable,
-        its lease dropped so a resume need not wait; one without fails."""
+        """Wait for the save in flight and stop renewing. An unfinished execution with a
+        checkpoint stays resumable, its lease dropped so a resume need not wait; one
+        without fails."""
+        try:
+            if self._manager is not None:
+                self._manager.close()
+        finally:
+            self._close()
+
+    def _close(self) -> None:
         self._stop.set()
         if self._renewal is not None:
             self._renewal.join()

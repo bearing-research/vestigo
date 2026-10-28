@@ -1,9 +1,9 @@
 # PyTorch checkpoints in the ledger
 
 `vestigo.torch` makes every checkpoint a PyTorch run saves an accepted release of the
-ledger. You keep training with
-[torch-checkpointing](https://pypi.org/project/torch-checkpointing/)'s
-`CheckpointManager`; one call points it at the ledger. In return you get:
+ledger. Your model and optimizer stay plain PyTorch objects; the run saves them through
+[torch-checkpointing](https://pypi.org/project/torch-checkpointing/), whose
+`CheckpointManager` it builds and closes for you. In return you get:
 
 - runs found again by what they compute, resumed after a crash in a new attempt that
   locks out the old process;
@@ -26,11 +26,11 @@ suite runs them too (`tests/test_torch.py`, "The examples").
 
 | Term | What it is | How you get it |
 | --- | --- | --- |
-| model | a node: the module's class and `state_dict` schema (every key's shape and dtype) under a version you name | `ledger.define_model(model, version=...)` |
-| program | a node over the model: its loss, optimizer class and defaults, and any config you declare | `ledger.define_program(model_def, loss=..., optimizer=..., config=...)` |
-| execution | one run of a program on concrete inputs (a build), found again by its computation key | `ledger.start(program, inputs)` |
-| attempt | one process's hold on an execution, with a lease a thread renews | each `start`, `resume`, `branch` |
-| checkpoint | one step's files from every rank, accepted together as one release | `manager.save(run.checkpoint_id(step), ...)` |
+| model | a node: the module's class and `state_dict` schema (every key's shape and dtype) under a version you name | `ledger.run(model, ..., version=...)` |
+| program | a node over the model: its loss, optimizer class and defaults, and any config you declare | `ledger.run(..., optimizer, loss=..., config=...)` |
+| execution | one run of a program on concrete inputs (a build), found again by its computation key | `ledger.run(...)` starts one, or resumes the unfinished one |
+| attempt | one process's hold on an execution, with a lease a thread renews | each `ledger.run` |
+| checkpoint | one step's files from every rank, accepted together as one release | `run.save(step, state)` |
 
 Weights are not part of a model's identity: a retrained model keeps its node. Source is
 not hashed either; bump `version` when behaviour changes. Two programs that differ in
@@ -43,79 +43,62 @@ computation key, and that key is how a run is found again.
 ## Train and checkpoint
 
 ```python
-from torch_checkpointing.checkpoint_manager import CheckpointManager
 from vestigo.torch import Ledger
 
 with Ledger("ledger") as ledger:
-    program = ledger.define_program(
-        ledger.define_model(model, version="regression-v1"),
+    with ledger.run(
+        model,
+        optimizer,
         loss=nn.MSELoss(),
-        optimizer=optimizer,
+        version="regression-v1",
+        inputs={"train": "synthetic-regression@seed=1"},
         config={"batch": 32},
-    )
-    with ledger.start(program, {"train": "synthetic-regression@seed=1"}) as run:
-        manager = run.configure(CheckpointManager.Config.with_sync_save()).build()
-        try:
-            for epoch in range(1, epochs + 1):
-                train_one_epoch()
-                manager.save(
-                    run.checkpoint_id(epoch),
-                    {"model": model.state_dict(), "optim": optimizer.state_dict(), "epoch": epoch},
-                )
-        finally:
-            manager.close()
+    ) as run:
+        state = run.restore({"model": model, "optim": optimizer, "epoch": 0})
+        for epoch in range(state["epoch"] + 1, epochs + 1):
+            train_one_epoch()
+            run.save(epoch, {"model": model, "optim": optimizer, "epoch": epoch})
         run.finish()
 ```
 
-`run.configure` sets four fields on the config and returns it:
+`ledger.run` defines the model and program nodes, then resumes this computation's
+unfinished execution if there is one, and starts a new one if not. The same script
+therefore trains from scratch the first time and carries on after a crash.
 
-| Field | Set to | Why |
-| --- | --- | --- |
-| `storage_config` | `LedgerStorageConfig` | every file goes into the ledger's blob store as a `building` version, created before its bytes |
-| `pre_finalize_callback` | `vestigo.torch.report` | each rank records what it wrote, before the barrier |
-| `finalize_callback` | the run's `Checkpoints` | after the barrier, rank 0 accepts the step as one release, only while the run holds its lease |
-| `save.writer_config.write_to_temp_dir` | `False` | the ledger is the commit point, so nothing is renamed |
+`run.save(step, state)` saves each module, optimizer or scheduler in `state` by its
+`state_dict`, and anything else as it is. A synchronous save returns the accepted
+release. `run.restore(state)` is its mirror. Each object is loaded in place and
+returned as itself, and each other value is a default that the saved one replaces. On
+a fresh start it returns `state` as given. Only the keys you pass are read, so a
+fine-tune can restore `{"model": model}` alone; a key the checkpoint never saved
+raises `FileNotFoundError`.
 
-`run.checkpoint_id(step)` is a name under the attempt, such as
-`vestigo-torch/<execution>/<attempt>/step-5`; it names no file on any disk. Once a
-synchronous save returns, `run.release_of(step)` is the accepted release.
+Use the run as a context manager. Leaving the block closes it: it waits for the save
+in flight, then drops its lease. `finish()` also waits for that save, then ends the
+execution. A block left without `finish()` (an exception, `SystemExit`, a `break` on
+preemption) keeps the execution resumable.
+
+For explicit control, `ledger.define_model` and `ledger.define_program` return the
+nodes. `ledger.find(program, inputs)`, `ledger.start(program, inputs)` and
+`ledger.resume(execution)` are the three steps `run` takes.
 
 ## Resume after a crash
 
-Find the unfinished execution of the same computation and resume it:
-
-```python
-execution = ledger.find(program, inputs)
-run = ledger.resume(execution) if execution else ledger.start(program, inputs)
-with run:
-    manager = run.configure(CheckpointManager.Config.with_sync_save()).build()
-    checkpoint = run.restore()  # None for a fresh start
-    if checkpoint is not None:
-        state = manager.load(
-            checkpoint,
-            into={"model": model.state_dict(), "optim": None, "epoch": None},
-        )
-        model.load_state_dict(state["model"])
-        optimizer.load_state_dict(state["optim"])
-        start = state["epoch"]
-```
-
-`resume` opens a new attempt from the execution's latest accepted checkpoint, and
-`restore()` names it. Pass `from_release=` to start from an older one. `into` must
-name every item you want back: a live `state_dict` is loaded into in place, and
-`None` reads the item as it was saved.
+Run the same script again. `ledger.run` finds the unfinished execution and resumes it
+in a new attempt, from its latest accepted checkpoint. `run.restores_from` is that
+release, or None for a fresh start. `ledger.resume(execution, from_release=...)`
+resumes from an older checkpoint.
 
 How the old process ended decides when you can resume:
 
 - **It left the `with` block,** by an exception or `SystemExit`, with at least one
   checkpoint. It dropped its lease, so a resume can start at once.
 - **It was killed.** Its lease holds until `lease_seconds` (60 by default) after its
-  last renewal. Until then `resume` refuses with "another attempt's lease on it is
+  last renewal. Until then `ledger.run` refuses with "another attempt's lease on it is
   live". Pass `Ledger(..., lease_seconds=...)` to shorten the wait.
-- **It left the `with` block before any checkpoint.** The execution failed, and
-  `find` no longer returns it, so the next run starts fresh. A process killed before
-  any checkpoint fails nothing: `find` still returns its execution, and once its lease
-  lapses a resume starts it over, in the same execution.
+- **It left the `with` block before any checkpoint.** The execution failed, and the
+  next run starts fresh. A process killed before any checkpoint fails nothing: once its
+  lease lapses, the next run starts it over, in the same execution.
 
 Once a new attempt holds the execution, the old process is fenced. Its saves are
 refused, and so are its `set_head`, `observe` and `finish` calls. A process that stalls
@@ -123,29 +106,31 @@ past `lease_seconds` without renewing (a long pause, a database locked throughou
 fenced the same way, even if nothing took over: a lapsed lease is never renewed, so
 resume the execution in a new process.
 
-`finish()` completes the execution, and nothing resumes it after that. `find` returns
-only unfinished executions, so the same computation started again after a finish is a
-new execution. The checkpoint the run ended on (its attempt's last, or the one it
-restored if it saved none) stays under the reference `vestigo-torch/<execution>`, and
-`ledger.final_checkpoint(execution)` returns that release.
+`finish()` completes the execution, and nothing resumes it after that. The same
+computation run again after a finish is a new execution. The checkpoint the run ended
+on (its attempt's last, or the one it restored if it saved none) stays under the
+reference `vestigo-torch/<execution>`, and `ledger.final_checkpoint(execution)` returns
+that release.
 
 ## Branch
 
 Start a new execution from any accepted checkpoint, of this run or another:
 
 ```python
-with ledger.branch(finetune_program, release_id, inputs) as run:
-    manager = run.configure(CheckpointManager.Config.with_sync_save()).build()
-    state = manager.load(run.restore(), into={"model": model.state_dict()})
+with ledger.run(
+    model, optimizer, loss=..., version=..., inputs=..., from_release=release_id
+) as run:
+    run.restore({"model": model})  # the optimizer starts fresh
 ```
 
 The release is part of the branch's computation, so a branch never dedups against the
-run it came from. Two branches of one release with the same program and inputs do share
-a computation key: each `branch` call opens an execution of its own, and
-`ledger.find(program, inputs, init=release_id)` finds the newest unfinished one.
+run it came from. Run the same branch again after a crash and it resumes. Once it has
+finished, it starts another. `ledger.branch(program, release_id, inputs)` always opens
+a new execution.
 
-`branch` and `resume(from_release=)` refuse a release that is not a checkpoint (a final
-or derived release) and a checkpoint `collect` has taken, before opening anything.
+`ledger.run(from_release=)`, `branch` and `resume(from_release=)` refuse a release that
+is not a checkpoint (a final or derived release) and a checkpoint `collect` has taken,
+before opening anything.
 
 ## Heads
 
@@ -221,11 +206,23 @@ has read the executions is not yet among the ones it keeps.
 
 ## Asynchronous saves
 
-`CheckpointManager.Config.with_async_save()` works unchanged. The writer runs in a
+```python
+from torch_checkpointing.checkpoint_manager import CheckpointManager
+
+run = ledger.run(..., checkpointing=CheckpointManager.Config.with_async_save())
+pending = run.save(step, state)  # a future
+pending.result()
+run.release_of(step)
+```
+
+`checkpointing` is the `CheckpointManager.Config` the run builds its manager from. The
+run copies it and sets the ledger's storage and callbacks on the copy; per-item
+settings (`items`, `default`) carry over. With async saves the writer runs in a
 subprocess, so the storage and callbacks are picklable descriptions of the ledger, and
-each one opens its own connection. `save` returns a future, and the step's release exists
-once that future completes. Call `.result()` on it before `release_of`;
-`manager.close()` waits for the last write.
+each one opens its own connection. `save` returns the write's future, and the step's
+release exists once it completes. The manager has one save in flight. `finish()` and
+leaving the block wait for it. `run.manager` is the run's manager, for anything the run
+does not wrap.
 
 On macOS, torch-checkpointing 0.1.1's async stager fails whenever MPS is available,
 because it calls CUDA device functions. That is an upstream bug. Synchronous saves are
@@ -234,17 +231,33 @@ unaffected.
 ## Several ranks
 
 Rank 0 owns the run. The other ranks get its `Checkpoints` (and the checkpoint to
-restore) by broadcast, then configure their managers the same way:
+restore) by broadcast, and every rank builds its manager from them:
 
 ```python
+from torch_checkpointing.checkpoint_manager import CheckpointManager
+
 shared = [None, None]
 if rank == 0:
-    run = ledger.start(program, inputs)  # or resume
-    shared = [run.checkpoints, run.restore()]
+    run = ledger.run(model, optimizer, loss=..., version=..., inputs=...)
+    restored = run.restores_from
+    shared = [run.checkpoints, ledger.checkpoint_id(restored) if restored else None]
 dist.broadcast_object_list(shared, src=0)
 checkpoints, checkpoint = shared
 manager = checkpoints.configure(CheckpointManager.Config.with_sync_save()).build()
+manager.save(checkpoints.checkpoint_id(step), {"model": model.state_dict(), ...})
 ```
+
+`checkpoints.configure` sets four fields on the config and returns it:
+
+| Field | Set to | Why |
+| --- | --- | --- |
+| `storage_config` | `LedgerStorageConfig` | every file goes into the ledger's blob store as a `building` version, created before its bytes |
+| `pre_finalize_callback` | `vestigo.torch.report` | each rank records what it wrote, before the barrier |
+| `finalize_callback` | the run's `Checkpoints` | after the barrier, rank 0 accepts the step as one release, only while the run holds its lease |
+| `save.writer_config.write_to_temp_dir` | `False` | the ledger is the commit point, so nothing is renamed |
+
+`checkpoints.checkpoint_id(step)` is a name under the attempt, such as
+`vestigo-torch/<execution>/<attempt>/step-5`; it names no file on any disk.
 
 Each rank writes its own files (`model_0.pt`, `model_1.pt`, ...) and loads its own back.
 Rank 0 accepts a step only after the barrier has seen every rank write. If a rank dies
@@ -400,20 +413,21 @@ Treat every machine in the training job as holding the key.
 
 ### Jobs that only load
 
-A gate needs no run. `ledger.configure` points a `CheckpointManager.Config` at a
-storage that loads and refuses to save. It holds no lease, and opens no execution:
+A gate needs no run. `ledger.load(release_id, state)` loads an accepted checkpoint
+into `state` as `run.restore` does. It holds no lease, opens no execution, and closes
+its manager before it returns:
 
 ```python
 reader = Ledger("ledger", verify_key=bytes.fromhex(Path("verify.key").read_text()))
 release_id, _ = reader.releases.reference("regression/best")
-manager = reader.configure(CheckpointManager.Config.with_sync_save()).build()
 try:
-    state = manager.load(reader.checkpoint_id(release_id), into={"model": model.state_dict()})
+    reader.load(release_id, {"model": model})
 except OSError as exc:
     raise SystemExit(f"refused {release_id}: {exc}")
-finally:
-    manager.close()
 ```
+
+`ledger.configure` points a `CheckpointManager.Config` of your own at the same
+load-only storage, for loads the run does not wrap; load by `ledger.checkpoint_id`.
 
 A ledger with only the verify key cannot sign. If such a ledger opens a run, that
 run's saves are unsigned, and its own loads refuse them. Give a job that trains the

@@ -74,6 +74,20 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Changed
 
+- `vestigo.torch` trains through one call and two methods. `Ledger.run(model,
+  optimizer, *, loss, version, inputs, config, from_release, checkpointing)`
+  defines the model and program, then resumes the computation's unfinished
+  execution or starts one (a branch with `from_release`). The `Run` owns its
+  `CheckpointManager`, built from `checkpointing` (synchronous saves by
+  default) and closed by `finish` and `close` before the final release and
+  before the lease drops. `Run.save(step, state)` saves modules and
+  optimizers by their `state_dict` and returns the accepted release (an
+  async save's future); `Run.restore(state)` loads them in place and returns
+  the saved plain values, or `state` on a fresh start. `Ledger.load(release_id,
+  state)` does the same for a job with no run. `Run.configure` and
+  `Run.checkpoint_id` are gone (`Run.checkpoints` has both, for other ranks),
+  and `restore` no longer returns a checkpoint id (`Ledger.checkpoint_id(
+  run.restores_from)`). The guide and examples use the new calls (#45).
 - A lapsed lease stays lapsed. `renew_lease` returns False once the lease has
   expired, and `open_attempt` refuses to re-open the attempt it covered, so an
   attempt that stalled past its lease is fenced for good, as one whose build was
