@@ -15,10 +15,12 @@ A resume continues the build in a new attempt, fencing the old one; a branch is 
 build whose computation names the release it starts from. Loads read accepted releases
 through the same storage, checking each file against its recorded digest.
 
-With a signing key (the ``sign`` extra), rank 0 signs each checkpoint's manifest with
-Ed25519 as it accepts it; a ledger with the matching verify key loads a file only once
-the signature, the file's entry in the manifest and its bytes all agree, so neither
-the blob store nor the metadata database alone can change what a load deserializes.
+With a signing key (the ``sign`` extra), each rank signs its report with Ed25519 and
+rank 0 signs the checkpoint's manifest from the reports that verify; a ledger with the
+matching verify key finds a checkpoint's files in its signed manifest and loads one only
+once its bytes match the size and digest signed there, so neither the blob store nor
+the metadata database, during the save or after it, can change what a load
+deserializes.
 
 Saves may be synchronous or asynchronous (the writer then runs in a subprocess, which is
 why everything the writer holds is a picklable description of the ledger, opened per
@@ -279,6 +281,16 @@ class _Location:
         return f"torch_{self.execution_id}@attempt={self.attempt}@step={self.step}"
 
 
+@dataclass(frozen=True)
+class _File:
+    """A file of an accepted checkpoint: the version holding it, and its size and digest."""
+
+    artifact_id: str
+    version: int
+    byte_size: int | None
+    sha256: str | None
+
+
 class Ledger:
     """A ledger seen as training runs; see :class:`LedgerConfig` for the arguments.
 
@@ -286,8 +298,9 @@ class Ledger:
     renews it at a third of that); ``writable_seconds`` bounds an attempt's whole write
     window, past which nothing it releases is accepted.
 
-    With ``signing_key`` (a raw Ed25519 private key) rank 0 signs every checkpoint it
-    accepts, and the ledger verifies with the key's public half. With ``verify_key``
+    With ``signing_key`` (a raw Ed25519 private key) each rank signs its report and
+    rank 0 every checkpoint it accepts, and the ledger verifies with the key's public
+    half. With ``verify_key``
     alone it verifies and cannot sign: a reader (an evaluation job, another team).
     Either way every load is verified, and an unsigned checkpoint is refused. The
     signing key travels with :class:`Checkpoints` to every rank and the async writer;
@@ -534,7 +547,7 @@ class Ledger:
             if bundle.release.state != "accepted":
                 continue
             for version in bundle.outputs:
-                if version.params.get("manifest"):
+                if version.params.get("manifest") and "step" in version.params:
                     yield version.params["step"], bundle
 
     def release_of(self, execution_id: str, step: int) -> Release | None:
@@ -572,12 +585,37 @@ class Ledger:
         config.storage_config = LedgerStorageConfig(self.config)
         return config
 
-    def _files(self, at: _Location) -> dict[str, ArtifactVersion] | None:
-        """The files of the accepted checkpoint *at* names, by path in it; None if none."""
+    def _files(self, at: _Location) -> dict[str, _File] | None:
+        """The files of the accepted checkpoint *at* names, by path in it; None if none.
+
+        With a verify key, as its signed manifest lists them: the database is not trusted.
+
+        Raises:
+            OSError: with a verify key, the manifest is missing, malformed, unsigned,
+                does not verify, or is signed for another checkpoint.
+        """
         bundle = self._checkpoint(at)
         if bundle is None:
             return None
-        return {v.params["file"]: v for v in bundle.outputs if "file" in v.params}
+        if self.config.verify_key is None:
+            return {
+                v.params["file"]: _File(v.id, v.version, v.byte_size, v.content_sha256)
+                for v in bundle.outputs
+                if "file" in v.params
+            }
+        where = f"step {at.step} of execution {at.execution_id}"
+        rows = [v for v in bundle.outputs if v.params.get("manifest")]
+        if len(rows) != 1:
+            raise OSError(f"{where} has {len(rows)} manifests")
+        raw = self.store.read_blob(rows[0].id, rows[0].version)
+        manifest = self._verified(raw, f"the manifest of {where}")
+        named = (manifest["execution"], manifest["attempt"], manifest["step"], manifest["release"])
+        if named != (at.execution_id, at.attempt, at.step, bundle.release.release_id):
+            raise OSError(f"the manifest of {where} is signed for another checkpoint")
+        return {
+            e["file"]: _File(e["artifact_id"], e["version"], e["byte_size"], e["sha256"])
+            for e in manifest["files"]
+        }
 
     def _checkpoint(self, at: _Location) -> ReleaseBundle | None:
         for step, bundle in self._accepted(at.execution_id):
@@ -585,40 +623,41 @@ class Ledger:
                 return bundle
         return None
 
-    def _signed_digest(self, at: _Location, version: ArtifactVersion) -> str:
-        """The digest the signed manifest gives the file *version* holds at *at*.
+    def _sign(self, document: dict[str, Any]) -> dict[str, Any]:
+        """*document* with its signature, given a signing key; else as it is."""
+        if self.config.signing_key is None:
+            return document
+        key = _ed25519().Ed25519PrivateKey.from_private_bytes(self.config.signing_key)
+        return {**document, "signature": key.sign(_signed(document)).hex()}
+
+    def _verified(self, raw: bytes | None, what: str) -> dict[str, Any]:
+        """The signed document *raw* holds, once its signature verifies under the verify key.
+
+        Its fields are trusted only after that, so only its envelope is checked first.
 
         Raises:
-            OSError: the checkpoint is unsigned, its signature does not verify under
-                the verify key, or the manifest does not name this file as this version.
+            OSError: *raw* is missing, is not a JSON object, is unsigned, or its
+                signature does not verify.
         """
         from cryptography.exceptions import InvalidSignature
 
         assert self.config.verify_key is not None
-        bundle = self._checkpoint(at)
-        [row] = [v for v in bundle.outputs if v.params.get("manifest")] if bundle else [None]
-        raw = self.store.read_blob(row.id, row.version) if row is not None else None
-        manifest = json.loads(raw) if raw is not None else {}
-        where = f"step {at.step} of execution {at.execution_id}"
-        if "signature" not in manifest:
-            raise OSError(f"{where} is not signed")
+        if raw is None:
+            raise OSError(f"{what} is missing")
+        try:
+            document = json.loads(raw)
+        except ValueError as exc:
+            raise OSError(f"{what} is malformed") from exc
+        if not isinstance(document, dict):
+            raise OSError(f"{what} is malformed")
+        if "signature" not in document:
+            raise OSError(f"{what} is not signed")
         public = _ed25519().Ed25519PublicKey.from_public_bytes(self.config.verify_key)
         try:
-            public.verify(bytes.fromhex(manifest["signature"]), _signed(manifest))
-        except (InvalidSignature, ValueError) as exc:
-            raise OSError(f"the signature on {where} does not verify") from exc
-        assert bundle is not None
-        named = (manifest["execution"], manifest["attempt"], manifest["step"], manifest["release"])
-        if named != (at.execution_id, at.attempt, at.step, bundle.release.release_id):
-            raise OSError(f"the manifest of {where} is signed for another checkpoint")
-        for entry in manifest["files"]:
-            if (entry["file"], entry["artifact_id"], entry["version"]) == (
-                at.file,
-                version.id,
-                version.version,
-            ):
-                return entry["sha256"]
-        raise OSError(f"the signed manifest of {where} does not name {at.file} as this version")
+            public.verify(bytes.fromhex(document["signature"]), _signed(document))
+        except (InvalidSignature, ValueError, TypeError) as exc:
+            raise OSError(f"the signature on {what} does not verify") from exc
+        return document
 
     # --- Derived releases ---
 
@@ -891,7 +930,31 @@ class Ledger:
     def _report(self, writer: Checkpoints, at: _Location, files: list[dict[str, Any]]) -> None:
         rank, _ = _rank()
         artifact_id, version = self._stage(writer, at, f"rank={rank}", {"rank": rank})
-        self._write_small(artifact_id, version, _canonical({"rank": rank, "files": files}))
+        # Signed by the rank that hashed the bytes, so rank 0 signs no digest a bucket
+        # writer swapped in between this report and the acceptance.
+        report = {
+            "execution": at.execution_id,
+            "attempt": at.attempt,
+            "step": at.step,
+            "rank": rank,
+            "files": files,
+        }
+        self._write_small(artifact_id, version, _canonical(self._sign(report)))
+
+    def _files_reported(self, at: _Location, rank: int, raw: bytes) -> list[dict[str, Any]]:
+        """The files *rank* reported writing of the step; verified, given a signing key.
+
+        Raises:
+            OSError: the report does not verify, or is signed for another rank or step.
+        """
+        if self.config.signing_key is None:
+            return json.loads(raw)["files"]
+        what = f"rank {rank}'s report of step {at.step} of execution {at.execution_id}"
+        report = self._verified(raw, what)
+        named = (report["execution"], report["attempt"], report["step"], report["rank"])
+        if named != (at.execution_id, at.attempt, at.step, rank):
+            raise OSError(f"{what} is signed for another checkpoint")
+        return report["files"]
 
     def _accept(self, writer: Checkpoints, at: _Location) -> Release:
         for step, bundle in self._accepted(at.execution_id):
@@ -911,7 +974,11 @@ class Ledger:
             if data is None:
                 raise ValueError(f"rank {rank} reported nothing for step {at.step}")
             reports.append((report_id, pending[-1].version, data))
-        files = [entry for *_, data in reports for entry in json.loads(data)["files"]]
+        files = [
+            entry
+            for rank, (*_, data) in enumerate(reports)
+            for entry in self._files_reported(at, rank, data)
+        ]
         if len({entry["file"] for entry in files}) != len(files):
             raise ValueError(f"two ranks wrote one file of step {at.step}")
 
@@ -939,9 +1006,7 @@ class Ledger:
                 "computation_key": writer.computation_key,
                 "files": files,
             }
-            if self.config.signing_key is not None:
-                key = _ed25519().Ed25519PrivateKey.from_private_bytes(self.config.signing_key)
-                manifest["signature"] = key.sign(_signed(manifest)).hex()
+            manifest = self._sign(manifest)
             manifest_id, version = self._stage(
                 writer,
                 at,
@@ -1171,7 +1236,7 @@ class LedgerStorage(Storage):
 
     # --- Reading ---
 
-    def _accepted_files(self, path: Path) -> tuple[_Location, dict[str, ArtifactVersion]]:
+    def _accepted_files(self, path: Path) -> tuple[_Location, dict[str, _File]]:
         try:
             at = _Location.of(path)
         except FileNotFoundError:
@@ -1180,7 +1245,7 @@ class LedgerStorage(Storage):
             files = ledger._files(at)
         return at, files or {}
 
-    def _version(self, path: Path) -> ArtifactVersion:
+    def _file(self, path: Path) -> _File:
         at, files = self._accepted_files(path)
         if at.file not in files:
             raise FileNotFoundError(f"{path} is not a file of an accepted checkpoint")
@@ -1202,19 +1267,16 @@ class LedgerStorage(Storage):
         return sorted({f[len(below) :].split("/")[0] for f in files if f.startswith(below)})
 
     def getsize(self, path: Path) -> int:
-        size = self._version(path).byte_size
+        # The loader reads this many bytes, so with a verify key it is the signed size.
+        size = self._file(path).byte_size
         assert size is not None
         return size
 
     def stream_read(self, path: Path, read_args: ReadArgs | None = None) -> io.RawIOBase:
-        version = self._version(path)
-        expected = version.content_sha256
+        file = self._file(path)
         with self.ledger.open() as ledger:
-            if ledger.config.verify_key is not None:
-                # The signed manifest's digest, not the row's: the database is not trusted.
-                expected = ledger._signed_digest(_Location.of(path), version)
-            data = ledger.store.read_blob(version.id, version.version)
-        if data is None or hashlib.sha256(data).hexdigest() != expected:
+            data = ledger.store.read_blob(file.artifact_id, file.version)
+        if data is None or hashlib.sha256(data).hexdigest() != file.sha256:
             raise OSError(f"{path} differs from the checkpoint the ledger accepted")
         # What the reader asks of a stream, readinto and seek, a BytesIO has.
         return cast(io.RawIOBase, io.BytesIO(data))

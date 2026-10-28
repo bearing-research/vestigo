@@ -110,9 +110,10 @@ The package exports nothing at its top level; a consumer imports each module.
   `Ledger.derive(from_release, name, outputs)` publishes what was computed
   from an accepted checkpoint (an export, evaluation metrics) as a release of
   its own, which keeps only its own outputs; `Ledger.derived` finds it again.
-  `Ledger(signing_key=)` (the `sign` extra) signs each checkpoint's manifest
-  with Ed25519 as rank 0 accepts it, and `verify_key=` makes every load check
-  the signature, the file's entry and its bytes before deserializing.
+  `Ledger(signing_key=)` (the `sign` extra) has each rank sign its report and
+  rank 0 sign each checkpoint's manifest with Ed25519, and `verify_key=` makes
+  every load take the files from the signed manifest and check their bytes
+  before deserializing.
   `Ledger.configure` points a `CheckpointManager.Config` at a storage that
   only loads, for a job with no run (an evaluation, a promotion gate).
   `Run.observe(exported_program,

@@ -288,11 +288,14 @@ training job wrote them, whoever else can write the stores.
 
 Every load checks each file's sha256 before any of it is deserialized. Without a key,
 the digest it checks against is the one the database recorded when the checkpoint was
-accepted. With a verify key, it is the one in the manifest the training job signed.
+accepted. With a verify key, the load takes the checkpoint's files, their sizes and
+their digests from the manifest the training job signed, and the database only finds
+that manifest.
 
 | Who can write | Without signing | With signing |
 | --- | --- | --- |
 | the bucket (an object PUT) | refused: the bytes differ from the recorded digest | refused |
+| the bucket, while a save is in flight (a file and the rank's report of it) | **loaded**: rank 0 records the digest the forged report gives | refused: each rank signs its report, so the save fails, or the manifest names the digest the rank computed |
 | the bucket and the database (a PUT and an UPDATE) | **loaded**: the forger rewrites the recorded digest too | refused: the signed manifest names the old digest, and rewriting it breaks the signature |
 | the database only, pointing a head or a resume at an older checkpoint | loaded | **loaded**: the older checkpoint is genuinely signed |
 | whoever holds the signing key | loaded | **loaded** |
@@ -356,11 +359,14 @@ verify_key = key.public_key().public_bytes_raw()  # public: every job that loads
 ledger = Ledger("ledger", signing_key=bytes.fromhex(Path("/secrets/signing.key").read_text()))
 ```
 
-Nothing else changes. Rank 0 signs each checkpoint's manifest as it accepts it, and
-the signature covers the execution, the attempt, the step, the release id, the
-computation key, and every file's id, version, size and digest. A signing ledger also
-verifies its own loads with its own public key, so a resume or branch refuses a
-checkpoint that was changed after it was signed.
+Nothing else changes. Each rank signs its report of what it wrote, with the digests it
+computed as the bytes went out, bound to the execution, attempt, step and rank. Rank 0
+verifies every report before it signs the checkpoint's manifest, and a report that does
+not verify fails the save with an `OSError`. The manifest's signature covers the
+execution, the attempt, the step, the release id, the computation key, and every
+file's id, version, size and digest. A signing ledger also verifies its own loads with
+its own public key, so a resume or branch refuses a checkpoint that was changed after
+it was signed.
 
 The key goes wherever the ledger's description goes:
 
@@ -397,11 +403,14 @@ Each refusal is an `OSError`, raised before any of the file is deserialized:
 
 | Message | Means |
 | --- | --- |
-| `... is not signed` | the training job ran without a signing key, or the checkpoint predates signing |
+| `... is not signed` | the training job ran without a signing key, the checkpoint predates signing, or someone stripped the signature from its manifest |
 | `the signature on ... does not verify` | it was signed with another key (a rotation, another team), or its manifest was rewritten |
 | `the manifest of ... is signed for another checkpoint` | another checkpoint's genuine manifest was copied into this one |
-| `the signed manifest of ... does not name ...` | a file was added, or swapped for another version |
+| `... is missing`, `... is malformed`, `... has 2 manifests` | the manifest's bytes or rows were deleted, garbled or duplicated |
 | `... differs from the checkpoint the ledger accepted` | the bytes are not the ones that were signed |
+
+Since an unsigned manifest cannot be told from a stripped one, a gate that sees
+`is not signed` for a checkpoint it expected to be signed should treat it as tampering.
 
 ### Rotating a key
 
@@ -419,7 +428,8 @@ checkpoint is never re-signed, because versions are immutable.
   release id it finished on through a channel the database cannot rewrite (its job
   log, a CI output), and have the gate load that id rather than a head.
 - **Derived releases and observations.** These go through `Ledger.derive` and
-  `Run.observe`, and are checked against the database's digests only.
+  `Run.observe`. The ledger records their digests, but nothing in vestigo reads them
+  back and checks them. Whoever reads one checks it.
 
 ## What the storage refuses
 
