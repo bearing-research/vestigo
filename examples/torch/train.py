@@ -26,7 +26,6 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch_checkpointing.checkpoint_manager import CheckpointManager
 
 from vestigo.torch import Ledger
 
@@ -57,64 +56,60 @@ def main() -> None:
     x, y = data()
 
     with Ledger(args.ledger, signing_key=signing_key) as ledger:
-        program = ledger.define_program(
-            ledger.define_model(model, version="regression-v1"),
+        # Resumes this computation's unfinished execution, if there is one.
+        with ledger.run(
+            model,
+            optimizer,
             loss=nn.MSELoss(),
-            optimizer=optimizer,
+            version="regression-v1",
+            inputs=INPUTS,
             config={"batch": 32},
-        )
-        execution = ledger.find(program, INPUTS)
-        run = ledger.resume(execution) if execution else ledger.start(program, INPUTS)
-        with run:
-            manager = run.configure(CheckpointManager.Config.with_sync_save()).build()
-            try:
-                epoch, best = 0, math.inf
-                checkpoint = run.restore()
-                if checkpoint is not None:
-                    # A tensor template is loaded into in place; None reads the item as saved.
-                    into = dict.fromkeys(["optim", "shuffle", "epoch", "best"])
-                    state = manager.load(checkpoint, into={"model": model.state_dict(), **into})
-                    model.load_state_dict(state["model"])
-                    optimizer.load_state_dict(state["optim"])
-                    shuffle.set_state(state["shuffle"])
-                    epoch, best = state["epoch"], state["best"]
-                    print(f"resumed {run.execution_id} after epoch {epoch}")
-                else:
-                    print(f"started {run.execution_id}")
+        ) as run:
+            # The model and optimizer load in place; the rest are defaults for a fresh start.
+            state = run.restore(
+                {
+                    "model": model,
+                    "optim": optimizer,
+                    "shuffle": shuffle.get_state(),
+                    "epoch": 0,
+                    "best": math.inf,
+                }
+            )
+            shuffle.set_state(state["shuffle"])
+            epoch, best = state["epoch"], state["best"]
+            if run.restores_from is not None:
+                print(f"resumed {run.execution_id} after epoch {epoch}")
+            else:
+                print(f"started {run.execution_id}")
 
-                while epoch < args.epochs:
-                    epoch += 1
-                    for batch in torch.randperm(len(x), generator=shuffle).split(32):
-                        optimizer.zero_grad()
-                        nn.functional.mse_loss(model(x[batch]), y[batch]).backward()
-                        optimizer.step()
-                    with torch.no_grad():
-                        loss = nn.functional.mse_loss(model(x), y).item()
-                    best = min(best, loss)
-                    manager.save(
-                        run.checkpoint_id(epoch),
-                        {
-                            "model": model.state_dict(),
-                            "optim": optimizer.state_dict(),
-                            "shuffle": shuffle.get_state(),
-                            "epoch": epoch,
-                            "best": best,
-                        },
-                    )
-                    # A synchronous save returns once rank 0 has accepted the release.
-                    release = run.release_of(epoch)
-                    assert release is not None
-                    if loss == best:
-                        run.set_head(HEAD, release.release_id)
-                    print(f"epoch {epoch}: loss {loss:.4f}, release {release.release_id}")
-                    if args.keep:
-                        ledger.collect(keep=args.keep)
-                    if epoch == args.crash_at:
-                        # Leaving the block closes the run: it keeps its checkpoints
-                        # and drops its lease, so the next command resumes at once.
-                        raise SystemExit(f"stopped after epoch {epoch}")
-            finally:
-                manager.close()
+            while epoch < args.epochs:
+                epoch += 1
+                for batch in torch.randperm(len(x), generator=shuffle).split(32):
+                    optimizer.zero_grad()
+                    nn.functional.mse_loss(model(x[batch]), y[batch]).backward()
+                    optimizer.step()
+                with torch.no_grad():
+                    loss = nn.functional.mse_loss(model(x), y).item()
+                best = min(best, loss)
+                release = run.save(
+                    epoch,
+                    {
+                        "model": model,
+                        "optim": optimizer,
+                        "shuffle": shuffle.get_state(),
+                        "epoch": epoch,
+                        "best": best,
+                    },
+                )
+                if loss == best:
+                    run.set_head(HEAD, release.release_id)
+                print(f"epoch {epoch}: loss {loss:.4f}, release {release.release_id}")
+                if args.keep:
+                    ledger.collect(keep=args.keep)
+                if epoch == args.crash_at:
+                    # Leaving the block closes the run: it keeps its checkpoints
+                    # and drops its lease, so the next command resumes at once.
+                    raise SystemExit(f"stopped after epoch {epoch}")
 
             batch_dim = torch.export.Dim("batch")
             exported = torch.export.export(model, (x[:2],), dynamic_shapes=({0: batch_dim},))

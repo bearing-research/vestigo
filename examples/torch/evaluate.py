@@ -23,7 +23,6 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from torch import nn
-from torch_checkpointing.checkpoint_manager import CheckpointManager
 from train import HEAD
 
 from vestigo.torch import Ledger
@@ -44,16 +43,10 @@ def main() -> None:
         if head is None:
             raise SystemExit(f"no {HEAD} yet: run train.py first")
         release_id, _revision = head
-        manager = ledger.configure(CheckpointManager.Config.with_sync_save()).build()
         try:
-            state = manager.load(
-                ledger.checkpoint_id(release_id), into={"model": model.state_dict()}
-            )
+            ledger.load(release_id, {"model": model})
         except OSError as exc:
             raise SystemExit(f"refused release {release_id}: {exc}") from exc
-        finally:
-            manager.close()
-    model.load_state_dict(state["model"])
     print(f"loaded release {release_id}" + (", signature verified" if verify_key else ""))
 
     generator = torch.Generator().manual_seed(3)

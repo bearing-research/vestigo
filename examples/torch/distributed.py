@@ -47,15 +47,16 @@ def main() -> None:
     shared: list[object] = [None, None]
     if rank == 0:
         ledger = Ledger(args.ledger)
-        program = ledger.define_program(
-            ledger.define_model(model, version="regression-v1"),
+        run = ledger.run(
+            model,
+            optimizer,
             loss=nn.MSELoss(),
-            optimizer=optimizer,
+            version="regression-v1",
+            inputs=INPUTS,
             config={"batch": 32, "world_size": world},
         )
-        execution = ledger.find(program, INPUTS)
-        run = ledger.resume(execution) if execution else ledger.start(program, INPUTS)
-        shared = [run.checkpoints, run.restore()]
+        restored = run.restores_from
+        shared = [run.checkpoints, ledger.checkpoint_id(restored) if restored else None]
     dist.broadcast_object_list(shared, src=0)
     checkpoints, checkpoint = shared
     assert isinstance(checkpoints, Checkpoints)

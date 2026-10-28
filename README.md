@@ -93,18 +93,20 @@ The package exports nothing at its top level; a consumer imports each module.
   `Ledger(artifact_dir, *, dsn=None, blobs=None, lease_seconds=60.0,
   writable_seconds=604800.0, signing_key=None, verify_key=None)` (Postgres
   metadata and an object store through `RemoteBlobs`, for ranks on several
-  machines) with
-  `define_model` and `define_program` (a model's class and `state_dict`
-  schema under a declared version; a program's loss and optimizer over it,
-  as structural nodes), `start`, `resume`, `branch` and `find` for
-  executions, and the `Run` they return. `Run.configure` (or
-  `Checkpoints.configure` on another rank, `Run.checkpoints` broadcast to
-  it) points a `torch_checkpointing` `CheckpointManager.Config` at
-  `LedgerStorage`, so every file a rank writes is a version of the ledger
-  and each saved step one release, accepted by rank 0 after the barrier
-  only while the run holds its lease; synchronous or asynchronous saves.
-  `restore` names the checkpoint a resume or branch loads, read back
-  through the same storage and checked against its digests;
+  machines) with `run(model, optimizer, *, loss, version, inputs=None,
+  config=None, from_release=None, checkpointing=None)`, which defines the
+  model and program nodes (a model's class and `state_dict` schema under a
+  declared version; a program's loss and optimizer over it) and resumes the
+  computation's unfinished execution or starts one, branching from
+  `from_release` when given. The `Run` it returns owns a `torch_checkpointing`
+  `CheckpointManager` (synchronous saves by default, or the `checkpointing`
+  config): `Run.save(step, state)` saves each module or optimizer by its
+  `state_dict` as one release, accepted by rank 0 after the barrier only
+  while the run holds its lease, and `Run.restore(state)` loads them back in
+  place, each file checked against its digest. `define_model`,
+  `define_program`, `start`, `resume`, `branch` and `find` are the explicit
+  steps; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
+  rank's `CheckpointManager.Config` at `LedgerStorage`.
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
   checkpoints no execution needs: an unfinished run keeps its newest `keep`
@@ -119,8 +121,9 @@ The package exports nothing at its top level; a consumer imports each module.
   rank 0 sign each checkpoint's manifest with Ed25519, and `verify_key=` makes
   every load take the files from the signed manifest and check their bytes
   before deserializing.
-  `Ledger.configure` points a `CheckpointManager.Config` at a storage that
-  only loads, for a job with no run (an evaluation, a promotion gate).
+  `Ledger.load(release_id, state)` loads a checkpoint as `Run.restore` does,
+  for a job with no run (an evaluation, a promotion gate); `Ledger.configure`
+  points a `CheckpointManager.Config` at the same load-only storage.
   `Run.observe(exported_program,
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
