@@ -19,6 +19,10 @@ Saves may be synchronous or asynchronous (the writer then runs in a subprocess, 
 why everything the writer holds is a picklable description of the ledger, opened per
 call), on one rank or many (rank and world size from the default process group, else
 ``RANK`` and ``WORLD_SIZE``).
+
+An ``ExportedProgram`` the run captured is recorded beside its checkpoints as an
+observed implementation: the archive with its versions and constraints, and a declared
+scope and coverage. It never enters a node, so no definition changes because of it.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import re
 import threading
 import time
 import uuid
+import zipfile
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,6 +47,7 @@ from urllib.parse import quote
 
 try:
     import torch.distributed as dist
+    import torch.export
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
 except ImportError as exc:
     raise ImportError("vestigo.torch needs the torch extra: install vestigo[torch]") from exc
@@ -62,7 +68,7 @@ from vestigo.provenance import (
     derive_subkey,
     run_output_key,
 )
-from vestigo.releases import Release, ReleaseBundle, ReleaseRejected, ReleaseStore
+from vestigo.releases import Release, ReleaseBundle, ReleaseRejected, ReleaseStore, lease_held
 from vestigo.sql_backend import PostgresDialect
 from vestigo.store import ArtifactStore, ArtifactVersion, StagedVersion
 
@@ -84,6 +90,41 @@ def _canonical(value: Any) -> bytes:
 def _fqn(obj: object) -> str:
     cls = obj if isinstance(obj, type) else type(obj)
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _archive_metadata(data: bytes) -> dict[str, Any]:
+    """What a PT2 archive says of itself: its own versions, and each program's."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        root = names[0].split("/", 1)[0]
+
+        def text(name: str) -> str:
+            return archive.read(f"{root}/{name}").decode().strip()
+
+        programs = {}
+        for name in names:
+            path = PurePosixPath(name)
+            if path.parent == PurePosixPath(root, "models") and path.suffix == ".json":
+                program = json.loads(archive.read(name))
+                programs[path.stem] = {
+                    "schema_version": program["schema_version"],
+                    "opset_version": program["opset_version"],
+                    "torch_version": program["torch_version"],
+                    "range_constraints": program["range_constraints"],
+                    "verifiers": program["verifiers"],
+                    "guards": len(program.get("guards_code") or []),
+                }
+        # The zip's own timestamps differ per save; its entries do not.
+        contents = hashlib.sha256()
+        for name in sorted(names):
+            contents.update(f"{name}\0{hashlib.sha256(archive.read(name)).hexdigest()}\0".encode())
+        return {
+            "contents_sha256": contents.hexdigest(),
+            "archive_version": text("archive_version"),
+            "data_version": text(".data/version"),
+            "serialization_id": text(".data/serialization_id"),
+            "programs": programs,
+        }
 
 
 def _rank() -> tuple[int, int]:
@@ -461,6 +502,63 @@ class Ledger:
             artifact_id, version, "", None, len(data), hashlib.sha256(data).hexdigest()
         )
 
+    def observations(self, execution_id: str) -> list[ArtifactVersion]:
+        """The implementations the execution's attempts recorded, oldest first."""
+        build = self.builds.get_build(execution_id)
+        if build is None or build.computation_key is None:
+            raise ValueError(f"execution {execution_id} does not exist")
+        return [
+            v
+            for v in self.store.versions_of_computation(build.computation_key)
+            if v.state == "ready" and "observed" in v.params
+        ]
+
+    def _observe(
+        self, writer: Checkpoints, data: bytes, scope: str, coverage: str
+    ) -> ArtifactVersion:
+        metadata = _archive_metadata(data)
+        artifact_id = f"torch_{writer.execution_id}@observed={quote(scope, safe='')}"
+        key = derive_subkey(
+            writer.computation_key,
+            f"build={writer.execution_id}",
+            f"attempt={writer.attempt}",
+            f"observed={metadata['contents_sha256']}",
+            f"coverage={quote(coverage, safe='')}",
+        )
+        recorded = self.store.find_version_by_provenance(artifact_id, key)
+        if recorded is not None:
+            return recorded
+        version = self.store.create_artifact(
+            artifact_id,
+            key,
+            TransformSpec(
+                EXECUTOR,
+                {
+                    "observed": scope,
+                    "coverage": coverage,
+                    "attempt": writer.attempt,
+                    **metadata,
+                },
+                [],
+            ),
+            definition=[writer.program],
+            computation_key=writer.computation_key,
+        )
+        self.store.write_blob(artifact_id, version, data)
+        stored = self.store.finalize_artifact(
+            artifact_id,
+            version,
+            "",
+            None,
+            len(data),
+            hashlib.sha256(data).hexdigest(),
+            fence=lambda conn, *_: lease_held(
+                conn, writer.execution_id, writer.attempt, time.time()
+            ),
+        )
+        assert stored is not None
+        return stored
+
     def _report(self, writer: Checkpoints, at: _Location, files: list[dict[str, Any]]) -> None:
         rank, _ = _rank()
         artifact_id, version = self._stage(writer, at, f"rank={rank}", {"rank": rank})
@@ -828,6 +926,25 @@ class Run:
 
     def checkpoint_id(self, step: int) -> str:
         return self.checkpoints.checkpoint_id(step)
+
+    def observe(self, program: Any, *, scope: str, coverage: str) -> ArtifactVersion:
+        """Record an ``ExportedProgram`` this attempt captured, as what it observed.
+
+        The PT2 archive ``torch.export.save`` writes is stored as a version of the
+        execution, its archive, schema and opset versions, torch version and range
+        constraints as metadata. *scope* says what the graph is of (``model_forward``:
+        not the training loop, the update or the checkpointing) and *coverage* how much
+        of it (``complete_under_declared_constraints``); the ledger records both and
+        reads neither. No node changes, so neither the program's nor the model's id
+        moves. The same program recorded twice is one version (its archive's entries
+        are compared, not the zip's timestamps).
+
+        Raises:
+            BuildLeaseLost: this attempt no longer holds the execution.
+        """
+        buffer = io.BytesIO()
+        torch.export.save(program, buffer)
+        return self.ledger._observe(self.checkpoints, buffer.getvalue(), scope, coverage)
 
     def release_of(self, step: int) -> Release | None:
         """This execution's accepted checkpoint of *step*, once its save has completed."""
