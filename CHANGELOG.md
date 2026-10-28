@@ -35,7 +35,7 @@ All notable changes to vestigo are recorded here. The format follows
   through a temporary file rather than memory. The same program exported
   again under one scope and coverage is one version (graph, weights and
   constants compared, not the example inputs). `Ledger.observations` lists
-  an execution's own records (#31, #PR).
+  an execution's own records (#31, #32).
 
 ## 0.2.1 - 2026-10-27
 
