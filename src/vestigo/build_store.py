@@ -79,9 +79,17 @@ CREATE TABLE IF NOT EXISTS build_attempts (
     writable_until REAL NOT NULL,  -- Nothing can write the attempt's key after this
     resumed_from TEXT,  -- The accepted release this attempt continues from, if any
     principal TEXT,  -- Who runs this attempt (a resume may be another's than the build's)
+    opened_at REAL,  -- When the attempt was first recorded
     PRIMARY KEY (build_id, attempt)
 );
 """
+
+# What the lineage lookups read: an executor's builds, the attempts resumed from a release.
+# Created once the columns they index exist, so apart from the tables.
+_LINEAGE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_build_executor ON artifact_builds(executor_ref, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_attempt_resumed_from ON build_attempts(resumed_from)",
+)
 
 # Console chunks a worker posted to a node other than the one that dispatched the
 # build; that node polls them out. Rows live only while the build runs.
@@ -162,10 +170,11 @@ class AttemptState:
     writable_until: float
     resumed_from: str | None = None
     principal: str | None = None
+    opened_at: float | None = None
 
 
 _ATTEMPT_COLUMNS = (
-    "build_id, artifact_id, version, attempt, writable_until, resumed_from, principal"
+    "build_id, artifact_id, version, attempt, writable_until, resumed_from, principal, opened_at"
 )
 
 
@@ -178,6 +187,7 @@ def _row_to_attempt(row: Any) -> AttemptState:
         writable_until=row["writable_until"],
         resumed_from=row["resumed_from"],
         principal=row["principal"],
+        opened_at=row["opened_at"],
     )
 
 
@@ -284,6 +294,8 @@ class BuildStore:
                 if not self._dialect.schema_exists(conn, "build_attempts"):
                     self._dialect.begin_write(conn, "__build_schema__")
                     conn.executescript(self._dialect.adapt_ddl(_ATTEMPT_SCHEMA_SQL))
+                    for statement in _LINEAGE_INDEXES:
+                        conn.execute(statement)
                     conn.commit()
                 if not self._dialect.schema_exists(conn, "build_console_chunks"):
                     self._dialect.begin_write(conn, "__build_schema__")
@@ -328,6 +340,9 @@ class BuildStore:
             conn.executescript(_CONSOLE_SCHEMA_SQL)
             conn.commit()
             self._add_release_columns(conn)
+            for statement in _LINEAGE_INDEXES:
+                conn.execute(statement)
+            conn.commit()
         finally:
             conn.close()
 
@@ -340,6 +355,8 @@ class BuildStore:
             ("build_attempts", "resumed_from"): "TEXT",
             ("artifact_builds", "dispatch"): "TEXT NOT NULL DEFAULT 'runner'",
             ("build_attempts", "principal"): "TEXT",
+            # REAL is single precision on Postgres: seconds would round to minutes.
+            ("build_attempts", "opened_at"): self._dialect.float_type,
         }
         if all(self._dialect.column_exists(conn, table, column) for table, column in columns):
             return
@@ -357,6 +374,8 @@ class BuildStore:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_build_computation ON artifact_builds(computation_key)"
         )
+        for statement in _LINEAGE_INDEXES:
+            conn.execute(statement)
         conn.commit()
 
     def create_build(
@@ -550,8 +569,9 @@ class BuildStore:
         conn.execute(
             """
             INSERT INTO build_attempts
-                (build_id, artifact_id, version, attempt, writable_until, resumed_from, principal)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (build_id, artifact_id, version, attempt, writable_until, resumed_from,
+                 principal, opened_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(build_id, attempt) DO UPDATE SET
                 writable_until = CASE
                     WHEN excluded.writable_until > build_attempts.writable_until
@@ -569,6 +589,7 @@ class BuildStore:
                 writable_until,
                 resumed_from,
                 principal,
+                now,
             ),
         )
         return True
@@ -586,14 +607,11 @@ class BuildStore:
             conn.close()
 
     def attempts_of(self, build_id: str) -> list[AttemptState]:
-        """The build's attempts in the order they stop being writable.
-
-        That is the order they opened in while each opens with the same write window.
-        """
+        """The build's attempts in the order they opened."""
         return self._attempts_where("build_id = ?", (build_id,))
 
     def attempts_resumed_from(self, release_id: str) -> list[AttemptState]:
-        """The attempts that continued from *release_id*, ordered as :meth:`attempts_of`."""
+        """The attempts that continued from *release_id*, in the order they opened."""
         return self._attempts_where("resumed_from = ?", (release_id,))
 
     def _attempts_where(self, clause: str, params: tuple[Any, ...]) -> list[AttemptState]:
@@ -601,7 +619,8 @@ class BuildStore:
         try:
             rows = conn.execute(
                 f"SELECT {_ATTEMPT_COLUMNS} FROM build_attempts WHERE {clause} "
-                "ORDER BY writable_until, attempt",
+                # Rows from before opened_at came first; among them, by window.
+                "ORDER BY COALESCE(opened_at, 0), writable_until, attempt",
                 params,
             ).fetchall()
         finally:
@@ -984,15 +1003,16 @@ class BuildStore:
         try:
             conn.execute(
                 """
-                INSERT INTO build_attempts (build_id, artifact_id, version, attempt, writable_until)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO build_attempts
+                    (build_id, artifact_id, version, attempt, writable_until, opened_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(build_id, attempt) DO UPDATE SET writable_until = CASE
                     WHEN excluded.writable_until > build_attempts.writable_until
                     THEN excluded.writable_until
                     ELSE build_attempts.writable_until
                 END
                 """,
-                (build_id, artifact_id, version, attempt, writable_until),
+                (build_id, artifact_id, version, attempt, writable_until, self._clock()),
             )
             conn.commit()
         finally:
@@ -1170,7 +1190,7 @@ class BuildStore:
             conn.close()
 
     def builds_of(self, executor_ref: str) -> list[BuildState]:
-        """Every build of an executor, oldest first."""
+        """Every build of an executor, of every tenant, oldest first."""
         conn = self._get_connection()
         try:
             rows = conn.execute(

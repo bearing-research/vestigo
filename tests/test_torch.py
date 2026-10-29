@@ -1150,6 +1150,28 @@ def test_an_execution_records_its_computation_attempts_and_checkpoints(ledger: L
     )
 
 
+def test_a_step_saved_again_after_a_resume_from_an_earlier_one_is_listed_again(
+    ledger: Ledger,
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+    one, two, three = (run.release_of(step).release_id for step in (1, 2, 3))
+    trainer = Trainer(ledger)
+    with ledger.resume(run.execution_id, from_release=one) as resumed:
+        trainer.restore(resumed)
+        trainer.train(resumed, 2)
+
+    again = ledger.release_of(run.execution_id, 2).release_id
+    assert again != two
+    assert ledger.execution(run.execution_id).checkpoints == (
+        (1, one),
+        (2, two),
+        (3, three),
+        (2, again),
+    )
+
+
 def test_executions_are_found_by_program_by_model_and_by_input(ledger: Ledger, tmp_path: Path):
     trainer = Trainer(ledger)
     model = ledger.define_model(trainer.model, version="tiny-v1")
@@ -1217,7 +1239,10 @@ def test_descendants_are_the_branches_of_a_run_at_any_depth(ledger: Ledger):
     assert _ids(ledger.descendants(a)) == [b]
     assert _ids(ledger.descendants(c)) == []
     assert _ids(ledger.descendants(unrelated)) == [d]
-    assert ledger.execution(b).init == ledger.release_of(a, 2).release_id
+    # A branch's first attempt resumed from nothing: it started from its init.
+    record = ledger.execution(b)
+    assert record.init == ledger.release_of(a, 2).release_id
+    assert [attempt.resumed_from for attempt in record.attempts] == [None]
 
     # The checkpoint a branch started from may be collected; the branch still descends.
     ledger.collect(keep=1)
@@ -2905,6 +2930,8 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
     with Ledger(Path(root)) as ledger:
         assert branch != execution
         assert ledger.builds.get_build(branch).params["init"] == head[0]
+    assert f"{branch} branched from {execution} at {head[0]}" in branched.stdout
+    assert "executions reading the data: 2" in branched.stdout
 
 
 def test_the_distributed_example_releases_every_ranks_files_and_resumes(tmp_path: Path):

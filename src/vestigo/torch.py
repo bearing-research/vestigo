@@ -76,8 +76,8 @@ from vestigo.blob_store import (
     GCSBlobStore,
     S3BlobStore,
 )
-from vestigo.build_store import BuildState, BuildStore
-from vestigo.graph import Edge, NodeId, NodeSpec
+from vestigo.build_store import AttemptState, BuildState, BuildStore
+from vestigo.graph import Edge, NodeId, NodeSpec, Traversal
 from vestigo.operations import AdvanceReference
 from vestigo.provenance import (
     TransformSpec,
@@ -691,6 +691,15 @@ def _copies(inputs: Mapping[str, Input], held: Sequence[_Held], rank: int) -> tu
     return tuple(copies)
 
 
+def _params(build: BuildState) -> dict[str, Any]:
+    assert build.params is not None, "an execution's build holds its params"
+    return build.params
+
+
+def _attempt(state: AttemptState) -> Attempt:
+    return Attempt(state.build_id, state.attempt, state.resumed_from)
+
+
 def _model_payload(model: Any, version: str) -> dict[str, Any]:
     schema = [
         [key, list(value.shape), str(value.dtype)]
@@ -779,7 +788,11 @@ class Definition:
 
 @dataclass(frozen=True)
 class Attempt:
-    """One attempt of an execution, and the checkpoint it continued from, if any."""
+    """One attempt of an execution, and the checkpoint it continued from.
+
+    With none, it started from the execution's ``init``: a branch's checkpoint, or
+    nothing.
+    """
 
     execution_id: str
     attempt: str
@@ -792,8 +805,10 @@ class Execution:
 
     *inputs* are each role's pin as the computation key holds it, *init* the
     checkpoint it branched from. *state* is ``building`` until it finishes
-    (``ready``) or fails. *attempts* and *checkpoints* (each accepted step that is
-    still stored, with its release) are oldest first.
+    (``ready``) or fails. *attempts* are in the order they opened. *checkpoints* are
+    the accepted checkpoints still stored, as (step, release_id) in the order they
+    were accepted: a step saved again after a resume from an earlier one is there
+    twice, and :meth:`Ledger.release_of` returns the later.
     """
 
     execution_id: str
@@ -1459,10 +1474,13 @@ class Ledger:
         Raises:
             ValueError: the execution does not exist.
         """
+        return self._execution(self._build(execution_id))
+
+    def _build(self, execution_id: str) -> BuildState:
         build = self.builds.get_build(execution_id)
         if build is None or build.executor_ref != EXECUTOR:
             raise ValueError(f"execution {execution_id} does not exist")
-        return self._execution(build)
+        return build
 
     def executions(
         self, of: Definition | None = None, *, reading: Input | None = None
@@ -1476,11 +1494,17 @@ class Ledger:
         Raises:
             OSError, ValueError: *reading* cannot be pinned (see :meth:`computation_key`).
         """
-        programs = None if of is None else {of.node_id, *self.store.graph.dependents(of.node_id)}
+        programs = None
+        if of is not None and of.spec.domain == MODEL_DOMAIN:
+            # A program reads its model directly, so one hop finds every one.
+            hop = Traversal(max_depth=1, max_nodes=2**31)
+            programs = set(self.store.graph.dependents(of.node_id, traversal=hop))
+        elif of is not None:
+            programs = {of.node_id}
         pin = None if reading is None else _resolve({"input": reading}).spec["input"]
         found = []
         for build in self.builds.builds_of(EXECUTOR):
-            params = build.params or {}
+            params = _params(build)
             if programs is not None and params["program"] not in programs:
                 continue
             if pin is not None and pin not in params["inputs"].values():
@@ -1489,11 +1513,11 @@ class Ledger:
         return found
 
     def resumed_from(self, release_id: str) -> list[Attempt]:
-        """The attempts that continued from *release_id*, in the order they opened."""
-        return [
-            Attempt(a.build_id, a.attempt, a.resumed_from)
-            for a in self.builds.attempts_resumed_from(release_id)
-        ]
+        """The attempts that continued from *release_id*, in the order they opened.
+
+        Executions branched from it are not among them: :meth:`descendants` finds those.
+        """
+        return [_attempt(a) for a in self.builds.attempts_resumed_from(release_id)]
 
     def descendants(self, execution_id: str) -> list[Execution]:
         """The executions branched from a checkpoint of *execution_id*, at any depth.
@@ -1504,10 +1528,10 @@ class Ledger:
         Raises:
             ValueError: the execution does not exist.
         """
-        self.execution(execution_id)
+        self._build(execution_id)
         branches: dict[str, list[BuildState]] = {}
         for build in self.builds.builds_of(EXECUTOR):
-            init = (build.params or {}).get("init")
+            init = _params(build).get("init")
             # A release row outlives the checkpoint's bytes, so a collected one still links.
             source = self.releases.get(init) if init is not None else None
             if source is not None:
@@ -1521,17 +1545,14 @@ class Ledger:
         return [self._execution(build) for build in found]
 
     def _execution(self, build: BuildState) -> Execution:
-        params = build.params or {}
+        params = _params(build)
         return Execution(
             build.build_id,
             params["program"],
             params["inputs"],
             params.get("init"),
             build.state,
-            tuple(
-                Attempt(a.build_id, a.attempt, a.resumed_from)
-                for a in self.builds.attempts_of(build.build_id)
-            ),
+            tuple(_attempt(a) for a in self.builds.attempts_of(build.build_id)),
             tuple(
                 (step, bundle.release.release_id)
                 for step, bundle in reversed(list(self._accepted(build.build_id)))
