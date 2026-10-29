@@ -10,6 +10,12 @@ its own files through the ledger's storage; rank 0 accepts the step once the bar
 has seen every rank write. The other ranks get the run's checkpoints, and the
 checkpoint to restore, from rank 0 by broadcast.
 
+The training data is a directory of shards, one per rank, that the first run writes
+beside the ledger. It is a ``Path`` input: every rank's report says what it found
+there, and rank 0 accepts a step only while every rank's copy is the bytes the run
+pinned. On another machine a rank holds its own copy with
+``checkpoints.with_inputs({"train": Path("/local/shards")})``.
+
 One machine and SQLite here. Ranks on several machines need a ledger every rank can
 reach: ``Ledger(path, dsn="postgresql://...", blobs=RemoteBlobs("s3", "bucket"))``.
 """
@@ -27,7 +33,18 @@ from torch_checkpointing.checkpoint_manager import CheckpointManager
 
 from vestigo.torch import Checkpoints, Ledger
 
-INPUTS = {"train": "synthetic-regression@seed=1"}
+
+def shards(ledger: Path, world: int) -> Path:
+    """One training shard per rank, beside *ledger*, written by rank 0 on the first run."""
+    root = ledger.parent / f"regression-shards-{world}"
+    if dist.get_rank() == 0 and not root.exists():
+        root.mkdir()
+        for rank in range(world):
+            generator = torch.Generator().manual_seed(1 + rank)
+            x = torch.randn(128, 4, generator=generator)
+            torch.save((x, x.sum(dim=1, keepdim=True)), root / f"{rank}.pt")
+    dist.barrier()
+    return root
 
 
 def main() -> None:
@@ -42,6 +59,7 @@ def main() -> None:
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    data = shards(args.ledger, world)
 
     ledger = run = None
     shared: list[object] = [None, None]
@@ -52,7 +70,7 @@ def main() -> None:
             optimizer,
             loss=nn.MSELoss(),
             version="regression-v1",
-            inputs=INPUTS,
+            inputs={"train": data},
             config={"batch": 32, "world_size": world},
         )
         restored = run.restores_from
@@ -76,9 +94,8 @@ def main() -> None:
             if rank == 0:
                 print(f"resumed {checkpoints.execution_id} after epoch {epoch}")
 
+        x, y = torch.load(data / f"{rank}.pt")
         generator = torch.Generator().manual_seed(1 + rank)
-        x = torch.randn(128, 4, generator=generator)
-        y = x.sum(dim=1, keepdim=True)
         while epoch < args.epochs:
             epoch += 1
             for batch in torch.randperm(len(x), generator=generator).split(32):

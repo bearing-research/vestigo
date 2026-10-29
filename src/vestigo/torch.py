@@ -51,7 +51,7 @@ import zipfile
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, cast
@@ -389,20 +389,33 @@ def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
     return _Inputs(spec, tuple(held))
 
 
-def _hold(held: Sequence[_Held]) -> None:
-    """Raises InputChanged: a verified input's bytes are not the ones it was pinned to.
+def _seen(held: Sequence[_Held]) -> dict[str, Any]:
+    """Each verified input's bytes as this process finds them now: their pin, or why
+    they cannot be read.
 
     An unchanged stat is the same bytes. A changed one (a chmod, a hardlink, an
     attribute a file browser adds) is read again, from the digest cache where it can be.
     """
+    seen: dict[str, Any] = {}
     for each in held:
         try:
             files = _scan(Path(each.path))
-            if _fingerprint(files) == each.scanned or _pin(files) == each.pinned:
-                continue
-        except (OSError, ValueError) as exc:
-            raise InputChanged(f"input {each.role!r} at {each.path} cannot be read") from exc
-        raise InputChanged(f"input {each.role!r} at {each.path} has other bytes now")
+            seen[each.role] = each.pinned if _fingerprint(files) == each.scanned else _pin(files)
+        except (OSError, ValueError, InputChanged) as exc:
+            seen[each.role] = {"unreadable": f"{each.path}: {exc}"}
+    return seen
+
+
+def _hold(held: Sequence[_Held], seen: Mapping[str, Any], where: str) -> None:
+    """Raises InputChanged: a verified input's bytes, as *seen* *where*, are not the
+    ones it was pinned to."""
+    for each in held:
+        now = seen.get(each.role)
+        if now == each.pinned:
+            continue
+        if isinstance(now, dict) and "unreadable" in now:
+            raise InputChanged(f"input {each.role!r} cannot be read {where}: {now['unreadable']}")
+        raise InputChanged(f"input {each.role!r} has other bytes {where}")
 
 
 def _stateful(value: object) -> bool:
@@ -1304,9 +1317,11 @@ class Ledger:
             if v.state == "ready" and v.id.startswith(prefix)
         ]
 
-    def _hold(self, writer: Checkpoints) -> None:
+    def _hold(
+        self, writer: Checkpoints, seen: Mapping[str, Any] | None = None, where: str = "now"
+    ) -> None:
         try:
-            _hold(writer.inputs)
+            _hold(writer.inputs, _seen(writer.inputs) if seen is None else seen, where)
         except InputChanged:
             # The data this attempt trained on is gone: a resume need not wait for it.
             # A lapse, not a renewal to zero, as the run's own renewal goes on meanwhile.
@@ -1381,42 +1396,48 @@ class Ledger:
         return stored
 
     def _report(
-        self, writer: Checkpoints, at: _Location, rank: int, files: list[dict[str, Any]]
+        self,
+        writer: Checkpoints,
+        at: _Location,
+        rank: int,
+        files: list[dict[str, Any]],
+        inputs: dict[str, Any],
     ) -> None:
         artifact_id, version = self._stage(writer, at, f"rank={rank}", {"rank": rank})
         # Signed by the rank that hashed the bytes, so rank 0 signs no digest a bucket
-        # writer swapped in between this report and the acceptance.
+        # writer swapped in between this report and the acceptance. *inputs* are this
+        # rank's copies as it found them, held by rank 0 against what the run pinned.
         report = {
             "execution": at.execution_id,
             "attempt": at.attempt,
             "step": at.step,
             "rank": rank,
             "files": files,
+            "inputs": inputs,
         }
         self._write_small(artifact_id, version, _canonical(self._sign(report)))
 
-    def _files_reported(self, at: _Location, rank: int, raw: bytes) -> list[dict[str, Any]]:
-        """The files *rank* reported writing of the step; verified, given a signing key.
+    def _reported(self, at: _Location, rank: int, raw: bytes) -> dict[str, Any]:
+        """*rank*'s report of the step: the files it wrote and its inputs as it found
+        them; verified, given a signing key.
 
         Raises:
             OSError: the report does not verify, or is signed for another rank or step.
         """
         if self.config.signing_key is None:
-            return json.loads(raw)["files"]
+            return json.loads(raw)
         what = f"rank {rank}'s report of step {at.step} of execution {at.execution_id}"
         report = self._verified(raw, what)
         named = (report["execution"], report["attempt"], report["step"], report["rank"])
         if named != (at.execution_id, at.attempt, at.step, rank):
             raise OSError(f"{what} is signed for another checkpoint")
-        return report["files"]
+        return report
 
     def _accept(self, writer: Checkpoints, at: _Location, world: int) -> Release:
         for step, bundle in self._accepted(at.execution_id):
             if step == at.step and bundle.release.attempt == at.attempt:
                 # The writer retried a finalize whose acceptance had landed.
                 return bundle.release
-        # Here, after the write, so a change while it ran fails it too.
-        self._hold(writer)
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -1429,11 +1450,12 @@ class Ledger:
             if data is None:
                 raise ValueError(f"rank {rank} reported nothing for step {at.step}")
             reports.append((report_id, pending[-1].version, data))
-        files = [
-            entry
-            for rank, (*_, data) in enumerate(reports)
-            for entry in self._files_reported(at, rank, data)
-        ]
+        documents = [self._reported(at, rank, data) for rank, (*_, data) in enumerate(reports)]
+        # Each rank found its own copy after its write (rank 0's too); any one with other
+        # bytes fails the step.
+        for rank, document in enumerate(documents):
+            self._hold(writer, document["inputs"], f"on rank {rank}")
+        files = [entry for document in documents for entry in document["files"]]
         if len({entry["file"] for entry in files}) != len(files):
             raise ValueError(f"two ranks wrote one file of step {at.step}")
 
@@ -1508,6 +1530,27 @@ class Checkpoints:
     program: NodeSpec
     # The verified inputs, rescanned before each release on rank 0 (its own paths).
     inputs: tuple[_Held, ...] = ()
+
+    def with_inputs(self, inputs: Mapping[str, Path]) -> Checkpoints:
+        """These checkpoints, holding each ``Path`` input at this rank's own copy.
+
+        For a rank whose data is not at rank 0's paths (another machine's disk). Each
+        copy is hashed here and must be the bytes the run pinned; every report of this
+        rank then says what it holds, and rank 0 accepts a step only when every rank's
+        copy is still those bytes. A rank that is given none holds rank 0's paths.
+
+        Raises:
+            ValueError: *inputs* are not the run's ``Path`` inputs by role.
+            InputChanged: a copy has other bytes.
+        """
+        resolved = _resolve(inputs)
+        pinned = {each.role: each.pinned for each in self.inputs}
+        if resolved.spec.keys() != pinned.keys():
+            raise ValueError(
+                f"the run's Path inputs are {sorted(pinned)}, not {sorted(resolved.spec)}"
+            )
+        _hold(self.inputs, resolved.spec, "in this copy")
+        return replace(self, inputs=resolved.held)
 
     def checkpoint_id(self, step: int) -> str:
         """Where to save *step*: a name under this attempt, never reused."""
@@ -1694,8 +1737,11 @@ class LedgerStorage(Storage):
         at = writer._own(path)
         with self._lock:
             files = self._written.pop(at, [])
+        # Recorded, not raised: a rank that raised here would hold every other one at
+        # the barrier.
+        inputs = _seen(writer.inputs)
         with self.ledger.open() as ledger:
-            ledger._report(writer, at, self.rank, files)
+            ledger._report(writer, at, self.rank, files, inputs)
 
     def mkdir(self, path: Path, recursive: bool = True) -> None:
         # Ids, not directories: nothing to make.

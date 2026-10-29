@@ -603,6 +603,40 @@ def test_a_save_scans_its_inputs_once_reads_none_and_ships_no_listing(
     assert abs(sizes[1] - sizes[0]) < 64
 
 
+def test_each_report_records_the_inputs_its_rank_found(ledger: Ledger, tmp_path: Path):
+    data = _file(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data, "seed": "seed=1"}) as run:
+        trainer.train(run, 1)
+        [report] = [v for v in _outputs(ledger, run, 1) if "rank" in v.params]
+        document = json.loads(ledger.store.read_blob(report.id, report.version))
+        pinned = ledger.builds.get_build(run.execution_id).params["inputs"]["train"]
+        assert document["inputs"] == {"train": pinned}
+
+
+def test_a_rank_holds_its_own_copy_of_the_inputs(ledger: Ledger, tmp_path: Path):
+    data = _file(tmp_path / "rank0" / "train.bin")
+    copy = _file(tmp_path / "rank1" / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data}) as run:
+        with pytest.raises(InputChanged):
+            run.checkpoints.with_inputs({"train": _file(tmp_path / "other.bin", b"rowz")})
+        with pytest.raises(ValueError, match="Path inputs"):
+            run.checkpoints.with_inputs({"eval": copy})
+        own = run.checkpoints.with_inputs({"train": copy})
+        assert [held.path for held in own.inputs] == [str(copy.absolute())]
+
+        # What this copy holds is what its reports say, whatever rank 0's own copy holds.
+        copy.write_bytes(b"rowz")
+        manager = _manager(own)
+        try:
+            with pytest.raises(InputChanged, match="on rank 0"):
+                manager.save(own.checkpoint_id(1), {"step": 1})
+        finally:
+            manager.close()
+        assert run.release_of(1) is None
+
+
 def test_resume_takes_the_execution_s_own_inputs_and_holds_them(ledger: Ledger, tmp_path: Path):
     data = _file(tmp_path / "train.bin")
     other = _file(tmp_path / "other.bin", b"rowz")
@@ -1965,12 +1999,19 @@ def test_checkpoints_on_an_object_store_load_back(tmp_path: Path, remote: Remote
 
 
 def _rank_main(
-    rank: int, world: int, root: str, die_at: int | None, asynchronous: bool = False
+    rank: int,
+    world: int,
+    root: str,
+    die_at: int | None,
+    asynchronous: bool = False,
+    inputs: str | None = None,
 ) -> None:
     """One rank: rank 0 starts the run and hands its checkpoints to the other.
 
     Asynchronous, the group gets its rank directly and the environment names none, so
-    the writer's subprocess has only what each rank configured.
+    the writer's subprocess has only what each rank configured. With *inputs*, each
+    rank holds its own copy of a ``Path`` input, and ``"drift"`` has rank 1 write
+    other bytes into its copy before step 2.
     """
     if asynchronous:
         os.environ.pop("RANK", None)
@@ -1991,11 +2032,15 @@ def _rank_main(
     shared: list[object] = [None]
     if ledger is not None:
         optimizer = torch.optim.AdamW(model.parameters())
-        run = ledger.start(_program(ledger, model, optimizer))
+        data = {"train": Path(root, "rank0", "train.bin")} if inputs else None
+        run = ledger.start(_program(ledger, model, optimizer), data)
         shared = [run.checkpoints]
     dist.broadcast_object_list(shared, src=0)
     checkpoints = shared[0]
     assert isinstance(checkpoints, Checkpoints)
+    copy = Path(root, f"rank{rank}", "train.bin")
+    if inputs:
+        checkpoints = checkpoints.with_inputs({"train": copy})
     config = checkpoints.configure(
         CheckpointManager.Config.with_async_save()
         if asynchronous
@@ -2011,6 +2056,8 @@ def _rank_main(
     for step in (1, 2):
         if rank == 1 and step == die_at:
             os._exit(3)  # dies before writing: rank 0 never passes the barrier
+        if rank == 1 and step == 2 and inputs == "drift":
+            copy.write_bytes(b"rowz")
         try:
             with torch.no_grad():
                 model[0].weight.add_(rank + 1)
@@ -2029,11 +2076,14 @@ def _rank_main(
 
 
 def _two_ranks(
-    root: Path, die_at: int | None, asynchronous: bool = False
+    root: Path, die_at: int | None, asynchronous: bool = False, inputs: str | None = None
 ) -> tuple[list[int], dict]:
+    if inputs:
+        for rank in (0, 1):
+            _file(root / f"rank{rank}" / "train.bin")
     context = multiprocessing.get_context("spawn")
     ranks = [
-        context.Process(target=_rank_main, args=(r, 2, str(root), die_at, asynchronous))
+        context.Process(target=_rank_main, args=(r, 2, str(root), die_at, asynchronous, inputs))
         for r in (0, 1)
     ]
     for process in ranks:
@@ -2088,6 +2138,28 @@ def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
         assert ledger.release_of(outcome["execution"], 2) is None
         [release] = ledger.releases.releases_of(outcome["execution"], "checkpoint")
         assert release.sequence == 1
+
+
+@pytest.mark.parametrize("inputs", ["copies", "drift"])
+def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, inputs: str):
+    exits, outcome = _two_ranks(tmp_path, die_at=None, inputs=inputs)
+
+    assert exits == [0, 0]
+    with Ledger(tmp_path / "ledger") as ledger:
+        execution = outcome["execution"]
+        assert ledger.release_of(execution, 1) is not None
+        if inputs == "copies":
+            assert outcome["saved"] == [1, 2]
+            outputs = ledger.releases.bundle(ledger.release_of(execution, 2).release_id).outputs
+            reports = [v for v in outputs if "rank" in v.params]
+            pinned = ledger.builds.get_build(execution).params["inputs"]
+            for report in reports:
+                document = json.loads(ledger.store.read_blob(report.id, report.version))
+                assert document["inputs"] == pinned
+        else:
+            assert outcome["saved"] == [1] and outcome["error"] == "InputChanged"
+            assert ledger.release_of(execution, 2) is None
+            assert ledger.builds.get_build(execution).lease_owner is None
 
 
 # --- Observed implementations ---

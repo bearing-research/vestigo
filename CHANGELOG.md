@@ -88,6 +88,14 @@ All notable changes to vestigo are recorded here. The format follows
   and the first failed read stops the hashing. `Ledger.resume` takes
   `inputs=`, which an execution with a `Path` input needs. A `str` stays a
   label, taken as given (#46, #47).
+- Every rank checks its own copy of a torch run's `Path` inputs: each
+  rank's report records the inputs as it found them after its write
+  (signed with the report), and rank 0 accepts a step only when every
+  report has the pinned bytes, else its save raises `InputChanged` naming
+  the rank and the lease lapses; no rank raises before the barrier.
+  `Checkpoints.with_inputs` points a rank at its own copy, hashed there and
+  checked against the pin. The distributed example trains on shards passed
+  as a `Path` (#48).
 - `BuildStore.lapse_lease(build_id, lease_owner)` ends a lease for good from
   any thread or process: it clears the owner, so a renewal that read the
   clock first cannot revive it, as one could after a renewal to zero (#47).
