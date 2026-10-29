@@ -100,8 +100,8 @@ machine, and the same objects in another bucket are another input. Other names, 
 object added or removed under a prefix, fail the next save as for a `Path`; a store
 that does not answer fails only that step. Credentials and endpoint come from
 `Remote(uri, settings=BlobSettings(...))`, as for the ledger's own `RemoteBlobs`, else
-the provider's defaults. Every rank lists the objects with them, and they travel to
-every rank inside `Checkpoints`. The store's names say the objects were not replaced;
+the provider's defaults. Every rank lists the objects with them, and they travel from
+rank 0 to every rank. The store's names say the objects were not replaced;
 like a `Path`, they cannot say what the code read, so read the URI you passed.
 
 **A `str` is a label.** Nothing reads it. It must change whenever the data does, so
@@ -304,65 +304,72 @@ unaffected.
 
 ## Several ranks
 
-Rank 0 owns the run. The other ranks get its `Checkpoints` (and the checkpoint to
-restore) by broadcast, and every rank builds its manager from them:
+Every rank runs the same code. `ledger.run` is a collective call, like
+`DistributedDataParallel(model)`: call it on every rank, after `init_process_group`,
+with the same arguments.
 
 ```python
-from torch_checkpointing.checkpoint_manager import CheckpointManager
-
-shared = [None, None]
-if rank == 0:
-    run = ledger.run(model, optimizer, loss=..., version=..., inputs=...)
-    restored = run.restores_from
-    shared = [run.checkpoints, ledger.checkpoint_id(restored) if restored else None]
-dist.broadcast_object_list(shared, src=0)
-checkpoints, checkpoint = shared
-manager = checkpoints.configure(CheckpointManager.Config.with_sync_save()).build()
-manager.save(checkpoints.checkpoint_id(step), {"model": model.state_dict(), ...})
+dist.init_process_group("nccl")
+ledger = Ledger("ledger")  # the same ledger on every rank
+with ledger.run(
+    model,
+    optimizer,
+    loss=nn.MSELoss(),
+    version="v1",
+    inputs={"train": Path("/data/shards")},
+) as run:
+    epoch = run.restore({"model": model, "optim": optimizer, "epoch": 0})["epoch"]
+    while epoch < epochs:
+        epoch += 1
+        ...
+        release = run.save(epoch, {"model": model, "optim": optimizer, "epoch": epoch})
+    run.finish()
 ```
 
-`checkpoints.configure` sets four fields on the config and returns it:
+Rank 0 starts or resumes the run and holds its lease; it sends the attempt to the
+others, and each rank gets its own `Run`. Each rank writes its own files
+(`model_0.pt`, `model_1.pt`, ...) and loads its own back. Rank 0 accepts a step only
+after the barrier has seen every rank write. If a rank dies before writing, the barrier
+times out, and that step never becomes a release.
 
-| Field | Set to | Why |
-| --- | --- | --- |
-| `storage_config` | `LedgerStorageConfig` | every file goes into the ledger's blob store as a `building` version, created before its bytes |
-| `pre_finalize_callback` | `vestigo.torch.report` | each rank records what it wrote, before the barrier |
-| `finalize_callback` | the run's `Checkpoints` | after the barrier, rank 0 accepts the step as one release, only while the run holds its lease |
-| `save.writer_config.write_to_temp_dir` | `False` | the ledger is the commit point, so nothing is renamed |
+Every rank first checks that it runs what rank 0 runs: the same model (class,
+`state_dict` shapes and `version`), loss, optimizer, `config`, `from_release` and input
+names. A rank with another config would train another computation under rank 0's
+key, so a difference raises `ValueError` on every rank, naming the rank and what
+differs, before anything is written.
 
-`checkpoints.checkpoint_id(step)` is a name under the attempt, such as
-`vestigo-torch/<execution>/<attempt>/step-5`; it names no file on any disk.
+A synchronous `save` and `finish` are collective too. Every rank gets rank 0's outcome:
+`save` returns the step's release on every rank, and an error rank 0 hit accepting the
+step (another rank's copy changed, the lease was lost) is raised on every rank. An
+asynchronous `save` returns each rank's own write future. `close` is each rank's own;
+only rank 0's touches the lease.
 
-Each rank writes its own files (`model_0.pt`, `model_1.pt`, ...) and loads its own back.
-Rank 0 accepts a step only after the barrier has seen every rank write. If a rank dies
-before writing, the barrier times out, and that step never becomes a release.
+A rank that raises between these calls leaves the others waiting at the next one until
+the process group's timeout. A launcher such as `torchrun` ends every rank when one
+fails.
 
-With a `Path` input, every rank checks its own copy at each save. Each other rank's
-report (signed, with a signing key) records the path and bytes it found after its
-write; rank 0 checks its own after the barrier and records that in the manifest. The
-step is accepted only when every copy has the bytes the run pinned. Otherwise rank 0's
-save raises `InputChanged` naming the rank and path: other bytes lapse the lease, and a
-copy that cannot be read (say, a transient error on a shared mount) fails only that
-step. No rank raises before the barrier, so a bad copy never holds the others up.
+### Inputs on several ranks
 
-A rank whose data is not at rank 0's path (another machine's disk) names its own copy
-when it configures, by role; it is hashed there and must be the same bytes:
+Each rank passes its own copy of each `Path` input, so a rank on another machine passes
+its local path. The copy must hold the bytes rank 0 pinned: a rank whose copy differs
+raises `InputChanged` on every rank, at `ledger.run`. A rank on rank 0's machine with
+rank 0's path is not read again. A `Remote` names the same objects on every rank.
 
-```python
-config = checkpoints.configure(
-    CheckpointManager.Config.with_sync_save(), inputs={"train": Path("/local/shards")}
-)
-```
+At each save every rank checks its own copy. Each other rank's report (signed, with a
+signing key) records the path and bytes it found after its write; rank 0 checks its own
+after the barrier and records that in the manifest. The step is accepted only when
+every copy has the bytes the run pinned. Otherwise every rank's save raises
+`InputChanged` naming the rank and path: other bytes lapse the lease, and a copy that
+cannot be read (say, a transient error on a shared mount) fails only that step. No rank
+raises before the barrier, so a bad copy never holds the others up. `finish` checks
+every rank's copy once more.
 
-A rank that names none checks rank 0's paths on its own machine. Every rank walks its
-copy at every save, a `stat` per file, before the barrier: on a large tree, save less
-often rather than check less.
+Every rank walks its copy at every save, a `stat` per file, before the barrier: on a
+large tree, save less often rather than check less.
 
-Each rank reads its rank and the world size when it calls `configure`, from the default
-process group, else from `RANK` and `WORLD_SIZE`, so configure after
-`init_process_group`. The async writer subprocess uses what `configure` read: it has no
-process group, and when the group was given its rank directly (as with `mp.spawn`), no
-such variables either.
+`ledger.start`, `ledger.branch` and `ledger.resume` are collective in the same way.
+Under a launcher that sets `WORLD_SIZE` above 1, a run without a process group raises
+`RuntimeError` rather than have each rank start its own.
 
 ## Where the ledger lives
 
@@ -500,8 +507,7 @@ it was signed.
 
 The key goes wherever the ledger's description goes:
 
-- to every rank, inside the `Checkpoints` that rank 0 broadcasts over the process
-  group;
+- to every rank, in the attempt rank 0 sends over the process group at `ledger.run`;
 - to the async writer subprocess, pickled.
 
 Treat every machine in the training job as holding the key.

@@ -24,8 +24,8 @@ deserializes.
 
 Saves may be synchronous or asynchronous (the writer then runs in a subprocess, which is
 why everything the writer holds is a picklable description of the ledger, opened per
-call), on one rank or many (rank and world size from the default process group, else
-``RANK`` and ``WORLD_SIZE``, read when each rank configures its manager).
+call), on one rank or many. In a process group every rank calls :meth:`Ledger.run`
+and gets its own :class:`Run`; rank 0 starts or resumes the build and holds its lease.
 
 An ``ExportedProgram`` the run captured is recorded beside its checkpoints as an
 observed implementation: the archive with its versions and constraints, and a declared
@@ -40,6 +40,7 @@ import io
 import json
 import logging
 import os
+import pickle
 import re
 import sqlite3
 import stat
@@ -48,7 +49,7 @@ import threading
 import time
 import uuid
 import zipfile
-from collections.abc import Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
@@ -61,6 +62,7 @@ try:
     import torch.distributed as dist
     import torch.export
     from torch_checkpointing.checkpoint_manager import CheckpointManager
+    from torch_checkpointing.config import SyncCheckpointSaverConfig
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
 except ImportError as exc:
     raise ImportError("vestigo.torch needs the torch extra: install vestigo[torch]") from exc
@@ -352,7 +354,7 @@ class Remote:
     """A verified input in an object store: ``s3://``, ``gs://`` or ``az://``, the bucket
     (the container on Azure), then a key, or a prefix ending in ``/`` for every object
     under it. *settings* are the credentials and endpoint, as for :class:`RemoteBlobs`;
-    every rank needs them, and they travel with :class:`Checkpoints`.
+    every rank needs them, and they travel from rank 0 to every rank.
 
     Nothing is downloaded. Each object is pinned by what its store says names its bytes:
     S3's ETag; GCS's MD5, or a composite object's generation; Azure's Content-MD5 when
@@ -527,6 +529,117 @@ def _rank() -> tuple[int, int]:
     return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
 
+def _group() -> tuple[int, int]:
+    """This process's rank and the world size in its process group; one rank without.
+
+    Raises:
+        RuntimeError: the launcher started several ranks and this one has no group.
+    """
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > 1:
+        raise RuntimeError(f"WORLD_SIZE is {world}: initialize the process group before the run")
+    return 0, 1
+
+
+def _portable(exc: Exception) -> Exception:
+    """*exc* as another rank can raise it: itself if it pickles back, else its repr."""
+    try:
+        return pickle.loads(pickle.dumps(exc))
+    except (pickle.PicklingError, TypeError, AttributeError):
+        # A driver's error with arguments its class cannot be built from again.
+        return RuntimeError(repr(exc))
+
+
+def _share(result: Any = None, error: Exception | None = None) -> Any:
+    """Rank 0's *result* or *error*, sent by rank 0 and returned or raised on the rest."""
+    box = [result, None if error is None else _portable(error)]
+    dist.broadcast_object_list(box, src=0)
+    if box[1] is not None and dist.get_rank():
+        raise box[1]
+    return box[0]
+
+
+def _from_rank_0(rank: int, world: int, work: Callable[[], Any]) -> Any:
+    """``work()`` run on rank 0; on every rank its result, or its error raised."""
+    if world == 1:
+        return work()
+    if rank:
+        return _share()
+    try:
+        result = work()
+    except Exception as exc:
+        _share(error=exc)
+        raise
+    return _share(result)
+
+
+def _agree(world: int, terms: Mapping[str, Any]) -> None:
+    """Raises ValueError on every rank: a rank's *terms* are not rank 0's."""
+    digests = {key: hashlib.sha256(_canonical(value)).hexdigest() for key, value in terms.items()}
+    everyone: list[Any] = [None] * world
+    dist.all_gather_object(everyone, digests)
+    differ = [
+        f"rank {rank}'s {', '.join(k for k in digests if theirs[k] != everyone[0][k])}"
+        for rank, theirs in enumerate(everyone)
+        if theirs != everyone[0]
+    ]
+    if differ:
+        raise ValueError(f"every rank must run what rank 0 runs: {'; '.join(differ)} differ")
+
+
+def _kinds(inputs: Mapping[str, Input] | None) -> dict[str, Any]:
+    """*inputs* as every rank must name them: a label or URI as given, a path by role."""
+    return {
+        role: value
+        if isinstance(value, str)
+        else value.uri
+        if isinstance(value, Remote)
+        else type(value).__name__
+        for role, value in (inputs or {}).items()
+    }
+
+
+def _copies(inputs: Mapping[str, Input], held: Sequence[_Held], rank: int) -> tuple[_Held, ...]:
+    """This rank's own copies of rank 0's verified inputs; a remote one is the same.
+
+    A copy is read only when its scan is not rank 0's (another machine's disk).
+
+    Raises:
+        InputChanged: a copy has other bytes than rank 0 pinned.
+        OSError, ValueError: a copy cannot be read, or holds what a scan refuses.
+    """
+    copies = []
+    for each in held:
+        if each.remote is not None:
+            copies.append(each)
+            continue
+        path = cast(Path, inputs[each.role])
+        files = _scan(path)
+        scanned = _fingerprint(files)
+        if scanned != each.scanned and _pin(files) != each.pinned:
+            raise InputChanged(f"input {each.role!r} at {path} has other bytes on rank {rank}")
+        copies.append(_Held(each.role, str(path.absolute()), scanned, each.pinned))
+    return tuple(copies)
+
+
+def _model_payload(model: Any, version: str) -> dict[str, Any]:
+    schema = [
+        [key, list(value.shape), str(value.dtype)]
+        for key, value in sorted(model.state_dict().items())
+    ]
+    return {"class": _fqn(model), "state_dict": schema, "version": version}
+
+
+def _program_payload(loss: Any, optimizer: Any, config: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {
+        "loss": loss if isinstance(loss, str) else _fqn(loss),
+        "optimizer": {"class": _fqn(optimizer), "defaults": dict(optimizer.defaults)},
+        "config": dict(config or {}),
+    }
+
+
 # --- Where the ledger is ---
 
 
@@ -642,8 +755,8 @@ class Ledger:
     half. With ``verify_key``
     alone it verifies and cannot sign: a reader (an evaluation job, another team).
     Either way every load is verified, and an unsigned checkpoint is refused. The
-    signing key travels with :class:`Checkpoints` to every rank and the async writer;
-    give it to the training job, never to readers.
+    signing key travels from rank 0 to every rank and the async writer; give it to the
+    training job, never to readers.
 
     Raises:
         ValueError: a key is not a raw Ed25519 key, or *verify_key* is not
@@ -713,12 +826,7 @@ class Ledger:
         changing it, and a comment would change it without changing behaviour, so the
         caller names the version.
         """
-        schema = [
-            [key, list(value.shape), str(value.dtype)]
-            for key, value in sorted(model.state_dict().items())
-        ]
-        payload = {"class": _fqn(model), "state_dict": schema, "version": version}
-        return self._put(NodeSpec(MODEL_DOMAIN, _canonical(payload)))
+        return self._put(NodeSpec(MODEL_DOMAIN, _canonical(_model_payload(model, version))))
 
     def define_program(
         self,
@@ -738,11 +846,7 @@ class Ledger:
         Raises:
             TypeError: a value is not JSON (an optimizer default held as a tensor).
         """
-        payload = {
-            "loss": loss if isinstance(loss, str) else _fqn(loss),
-            "optimizer": {"class": _fqn(optimizer), "defaults": dict(optimizer.defaults)},
-            "config": dict(config or {}),
-        }
+        payload = _program_payload(loss, optimizer, config)
         return self._put(
             NodeSpec(PROGRAM_DOMAIN, _canonical(payload), edges=(Edge("impl", 0, model.node_id),))
         )
@@ -819,24 +923,82 @@ class Ledger:
         or finish after they change raises :class:`InputChanged`. Data changed after a
         crash is another computation, so the run starts fresh rather than resume on it.
 
+        In a process group every rank calls it, as it calls ``DistributedDataParallel``.
+        Rank 0 starts or resumes the run and holds its lease; each rank has its own
+        :class:`Run` and saves its own files. A rank passes its own copy of each
+        ``Path`` input, which must be the bytes rank 0 pinned.
+
         Raises:
             ValueError: the unfinished execution's lease is live under another attempt
                 (the old process is still running, or was killed under
-                ``lease_seconds`` ago), or *from_release* is not an accepted checkpoint.
+                ``lease_seconds`` ago), *from_release* is not an accepted checkpoint, or
+                a rank's model, program, inputs or *from_release* are not rank 0's.
+            InputChanged: a rank's copy of a ``Path`` input has other bytes.
+            RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up.
         """
-        program = self.define_program(
-            self.define_model(model, version=version),
-            loss=loss,
-            optimizer=optimizer,
-            config=config,
-        )
-        resolved = _resolve(inputs)
-        execution = self._find(program, resolved, from_release)
-        if execution is not None:
-            return self._resume(execution, None, resolved, checkpointing)
-        if from_release is not None:
-            return self._branch(program, from_release, resolved, checkpointing)
-        return self._open(program, resolved, None, checkpointing)
+        terms = {
+            "model": _model_payload(model, version),
+            "program": _program_payload(loss, optimizer, config),
+            "from_release": from_release,
+        }
+
+        def opened(resolved: _Inputs) -> Run:
+            program = self.define_program(
+                self.define_model(model, version=version),
+                loss=loss,
+                optimizer=optimizer,
+                config=config,
+            )
+            execution = self._find(program, resolved, from_release)
+            if execution is not None:
+                return self._resume(execution, None, resolved, checkpointing)
+            if from_release is not None:
+                return self._branch(program, from_release, resolved, checkpointing)
+            return self._open(program, resolved, None, checkpointing)
+
+        return self._collective(terms, inputs, opened, checkpointing)
+
+    def _collective(
+        self,
+        terms: dict[str, Any],
+        inputs: Mapping[str, Input] | None,
+        opened: Callable[[_Inputs], Run],
+        checkpointing: Any,
+    ) -> Run:
+        """The run *opened* makes, on every rank once all agree on *terms* and inputs.
+
+        Rank 0 opens it; every other rank gets its attempt and checks its own copies.
+        A failure on any rank raises on all, and rank 0 closes the run.
+        """
+        rank, world = _group()
+        if world == 1:
+            return opened(_resolve(inputs))
+        _agree(world, {**terms, "inputs": _kinds(inputs)})
+        own: list[Run] = []
+
+        def start() -> tuple[_Checkpoints, str | None]:
+            run = opened(_resolve(inputs))
+            own.append(run)
+            return run._checkpoints, run.restores_from
+
+        checkpoints, restores_from = _from_rank_0(rank, world, start)
+        error: Exception | None = None
+        copies = checkpoints.inputs
+        if rank:
+            try:
+                copies = _copies(inputs or {}, checkpoints.inputs, rank)
+            except (OSError, ValueError, InputChanged) as exc:
+                error = exc
+        errors: list[Any] = [None] * world
+        dist.all_gather_object(errors, None if error is None else _portable(error))
+        failed = next((each for each in errors if each is not None), None)
+        if failed is not None:
+            if own:
+                own[0].close()
+            raise error or failed
+        if own:
+            return own[0]
+        return Run(self, replace(checkpoints, inputs=copies), restores_from, checkpointing)
 
     def start(
         self,
@@ -845,8 +1007,14 @@ class Ledger:
         *,
         checkpointing: Any = None,
     ) -> Run:
-        """A new execution of *program* on *inputs*, in its first attempt."""
-        return self._open(program, _resolve(inputs), None, checkpointing)
+        """A new execution of *program* on *inputs*, in its first attempt; in a process
+        group, on every rank as :meth:`run` is."""
+        return self._collective(
+            {"program": program.node_id},
+            inputs,
+            lambda resolved: self._open(program, resolved, None, checkpointing),
+            checkpointing,
+        )
 
     def branch(
         self,
@@ -859,12 +1027,18 @@ class Ledger:
         """A new execution starting from *from_release*, an accepted checkpoint of any run.
 
         The release is part of the computation, so a branch never dedups against its
-        source or another branch of it; :meth:`Run.restore` loads it.
+        source or another branch of it; :meth:`Run.restore` loads it. In a process
+        group, on every rank as :meth:`run` is.
 
         Raises:
             ValueError: *from_release* is not an accepted checkpoint, or was collected.
         """
-        return self._branch(program, from_release, _resolve(inputs), checkpointing)
+        return self._collective(
+            {"program": program.node_id, "from_release": from_release},
+            inputs,
+            lambda resolved: self._branch(program, from_release, resolved, checkpointing),
+            checkpointing,
+        )
 
     def _branch(
         self, program: Definition, from_release: str, inputs: _Inputs, checkpointing: Any
@@ -911,7 +1085,7 @@ class Ledger:
             lease_owner=attempt,
             lease_duration_seconds=self.lease_seconds,
         )
-        checkpoints = Checkpoints(
+        checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )
         return Run(self, checkpoints, init, checkpointing)
@@ -943,15 +1117,22 @@ class Ledger:
         *from_release* defaults to the execution's latest accepted checkpoint; with
         none, the attempt starts from the execution's own initial state. *inputs*, when
         given, must be the execution's; an execution with a ``Path`` input needs them,
-        since the attempt holds those paths as the first resolved them.
+        since the attempt holds those paths as the first resolved them. In a process
+        group, on every rank as :meth:`run` is.
 
         Raises:
             ValueError: the execution does not exist, is finished, another attempt's
                 lease on it is live, *inputs* are not its own or are missing, or
                 *from_release* is not an accepted checkpoint of it, or was collected.
         """
-        resolved = None if inputs is None else _resolve(inputs)
-        return self._resume(execution_id, from_release, resolved, checkpointing)
+        return self._collective(
+            {"execution": execution_id, "from_release": from_release, "given": inputs is not None},
+            inputs,
+            lambda resolved: self._resume(
+                execution_id, from_release, None if inputs is None else resolved, checkpointing
+            ),
+            checkpointing,
+        )
 
     def _resume(
         self,
@@ -984,7 +1165,7 @@ class Ledger:
             from_release=from_release,
         )
         program = self._definition(params["program"])
-        checkpoints = Checkpoints(
+        checkpoints = _Checkpoints(
             self.config,
             execution_id,
             attempt,
@@ -994,7 +1175,7 @@ class Ledger:
         )
         return Run(self, checkpoints, from_release or params.get("init"), checkpointing)
 
-    # --- Checkpoints ---
+    # --- _Checkpoints ---
 
     def _accepted(self, execution_id: str) -> Iterator[tuple[int, ReleaseBundle]]:
         """The execution's accepted checkpoints with their steps, newest first."""
@@ -1345,7 +1526,7 @@ class Ledger:
         return {**result, "orphaned": len(orphans)}
 
     def _stage(
-        self, writer: Checkpoints, at: _Location, label: str, params: dict[str, Any], **kw: Any
+        self, writer: _Checkpoints, at: _Location, label: str, params: dict[str, Any], **kw: Any
     ) -> tuple[str, int]:
         """A ``building`` version for one output of the step, before its bytes exist."""
         artifact_id = f"{at.prefix}@{label}" if label != "manifest" else at.prefix
@@ -1384,7 +1565,7 @@ class Ledger:
             if v.state == "ready" and v.id.startswith(prefix)
         ]
 
-    def _hold(self, writer: Checkpoints, seen: Mapping[str, Any], where: str) -> None:
+    def _hold(self, writer: _Checkpoints, seen: Mapping[str, Any], where: str) -> None:
         """Raises InputChanged: a verified input, as *seen* *where*, cannot be read or
         has bytes other than its pin."""
         for each in writer.inputs:
@@ -1403,7 +1584,7 @@ class Ledger:
             self.builds.lapse_lease(writer.execution_id, writer.attempt)
             raise InputChanged(f"input {each.role!r} at {path} has other bytes {where}")
 
-    def _require_lease(self, writer: Checkpoints) -> None:
+    def _require_lease(self, writer: _Checkpoints) -> None:
         conn = self.store._get_connection()
         try:
             held = lease_held(conn, writer.execution_id, writer.attempt, time.time())
@@ -1416,7 +1597,7 @@ class Ledger:
             )
 
     def _observe(
-        self, writer: Checkpoints, archive: Path, scope: str, coverage: str
+        self, writer: _Checkpoints, archive: Path, scope: str, coverage: str
     ) -> ArtifactVersion:
         # Before anything is looked up or staged: a stale attempt records nothing.
         self._require_lease(writer)
@@ -1472,7 +1653,7 @@ class Ledger:
 
     def _report(
         self,
-        writer: Checkpoints,
+        writer: _Checkpoints,
         at: _Location,
         rank: int,
         files: list[dict[str, Any]],
@@ -1510,7 +1691,7 @@ class Ledger:
         return report
 
     def _accept(
-        self, writer: Checkpoints, at: _Location, world: int, known: dict[str, str]
+        self, writer: _Checkpoints, at: _Location, world: int, known: dict[str, str]
     ) -> Release:
         for step, bundle in self._accepted(at.execution_id):
             if step == at.step and bundle.release.attempt == at.attempt:
@@ -1596,12 +1777,11 @@ class Ledger:
 
 
 @dataclass(frozen=True)
-class Checkpoints:
-    """One attempt's checkpoints, as every rank and writer process sees them.
+class _Checkpoints:
+    """One attempt's checkpoints, as a rank and its writer process see them.
 
-    Rank 0 has it from its :class:`Run`; the others receive it (it pickles, as
-    ``torch.distributed.broadcast_object_list`` needs), and every rank builds its
-    manager from :meth:`configure`.
+    Rank 0 makes it and broadcasts it (it pickles); each rank's :class:`Run` holds its
+    own, with that rank's copies of the inputs, and builds its manager from it.
     """
 
     ledger: LedgerConfig
@@ -1609,54 +1789,26 @@ class Checkpoints:
     attempt: str
     computation_key: str
     program: NodeSpec
-    # The verified inputs, rank 0's: every rank scans them, or its own copies
-    # (configure's inputs), at each save.
+    # The verified inputs, this rank's copies: it scans them at each save.
     inputs: tuple[_Held, ...] = ()
 
     def checkpoint_id(self, step: int) -> str:
         """Where to save *step*: a name under this attempt, never reused."""
         return f"{ROOT}/{self.execution_id}/{self.attempt}/step-{step}"
 
-    def configure(self, config: Any, *, inputs: Mapping[str, Path] | None = None) -> Any:
+    def configure(self, config: Any) -> Any:
         """Point a ``CheckpointManager.Config`` at the ledger; returns it.
 
         Sets its storage, both write callbacks and ``write_to_temp_dir=False`` (the
-        barrier stays: rank 0 accepts only after every rank has written). Call it once
-        the process group is up: the rank and world size are read here.
-
-        Every rank checks the run's ``Path`` inputs at each save, at rank 0's paths
-        unless *inputs* name this rank's own copies (another machine's disk), by role.
-        Each copy is hashed here and must be the bytes the run pinned.
-
-        Raises:
-            TypeError: an input is not a ``Path``.
-            ValueError: *inputs* are not the run's ``Path`` inputs by role.
-            InputChanged: a copy has other bytes.
+        barrier stays: rank 0 accepts only after every rank has written). The rank and
+        world size are read here, once the process group is up.
         """
-        writer = self if inputs is None else self._with(inputs)
         rank, world = _rank()
-        config.storage_config = LedgerStorageConfig(self.ledger, writer, rank, world)
-        config.pre_finalize_callback = report
-        config.finalize_callback = writer
+        config.storage_config = LedgerStorageConfig(self.ledger, self, rank, world)
+        config.pre_finalize_callback = _report_written
+        config.finalize_callback = self
         config.save.writer_config.write_to_temp_dir = False
         return config
-
-    def _with(self, inputs: Mapping[str, Path]) -> Checkpoints:
-        for role, value in inputs.items():
-            if not isinstance(value, Path):
-                raise TypeError(f"input {role!r} is this rank's copy, a Path, not {type(value)}")
-        resolved = _resolve(inputs)
-        # A remote input names the same objects on every rank: nothing to point at.
-        remote = tuple(each for each in self.inputs if each.remote is not None)
-        pinned = {each.role: each.pinned for each in self.inputs if each.remote is None}
-        if resolved.spec.keys() != pinned.keys():
-            raise ValueError(
-                f"the run's Path inputs are {sorted(pinned)}, not {sorted(resolved.spec)}"
-            )
-        for role, pin in resolved.spec.items():
-            if pin != pinned[role]:
-                raise InputChanged(f"input {role!r} at {inputs[role]} has other bytes in this copy")
-        return replace(self, inputs=remote + resolved.held)
 
     def __call__(self, args: Any) -> None:
         """``finalize_callback``: on rank 0, make the step a release."""
@@ -1674,7 +1826,7 @@ class Checkpoints:
         return at
 
 
-def report(args: Any) -> None:
+def _report_written(args: Any) -> None:
     """``pre_finalize_callback``: this rank records what it wrote of the step."""
     _ledger_storage(args).report(Path(args.path))
 
@@ -1682,7 +1834,7 @@ def report(args: Any) -> None:
 def _ledger_storage(args: Any) -> LedgerStorage:
     storage = args.storage
     if not isinstance(storage, LedgerStorage):
-        raise TypeError("the writer's storage is not the ledger; use Checkpoints.configure")
+        raise TypeError("the writer's storage is not the ledger; save through Ledger.run")
     return storage
 
 
@@ -1690,7 +1842,7 @@ def _ledger_storage(args: Any) -> LedgerStorage:
 class LedgerStorageConfig(StorageConfig):
     ledger: LedgerConfig
     # None for a storage that only loads (Ledger.configure).
-    checkpoints: Checkpoints | None = None
+    checkpoints: _Checkpoints | None = None
     rank: int = 0
     world: int = 1
 
@@ -1776,7 +1928,7 @@ class LedgerStorage(Storage):
     def __init__(
         self,
         ledger: LedgerConfig,
-        checkpoints: Checkpoints | None = None,
+        checkpoints: _Checkpoints | None = None,
         rank: int = 0,
         world: int = 1,
     ) -> None:
@@ -1795,9 +1947,9 @@ class LedgerStorage(Storage):
 
     # --- Writing ---
 
-    def _writer(self) -> Checkpoints:
+    def _writer(self) -> _Checkpoints:
         if self.checkpoints is None:
-            raise PermissionError("this storage only loads; save through a run's configure")
+            raise PermissionError("this storage only loads; save through Ledger.run")
         return self.checkpoints
 
     def stream_write(self, path: Path) -> io.IOBase:
@@ -1908,20 +2060,29 @@ class LedgerStorage(Storage):
 
 @dataclass
 class Run:
-    """One attempt at an execution, held by rank 0: its lease, saves, heads and end.
+    """One attempt at an execution, as one rank runs it: its saves, heads and end.
 
-    Renews its lease from a thread until :meth:`finish` or :meth:`close`; use it as a
-    context manager. ``restores_from`` is the accepted release the attempt starts from.
-    ``checkpointing`` is the ``CheckpointManager.Config`` :attr:`manager` is built from,
-    synchronous saves when None.
+    Rank 0's renews the lease from a thread until :meth:`finish` or :meth:`close`; use
+    it as a context manager. ``restores_from`` is the accepted release the attempt
+    starts from. ``checkpointing`` is the ``CheckpointManager.Config`` :attr:`manager`
+    is built from, synchronous saves when None.
+
+    In a process group, :meth:`finish` and a synchronous :meth:`save` are collective:
+    every rank calls them, and rank 0's outcome (the release, or its error) is every
+    rank's. A rank that raises before one leaves the others waiting at it until the
+    group's timeout, unless the launcher (``torchrun``) ends them.
     """
 
     ledger: Ledger
-    checkpoints: Checkpoints
+    _checkpoints: _Checkpoints
     restores_from: str | None = None
     checkpointing: Any = None
     finished: bool = False
+    rank: int = field(init=False)
+    world: int = field(init=False)
     _manager: Any = field(default=None, repr=False)
+    # Set by rank 0's acceptance, which runs only once every rank has passed the barrier.
+    _accepting: bool = field(default=False, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renewal: threading.Thread | None = field(default=None, repr=False)
     # Held by a renewal and by finish's final release, so no renewal reads a finish
@@ -1929,22 +2090,24 @@ class Run:
     _renewing: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
-        self._renewal = threading.Thread(
-            target=self._renew, name=f"lease:{self.execution_id}", daemon=True
-        )
-        self._renewal.start()
+        self.rank, self.world = _group()
+        if self.rank == 0:
+            self._renewal = threading.Thread(
+                target=self._renew, name=f"lease:{self.execution_id}", daemon=True
+            )
+            self._renewal.start()
 
     @property
     def execution_id(self) -> str:
-        return self.checkpoints.execution_id
+        return self._checkpoints.execution_id
 
     @property
     def attempt(self) -> str:
-        return self.checkpoints.attempt
+        return self._checkpoints.attempt
 
     @property
     def computation_key(self) -> str:
-        return self.checkpoints.computation_key
+        return self._checkpoints.computation_key
 
     def _renew(self) -> None:
         every = self.ledger.lease_seconds / 3
@@ -1980,28 +2143,66 @@ class Run:
         """The run's ``CheckpointManager``, built on first use; the run closes it."""
         if self._manager is None:
             # A copy: configure sets the storage and callbacks on it, which are this run's.
-            config = copy.copy(self.checkpointing or CheckpointManager.Config.with_sync_save())
-            self._manager = self.checkpoints.configure(config).build()
+            config = self._checkpoints.configure(copy.copy(self._config))
+            if self.rank == 0 and self._synchronous:
+                accept = config.finalize_callback
+
+                def finalize(args: Any) -> None:
+                    self._accepting = True
+                    accept(args)
+
+                config.finalize_callback = finalize
+            self._manager = config.build()
         return self._manager
+
+    @property
+    def _config(self) -> Any:
+        return self.checkpointing or CheckpointManager.Config.with_sync_save()
+
+    @property
+    def _synchronous(self) -> bool:
+        return isinstance(self._config.save, SyncCheckpointSaverConfig)
 
     def save(self, step: int, state: Mapping[str, Any]) -> Release | Future[Any]:
         """Save *state* as checkpoint *step*, each module or optimizer by its ``state_dict``.
 
-        A synchronous save returns the accepted release. An asynchronous one returns
-        the write's future; once it resolves, :meth:`release_of` names the release.
+        A synchronous save returns the accepted release, on every rank. An
+        asynchronous one returns the write's future; once it resolves,
+        :meth:`release_of` names the release.
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
             InputChanged: a ``Path`` input's bytes changed since the run resolved
-                it (from the future, for an asynchronous save); nothing is released,
-                and the attempt gives up its lease.
+                it, on any rank (from rank 0's future, for an asynchronous save);
+                nothing is released, and the attempt gives up its lease.
         """
-        pending = self.manager.save(self.checkpoints.checkpoint_id(step), _saved(state))
-        if pending is not None:
+        checkpoint_id = self._checkpoints.checkpoint_id(step)
+        if not self._synchronous:
+            pending = self.manager.save(checkpoint_id, _saved(state))
+            assert pending is not None
             return pending
-        release = self.release_of(step)
-        assert release is not None
-        return release
+
+        def accepted() -> Release:
+            self.manager.save(checkpoint_id, _saved(state))
+            release = self.release_of(step)
+            assert release is not None
+            return release
+
+        if self.world == 1:
+            return accepted()
+        if self.rank:
+            # Back from the barrier: rank 0 accepts, and says how it went.
+            self.manager.save(checkpoint_id, _saved(state))
+            return _share()
+        self._accepting = False
+        try:
+            release = accepted()
+        except Exception as exc:
+            # Short of the barrier a rank failed or died there, so none is listening.
+            if self._accepting:
+                _share(error=exc)
+            raise
+        return _share(release)
 
     def restore(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """*state* as of ``restores_from``; as given when the attempt starts fresh.
@@ -2039,7 +2240,7 @@ class Run:
         with tempfile.TemporaryDirectory() as scratch:
             archive = Path(scratch) / "program.pt2"
             torch.export.save(program, archive)
-            return self.ledger._observe(self.checkpoints, archive, scope, coverage)
+            return self.ledger._observe(self._checkpoints, archive, scope, coverage)
 
     def release_of(self, step: int) -> Release | None:
         """This execution's accepted checkpoint of *step*, once its save has completed."""
@@ -2064,15 +2265,27 @@ class Run:
         :meth:`Ledger.final_checkpoint` names it.
 
         Waits first for the save in flight, which lands as a release before the final one.
+        In a process group every rank calls it, and rank 0 releases.
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
             InputChanged: a ``Path`` input's bytes changed since the run resolved
-                it; the attempt gives up its lease.
+                it, on any rank; the attempt gives up its lease.
         """
         if self._manager is not None:
             self._manager.close()
-        self.ledger._hold(self.checkpoints, _seen(self.checkpoints.inputs, {}), "now")
+        seen = _seen(self._checkpoints.inputs, {})
+        everyone: list[Any] = [seen]
+        if self.world > 1:
+            everyone = [None] * self.world
+            dist.all_gather_object(everyone, seen)
+        _from_rank_0(self.rank, self.world, lambda: self._finish(everyone))
+        self.finished = True
+
+    def _finish(self, everyone: Sequence[Mapping[str, Any]]) -> None:
+        for rank, seen in enumerate(everyone):
+            where = "now" if len(everyone) == 1 else f"now on rank {rank}"
+            self.ledger._hold(self._checkpoints, seen, where)
         ended_on = next(
             (
                 bundle.release.release_id
@@ -2091,7 +2304,7 @@ class Run:
     def close(self) -> None:
         """Wait for the save in flight and stop renewing. An unfinished execution with a
         checkpoint stays resumable, its lease dropped so a resume need not wait; one
-        without fails."""
+        without fails. Each rank closes its own; only rank 0's touches the lease."""
         try:
             if self._manager is not None:
                 self._manager.close()
@@ -2102,7 +2315,7 @@ class Run:
         self._stop.set()
         if self._renewal is not None:
             self._renewal.join()
-        if self.finished:
+        if self.finished or self.rank:
             return
         builds = self.ledger.builds
         if self.ledger.releases.latest_accepted(self.execution_id) is not None:

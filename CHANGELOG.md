@@ -114,6 +114,20 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Changed
 
+- Every rank calls `Ledger.run` (and `start`, `branch`, `resume`), as it calls
+  `DistributedDataParallel`, and gets its own `Run`. Rank 0 starts or
+  resumes the run and holds the lease; every rank first checks that it runs
+  what rank 0 runs (model, loss, optimizer, config, `from_release`, input
+  names), and a rank that differs, or whose copy of a `Path` input has other
+  bytes, raises on every rank before anything trains. Each rank passes its
+  own copy's path; one with rank 0's scan is not read again. A synchronous
+  `save` returns the step's release on every rank and raises rank 0's
+  acceptance error on every rank; `finish` checks every rank's copy and is
+  collective. A launcher's `WORLD_SIZE` above 1 with no process group raises.
+  `Checkpoints`, `Run.checkpoints`, `Checkpoints.configure(inputs=)` and
+  `vestigo.torch.report` are gone from the API: the broadcast and the
+  hand-built manager are internal. The distributed example and the guide
+  use one code path for every rank (#50).
 - `vestigo.torch` trains through one call and two methods. `Ledger.run(model,
   optimizer, *, loss, version, inputs, config, from_release, checkpointing)`
   defines the model and program, then resumes the computation's unfinished
