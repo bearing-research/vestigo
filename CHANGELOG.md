@@ -108,6 +108,17 @@ All notable changes to vestigo are recorded here. The format follows
   that step. `objects(path)` on `S3BlobStore`, `GCSBlobStore` and
   `AzureBlobStore` lists a key or prefix of the bucket that way; the object
   store error counter has a `list` operation (#49).
+- Lineage queries over `vestigo.torch` executions (Investigation 09, T4).
+  `Ledger.execution(execution_id)` is the record an execution was started
+  from (its program, each input's pin, the checkpoint it branched from) with
+  its attempts and the checkpoint each resumed from, and its accepted
+  checkpoints by step. `Ledger.executions(of, reading=)` lists the
+  executions of a program, or of every program over a model, and those
+  reading an input's bytes wherever they are; `Ledger.resumed_from` the
+  attempts that continued from a release; `Ledger.descendants` a run's
+  branches at any depth, still linked after their checkpoint is collected.
+  `BuildStore.builds_of(executor_ref)`, `attempts_of(build_id)` and
+  `attempts_resumed_from(release_id)` read the rows they join (#52).
 - `BuildStore.lapse_lease(build_id, lease_owner)` ends a lease for good from
   any thread or process: it clears the owner, so a renewal that read the
   clock first cannot revive it, as one could after a renewal to zero (#47).

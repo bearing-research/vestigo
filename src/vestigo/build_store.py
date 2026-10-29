@@ -164,6 +164,23 @@ class AttemptState:
     principal: str | None = None
 
 
+_ATTEMPT_COLUMNS = (
+    "build_id, artifact_id, version, attempt, writable_until, resumed_from, principal"
+)
+
+
+def _row_to_attempt(row: Any) -> AttemptState:
+    return AttemptState(
+        build_id=row["build_id"],
+        attempt=row["attempt"],
+        artifact_id=row["artifact_id"],
+        version=row["version"],
+        writable_until=row["writable_until"],
+        resumed_from=row["resumed_from"],
+        principal=row["principal"],
+    )
+
+
 # The SELECT list of a BuildState; a new column is added here and in the dataclass.
 _BUILD_FIELDS = (
     "build_id",
@@ -561,23 +578,35 @@ class BuildStore:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT build_id, artifact_id, version, attempt, writable_until, resumed_from, "
-                "principal FROM build_attempts WHERE build_id = ? AND attempt = ?",
+                f"SELECT {_ATTEMPT_COLUMNS} FROM build_attempts WHERE build_id = ? AND attempt = ?",
                 (build_id, attempt),
             ).fetchone()
-            if row is None:
-                return None
-            return AttemptState(
-                build_id=row["build_id"],
-                attempt=row["attempt"],
-                artifact_id=row["artifact_id"],
-                version=row["version"],
-                writable_until=row["writable_until"],
-                resumed_from=row["resumed_from"],
-                principal=row["principal"],
-            )
+            return None if row is None else _row_to_attempt(row)
         finally:
             conn.close()
+
+    def attempts_of(self, build_id: str) -> list[AttemptState]:
+        """The build's attempts in the order they stop being writable.
+
+        That is the order they opened in while each opens with the same write window.
+        """
+        return self._attempts_where("build_id = ?", (build_id,))
+
+    def attempts_resumed_from(self, release_id: str) -> list[AttemptState]:
+        """The attempts that continued from *release_id*, ordered as :meth:`attempts_of`."""
+        return self._attempts_where("resumed_from = ?", (release_id,))
+
+    def _attempts_where(self, clause: str, params: tuple[Any, ...]) -> list[AttemptState]:
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT {_ATTEMPT_COLUMNS} FROM build_attempts WHERE {clause} "
+                "ORDER BY writable_until, attempt",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_row_to_attempt(row) for row in rows]
 
     def find_open_build(
         self,
@@ -1139,6 +1168,19 @@ class BuildStore:
             return [_row_to_build_state(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+    def builds_of(self, executor_ref: str) -> list[BuildState]:
+        """Every build of an executor, oldest first."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT {_BUILD_COLUMNS} FROM artifact_builds WHERE executor_ref = ? "
+                "ORDER BY created_at, build_id",
+                (executor_ref,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_row_to_build_state(row) for row in rows]
 
     def list_builds_by_tenant(
         self,

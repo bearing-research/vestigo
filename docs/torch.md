@@ -206,6 +206,31 @@ a new execution.
 is not a checkpoint (a final or derived release) and a checkpoint `collect` has taken,
 before opening anything.
 
+## Lineage
+
+Every execution keeps the record it was started from, so the ledger can say what ran
+on what without any logging call in the training script:
+
+```python
+execution = ledger.execution(run.execution_id)
+execution.program, execution.inputs, execution.init  # the bound computation
+execution.attempts  # each Attempt, and the checkpoint it resumed from
+execution.checkpoints  # (step, release_id) of each accepted checkpoint still stored
+
+ledger.executions(program)  # every execution of a program
+ledger.executions(model)  # of every program over a model
+ledger.executions(reading=Path("data"))  # every execution that read these bytes
+ledger.resumed_from(release_id)  # the attempts that continued from it
+ledger.descendants(run.execution_id)  # its branches, and theirs, at any depth
+```
+
+`inputs` hold each role's pin as the computation key hashes it: a `str` as given, a
+`Path` or `Remote` as the digests or object names it was pinned to. `reading` is pinned
+the same way, so a copy of the data on another machine finds the same executions. Each
+branch names the checkpoint it started from in `init`, and still descends from its run
+after `collect` has taken that checkpoint. Lists are oldest first. A derived release is
+not an execution; `ledger.derived(release_id, name)` finds it.
+
 ## Heads
 
 `run.set_head(name, release_id)` points a reference at an accepted release, and
