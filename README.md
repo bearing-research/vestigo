@@ -109,10 +109,11 @@ The package exports nothing at its top level; a consumer imports each module.
   or finish after those bytes change raises `InputChanged`; a `Remote`
   (`s3://`, `gs://`, `az://`, a key or a prefix) is pinned to its object
   store's names for the bytes and listed again at each check; a `str` is a
-  label taken as given; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
-  rank's `CheckpointManager.Config` at `LedgerStorage`, and
-  `configure(config, inputs=)` points that rank at its own copy of the
-  inputs, which every rank's report records.
+  label taken as given. In a process group every rank calls `Ledger.run`
+  (as it calls `DistributedDataParallel`) with its own copy of the inputs:
+  rank 0 holds the lease, a rank that runs another config or other bytes
+  stops every rank, and a synchronous `save` and `finish` give every rank
+  rank 0's outcome.
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
   checkpoints no execution needs: an unfinished run keeps its newest `keep`

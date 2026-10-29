@@ -36,12 +36,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from torch import nn
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 
+import vestigo.torch
 from vestigo.blob_store import BlobSettings
 from vestigo.build_store import BuildStore
 from vestigo.releases import ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost
 from vestigo.torch import (
-    Checkpoints,
     Definition,
     InputChanged,
     Ledger,
@@ -51,8 +51,12 @@ from vestigo.torch import (
     Run,
     _archive_metadata,
     _canonical,
+    _Checkpoints,
+    _copies,
     _file_digest,
-    report,
+    _kinds,
+    _portable,
+    _report_written,
 )
 
 STEPS = 6
@@ -89,7 +93,7 @@ def _program(ledger: Ledger, model: nn.Module, optimizer: torch.optim.Optimizer)
     )
 
 
-def _manager(checkpoints: Checkpoints) -> CheckpointManager:
+def _manager(checkpoints: _Checkpoints) -> CheckpointManager:
     return checkpoints.configure(CheckpointManager.Config.with_sync_save()).build()
 
 
@@ -533,10 +537,10 @@ def test_a_change_after_rank_zero_s_report_fails_the_step(ledger: Ledger, tmp_pa
     data = _file(tmp_path / "train.bin")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": data}) as run:
-        config = run.checkpoints.configure(CheckpointManager.Config.with_sync_save())
+        config = run._checkpoints.configure(CheckpointManager.Config.with_sync_save())
 
         def reported_then_changed(args) -> None:
-            report(args)
+            _report_written(args)
             # As while rank 0 waits at the barrier for a slower rank.
             data.write_bytes(b"rowz")
 
@@ -544,7 +548,7 @@ def test_a_change_after_rank_zero_s_report_fails_the_step(ledger: Ledger, tmp_pa
         manager = config.build()
         try:
             with pytest.raises(InputChanged, match="on rank 0"):
-                manager.save(run.checkpoints.checkpoint_id(1), {"step": 1})
+                manager.save(run._checkpoints.checkpoint_id(1), {"step": 1})
         finally:
             manager.close()
         assert run.release_of(1) is None
@@ -613,10 +617,10 @@ def test_a_save_through_the_manager_itself_holds_the_inputs(ledger: Ledger, tmp_
         trainer.train(run, 1)
         data.write_bytes(b"rowz")
         # As another rank's script saves, or a write still in flight when it lands.
-        manager = _manager(run.checkpoints)
+        manager = _manager(run._checkpoints)
         try:
             with pytest.raises(InputChanged):
-                manager.save(run.checkpoints.checkpoint_id(2), {"step": 2})
+                manager.save(run._checkpoints.checkpoint_id(2), {"step": 2})
         finally:
             manager.close()
         assert run.release_of(2) is None
@@ -638,7 +642,7 @@ def test_a_save_scans_its_inputs_once_reads_none_and_ships_no_listing(
     for tree in (small, large):
         trainer = Trainer(ledger)
         with _run(ledger, trainer, {"train": tree}) as run:
-            sizes.append(len(pickle.dumps(run.checkpoints)))
+            sizes.append(len(pickle.dumps(run._checkpoints)))
             scans.clear()
             reads.clear()
             trainer.train(run, 1)
@@ -664,34 +668,65 @@ def test_rank_zero_records_its_inputs_in_the_manifest(ledger: Ledger, tmp_path: 
         assert json.loads(ledger.store.read_blob(own.id, own.version))["inputs"] is None
 
 
-def test_a_rank_configures_with_its_own_copy_of_the_inputs(ledger: Ledger, tmp_path: Path):
+def test_a_rank_s_copies_must_be_the_bytes_rank_0_pinned(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://lake/eval.bin"] = (1, "etag:e")
     data = _file(tmp_path / "rank0" / "train.bin")
     copy = _file(tmp_path / "rank1" / "train.bin")
+    other = _file(tmp_path / "other" / "train.bin", b"rowz")
+    remote = Remote("s3://lake/eval.bin")
     trainer = Trainer(ledger)
-    sync = CheckpointManager.Config.with_sync_save
-    with _run(ledger, trainer, {"train": data}) as run:
-        checkpoints = run.checkpoints
-        with pytest.raises(InputChanged, match="in this copy"):
-            checkpoints.configure(sync(), inputs={"train": _file(tmp_path / "other", b"rowz")})
-        with pytest.raises(ValueError, match="Path inputs"):
-            checkpoints.configure(sync(), inputs={"eval": copy})
-        with pytest.raises(TypeError):
-            checkpoints.configure(sync(), inputs={"train": str(copy)})
-        config = checkpoints.configure(sync(), inputs={"train": copy})
-        assert [held.path for held in config.storage_config.checkpoints.inputs] == [
-            str(copy.absolute())
-        ]
-        assert config.finalize_callback is config.storage_config.checkpoints
+    with _run(ledger, trainer, {"train": data, "eval": remote}) as run:
+        held = run._checkpoints.inputs
 
-        # What this copy holds is what is checked, whatever rank 0's own copy holds.
-        copy.write_bytes(b"rowz")
-        manager = config.build()
-        try:
-            with pytest.raises(InputChanged, match=f"at {copy.absolute()} has other bytes"):
-                manager.save(checkpoints.checkpoint_id(1), {"step": 1})
-        finally:
-            manager.close()
-        assert run.release_of(1) is None
+    copies = _copies({"train": copy, "eval": remote}, held, 1)
+    assert {each.role: each.path for each in copies} == {
+        "train": str(copy.absolute()),
+        "eval": "s3://lake/eval.bin",
+    }
+    assert [each.pinned for each in copies] == [each.pinned for each in held]
+    with pytest.raises(InputChanged, match=f"at {other} has other bytes on rank 1"):
+        _copies({"train": other, "eval": remote}, held, 1)
+
+    # Rank 0's own copy, as its scan found it, is not read again.
+    def unread(files: object) -> None:
+        raise AssertionError("read again")
+
+    monkeypatch.setattr(vestigo.torch, "_pin", unread)
+    assert _copies({"train": data, "eval": remote}, held, 1)[0].pinned == held[0].pinned
+
+
+def test_ranks_agree_on_labels_and_uris_but_not_where_their_copies_are(tmp_path: Path):
+    remote = Remote("s3://lake/eval/")
+    terms = _kinds({"label": "data@v=1", "eval": remote, "train": tmp_path / "rank0"})
+    assert terms == _kinds({"label": "data@v=1", "eval": remote, "train": tmp_path / "rank1"})
+    assert terms != _kinds(
+        {"label": "data@v=1", "eval": Remote("s3://lake/other/"), "train": tmp_path}
+    )
+    assert terms != _kinds({"label": "data@v=2", "eval": remote, "train": tmp_path})
+    assert terms != _kinds({"label": "data@v=1", "eval": remote, "train": str(tmp_path)})
+
+
+def test_a_launcher_s_ranks_need_their_process_group(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(RuntimeError, match="initialize the process group"):
+        _run(ledger, Trainer(ledger))
+
+
+class _Unbuildable(Exception):
+    def __init__(self, code: int, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+
+
+def test_an_error_goes_to_other_ranks_as_itself_else_as_its_repr():
+    sent = _portable(InputChanged("input 'train' has other bytes"))
+    assert type(sent) is InputChanged and str(sent) == "input 'train' has other bytes"
+    sent = _portable(_Unbuildable(503, "busy"))
+    assert type(sent) is RuntimeError and "503: busy" in str(sent)
 
 
 def test_resume_takes_the_execution_s_own_inputs_and_holds_them(ledger: Ledger, tmp_path: Path):
@@ -888,22 +923,6 @@ def test_a_store_that_does_not_answer_fails_that_step_only(
         assert run.release_of(3) is not None
 
 
-def test_a_rank_names_its_own_copies_of_local_inputs_only(
-    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    objects = _bucket(monkeypatch)
-    objects["s3://lake/eval.bin"] = (1, "etag:e")
-    data = _file(tmp_path / "rank0" / "train.bin")
-    copy = _file(tmp_path / "rank1" / "train.bin")
-    trainer = Trainer(ledger)
-    with _run(ledger, trainer, {"train": data, "eval": Remote("s3://lake/eval.bin")}) as run:
-        config = run.checkpoints.configure(
-            CheckpointManager.Config.with_sync_save(), inputs={"train": copy}
-        )
-        held = {each.role: each.path for each in config.storage_config.checkpoints.inputs}
-        assert held == {"train": str(copy.absolute()), "eval": "s3://lake/eval.bin"}
-
-
 # --- Checkpoints ---
 
 
@@ -936,10 +955,10 @@ def test_a_checkpoint_is_one_release_of_its_files_under_a_manifest(ledger: Ledge
 
 def _finalize(run: Run, step: int) -> None:
     """Call the finalize callback as the writer does, with a storage *run* configured."""
-    config = run.checkpoints.configure(CheckpointManager.Config())
+    config = run._checkpoints.configure(CheckpointManager.Config())
     storage = config.storage_config.create_storage()
     config.finalize_callback(
-        SimpleNamespace(path=run.checkpoints.checkpoint_id(step), storage=storage)
+        SimpleNamespace(path=run._checkpoints.checkpoint_id(step), storage=storage)
     )
 
 
@@ -955,14 +974,14 @@ def test_a_retried_finalize_returns_the_accepted_release(ledger: Ledger):
 def test_an_attempt_writes_only_its_own_checkpoints(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run, ledger.start(trainer.program) as other:
-        manager = _manager(run.checkpoints)
+        manager = _manager(run._checkpoints)
         try:
             with pytest.raises(PermissionError):
-                manager.save(other.checkpoints.checkpoint_id(1), {"step": 1})
+                manager.save(other._checkpoints.checkpoint_id(1), {"step": 1})
         finally:
             manager.close()
         with pytest.raises(PermissionError):
-            run.checkpoints(SimpleNamespace(path=other.checkpoints.checkpoint_id(1)))
+            run._checkpoints(SimpleNamespace(path=other._checkpoints.checkpoint_id(1)))
 
 
 def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
@@ -977,12 +996,12 @@ def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
         written = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@")
         assert any(ledger.store.blob_exists(v.id, v.version) for v in written)
 
-        storage = run.checkpoints.configure(
+        storage = run._checkpoints.configure(
             CheckpointManager.Config()
         ).storage_config.create_storage()
-        assert not storage.exists(Path(run.checkpoints.checkpoint_id(1)))
+        assert not storage.exists(Path(run._checkpoints.checkpoint_id(1)))
         with pytest.raises(FileNotFoundError):
-            storage.getsize(Path(run.checkpoints.checkpoint_id(1)) / "model_0.pt")
+            storage.getsize(Path(run._checkpoints.checkpoint_id(1)) / "model_0.pt")
 
 
 def test_only_rank_zero_accepts_by_the_rank_it_configured_with(
@@ -992,14 +1011,14 @@ def test_only_rank_zero_accepts_by_the_rank_it_configured_with(
     with ledger.start(trainer.program) as run:
         monkeypatch.setenv("RANK", "1")
         monkeypatch.setenv("WORLD_SIZE", "2")
-        config = run.checkpoints.configure(CheckpointManager.Config())
+        config = run._checkpoints.configure(CheckpointManager.Config())
         # An async writer's subprocess may see neither a process group nor the variables.
         monkeypatch.delenv("RANK")
         monkeypatch.delenv("WORLD_SIZE")
         storage = config.storage_config.create_storage()
 
         config.finalize_callback(
-            SimpleNamespace(path=run.checkpoints.checkpoint_id(1), storage=storage)
+            SimpleNamespace(path=run._checkpoints.checkpoint_id(1), storage=storage)
         )
 
         assert (storage.rank, storage.world) == (1, 2)
@@ -1270,7 +1289,7 @@ def test_a_load_only_ledger_reads_a_checkpoint_and_writes_nothing(tmp_path: Path
         try:
             with pytest.raises(PermissionError, match="only loads"):
                 manager.save(
-                    run.checkpoints.checkpoint_id(3), {"model": trainer.model.state_dict()}
+                    run._checkpoints.checkpoint_id(3), {"model": trainer.model.state_dict()}
                 )
         finally:
             manager.close()
@@ -1302,14 +1321,14 @@ def _save_meddled(ledger: Ledger, run: Run, step: int, meddle) -> None:
     """Save *step*, letting *meddle* at the store between the rank's report and rank 0."""
 
     def reported(args: SimpleNamespace) -> None:
-        report(args)
+        _report_written(args)
         meddle()
 
-    config = run.checkpoints.configure(CheckpointManager.Config.with_sync_save())
+    config = run._checkpoints.configure(CheckpointManager.Config.with_sync_save())
     config.pre_finalize_callback = reported
     manager = config.build()
     try:
-        manager.save(run.checkpoints.checkpoint_id(step), {"model": _model().state_dict()})
+        manager.save(run._checkpoints.checkpoint_id(step), {"model": _model().state_dict()})
     finally:
         manager.close()
 
@@ -1506,11 +1525,11 @@ def test_a_crash_while_writing_leaves_only_rows_to_collect(
 def test_a_write_that_fails_midway_commits_no_bytes(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
-        manager = _manager(run.checkpoints)
+        manager = _manager(run._checkpoints)
         try:
             with pytest.raises(Exception, match="pickle"):
                 # torch.save writes its archive header before the lambda refuses to pickle.
-                manager.save(run.checkpoints.checkpoint_id(1), {"bad": {"f": lambda: 0}})
+                manager.save(run._checkpoints.checkpoint_id(1), {"bad": {"f": lambda: 0}})
         finally:
             manager.close()
 
@@ -1568,13 +1587,13 @@ def test_a_step_saved_again_after_a_failed_write_is_released(
 
     state = {"model": trainer.model.state_dict(), "step": 1}
     with ledger.start(trainer.program) as run:
-        manager = _manager(run.checkpoints)
+        manager = _manager(run._checkpoints)
         try:
             with monkeypatch.context() as patch:
                 patch.setattr(LedgerStorage, "stream_write", second_fails)
                 with pytest.raises(OSError, match="upload failed"):
-                    manager.save(run.checkpoints.checkpoint_id(1), state)
-            manager.save(run.checkpoints.checkpoint_id(1), state)
+                    manager.save(run._checkpoints.checkpoint_id(1), state)
+            manager.save(run._checkpoints.checkpoint_id(1), state)
         finally:
             manager.close()
 
@@ -2004,17 +2023,17 @@ def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
         }
 
     with ledger.start(trainer.program) as run:
-        manager = _manager(run.checkpoints)
+        manager = _manager(run._checkpoints)
 
         def save(step: int, patch: tuple[type, str, object] | None = None) -> None:
             state = {"model": trainer.model.state_dict(), "step": step}
             if patch is None:
-                manager.save(run.checkpoints.checkpoint_id(step), state)
+                manager.save(run._checkpoints.checkpoint_id(step), state)
                 return
             with monkeypatch.context() as patched:
                 patched.setattr(*patch)
                 with pytest.raises((OSError, ReleaseRejected)):
-                    manager.save(run.checkpoints.checkpoint_id(step), state)
+                    manager.save(run._checkpoints.checkpoint_id(step), state)
 
         upload_fails = (LedgerStorage, "stream_write", second_fails)
         try:
@@ -2217,21 +2236,19 @@ def test_checkpoints_on_an_object_store_load_back(tmp_path: Path, remote: Remote
 # --- Two ranks ---
 
 
-def _rank_main(
-    rank: int,
-    world: int,
-    root: str,
-    die_at: int | None,
-    asynchronous: bool = False,
-    inputs: str | None = None,
-) -> None:
-    """One rank: rank 0 starts the run and hands its checkpoints to the other.
+def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) -> None:
+    """One rank of a two-rank run, every rank calling ``Ledger.run``; writes what it saw.
+
+    Cases: ``sync`` and ``async`` save and finish; in ``die`` rank 1 dies before
+    writing step 2; ``copies`` and ``drift`` give each rank its own copy of a ``Path``
+    input, which in ``drift`` rank 1 rewrites before step 2 and in ``late`` before it
+    finishes; ``mismatch`` gives rank 1
+    another config, and ``badcopy`` rank 1 a copy with other bytes.
 
     Asynchronous, the group gets its rank directly and the environment names none, so
-    the writer's subprocess has only what each rank configured. With *inputs*, each
-    rank holds its own copy of a ``Path`` input, and ``"drift"`` has rank 1 write
-    other bytes into its copy before step 2.
+    the writer's subprocess has only what each rank configured.
     """
+    asynchronous = case == "async"
     if asynchronous:
         os.environ.pop("RANK", None)
         os.environ.pop("WORLD_SIZE", None)
@@ -2240,84 +2257,109 @@ def _rank_main(
     dist.init_process_group(
         "gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=world
     )
-    signing = Ed25519PrivateKey.generate()
-    ledger = (
-        Ledger(Path(root) / "ledger", signing_key=signing.private_bytes_raw())
-        if rank == 0
-        else None
-    )
+    ledger = Ledger(Path(root) / "ledger", signing_key=signing_key)
     model = _model()
-    run = None
-    shared: list[object] = [None]
-    if ledger is not None:
-        optimizer = torch.optim.AdamW(model.parameters())
-        data = {"train": Path(root, "rank0", "train.bin")} if inputs else None
-        run = ledger.start(_program(ledger, model, optimizer), data)
-        shared = [run.checkpoints]
-    dist.broadcast_object_list(shared, src=0)
-    checkpoints = shared[0]
-    assert isinstance(checkpoints, Checkpoints)
     copy = Path(root, f"rank{rank}", "train.bin")
-    config = checkpoints.configure(
+    if case == "badcopy" and rank == 1:
+        copy.write_bytes(b"rowz")
+    checkpointing = (
         CheckpointManager.Config.with_async_save()
         if asynchronous
-        else CheckpointManager.Config.with_sync_save(),
-        inputs={"train": copy} if inputs else None,
+        else CheckpointManager.Config.with_sync_save()
     )
-    config.save.writer_config.checkpoint_write_barrier_timeout_sec = 5
-    manager = config.build()
-    outcome: dict[str, object] = {
-        "execution": checkpoints.execution_id,
-        "saved": [],
-        "verify_key": signing.public_key().public_bytes_raw().hex(),
-    }
-    for step in (1, 2):
-        if rank == 1 and step == die_at:
-            os._exit(3)  # dies before writing: rank 0 never passes the barrier
-        if rank == 1 and step == 2 and inputs == "drift":
-            copy.write_bytes(b"rowz")
-        try:
-            with torch.no_grad():
-                model[0].weight.add_(rank + 1)
-            pending = manager.save(checkpoints.checkpoint_id(step), {"model": model.state_dict()})
-            if pending is not None:
-                pending.result()
-            outcome["saved"].append(step)  # type: ignore[union-attr]
-        except Exception as exc:
-            outcome["error"] = type(exc).__name__
-            outcome["message"] = str(exc)
-            break
+    checkpointing.save.writer_config.checkpoint_write_barrier_timeout_sec = 5
+    saved: list[int] = []
+    returned: list[str] = []
+    outcome: dict[str, object] = {"saved": saved, "returned": returned}
+    try:
+        run = ledger.run(
+            model,
+            torch.optim.AdamW(model.parameters()),
+            loss=nn.MSELoss(),
+            version="tiny-v1",
+            inputs={"train": copy} if case in ("copies", "drift", "late", "badcopy") else None,
+            config={"batch": 32 if case == "mismatch" and rank == 1 else 16},
+            checkpointing=checkpointing,
+        )
+    except Exception as exc:
+        outcome.update(error=type(exc).__name__, message=str(exc))
+        run = None
     if run is not None:
+        outcome["execution"] = run.execution_id
+        for step in (1, 2):
+            if rank == 1 and step == 2 and case == "die":
+                os._exit(3)  # dies before writing: rank 0 never passes the barrier
+            if rank == 1 and step == 2 and case == "drift":
+                copy.write_bytes(b"rowz")
+            try:
+                with torch.no_grad():
+                    model[0].weight.add_(rank + 1)
+                release = run.save(step, {"model": model})
+                if isinstance(release, Future):
+                    release.result()
+                else:
+                    returned.append(release.release_id)
+                saved.append(step)
+            except Exception as exc:
+                outcome.update(error=type(exc).__name__, message=str(exc))
+                break
+        else:
+            if rank == 1 and case == "late":
+                copy.write_bytes(b"rowz")
+            try:
+                run.finish()
+            except InputChanged as exc:
+                outcome.update(error=type(exc).__name__, message=str(exc))
+                run.close()
+                Path(root, f"outcome{rank}.json").write_text(json.dumps(outcome))
+                os._exit(0)
+            # Past finish every save is settled: an asynchronous one may land on rank 0
+            # after this rank's future resolves.
+            outcome["released"] = [run.release_of(step).release_id for step in saved]  # type: ignore[union-attr]
         run.close()
-        Path(root, "outcome.json").write_text(json.dumps(outcome))
+    Path(root, f"outcome{rank}.json").write_text(json.dumps(outcome))
     # A dead peer can hang the group's teardown; nothing below needs it.
     os._exit(0)
 
 
-def _two_ranks(
-    root: Path, die_at: int | None, asynchronous: bool = False, inputs: str | None = None
-) -> tuple[list[int], dict]:
-    if inputs:
-        for rank in (0, 1):
-            _file(root / f"rank{rank}" / "train.bin")
+def _builds(ledger: Ledger) -> list[str]:
+    conn = ledger.builds._get_connection()
+    try:
+        return [row["build_id"] for row in conn.execute("SELECT build_id FROM artifact_builds")]
+    finally:
+        conn.close()
+
+
+def _two_ranks(root: Path, case: str) -> tuple[list[int], list[dict], bytes]:
+    """Each rank's exit code and outcome (None for a rank that wrote none), and the
+    verify key."""
+    for rank in (0, 1):
+        _file(root / f"rank{rank}" / "train.bin")
+    signing = Ed25519PrivateKey.generate()
     context = multiprocessing.get_context("spawn")
     ranks = [
-        context.Process(target=_rank_main, args=(r, 2, str(root), die_at, asynchronous, inputs))
+        context.Process(
+            target=_rank_main, args=(r, 2, str(root), case, signing.private_bytes_raw())
+        )
         for r in (0, 1)
     ]
     for process in ranks:
         process.start()
     for process in ranks:
         process.join(120)
-    return [p.exitcode for p in ranks], json.loads((root / "outcome.json").read_text())
+    outcomes = [
+        json.loads(path.read_text()) if (path := root / f"outcome{r}.json").exists() else None
+        for r in (0, 1)
+    ]
+    return [p.exitcode for p in ranks], outcomes, signing.public_key().public_bytes_raw()
 
 
 @pytest.mark.parametrize(
-    "asynchronous",
+    "case",
     [
-        False,
+        "sync",
         pytest.param(
-            True,
+            "async",
             marks=pytest.mark.skipif(
                 sys.platform == "darwin",
                 reason="torch_checkpointing 0.1.1 stages for CUDA whenever an accelerator "
@@ -2326,14 +2368,25 @@ def _two_ranks(
         ),
     ],
 )
-def test_two_ranks_make_one_release_from_rank_zero(tmp_path: Path, asynchronous: bool):
-    exits, outcome = _two_ranks(tmp_path, die_at=None, asynchronous=asynchronous)
+def test_every_rank_runs_one_run_whose_releases_rank_zero_makes(tmp_path: Path, case: str):
+    exits, outcomes, verify_key = _two_ranks(tmp_path, case)
 
-    assert exits == [0, 0] and outcome["saved"] == [1, 2]
+    assert exits == [0, 0]
+    zero, one = outcomes
+    assert zero is not None and one is not None
+    # One execution, each save one release on both ranks, which both finished.
+    assert zero["execution"] == one["execution"] and zero["released"] == one["released"]
+    assert len(zero["released"]) == 2
+    # A synchronous save returned it on every rank.
+    if case == "sync":
+        assert zero["returned"] == one["returned"] == zero["released"]
     with Ledger(tmp_path / "ledger") as ledger:
-        for step in (1, 2):
-            release = ledger.release_of(outcome["execution"], step)
-            assert release is not None
+        execution = zero["execution"]
+        assert ledger.builds.get_build(execution).state == "ready"
+        assert _builds(ledger) == [execution]
+        for step, release_id in enumerate(zero["released"], start=1):
+            release = ledger.release_of(execution, step)
+            assert release is not None and release.release_id == release_id
             outputs = ledger.releases.bundle(release.release_id).outputs
             assert {v.params["file"] for v in outputs if "file" in v.params} == {
                 "model_0.pt",
@@ -2344,50 +2397,89 @@ def test_two_ranks_make_one_release_from_rank_zero(tmp_path: Path, asynchronous:
             [manifest] = [v for v in outputs if v.params.get("manifest")]
             content = json.loads(ledger.store.read_blob(manifest.id, manifest.version))
             assert {e["file"] for e in content["files"]} == {"model_0.pt", "model_1.pt"}
-            public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(outcome["verify_key"]))
+            public = Ed25519PublicKey.from_public_bytes(verify_key)
             public.verify(bytes.fromhex(content.pop("signature")), _canonical(content))
 
 
 def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
-    exits, outcome = _two_ranks(tmp_path, die_at=2)
+    exits, outcomes, _ = _two_ranks(tmp_path, "die")
 
-    assert exits == [0, 3] and outcome["saved"] == [1] and "error" in outcome
+    # Rank 0 is not left waiting for a rank that will never hear it.
+    assert exits == [0, 3]
+    zero = outcomes[0]
+    assert zero is not None and len(zero["saved"]) == 1 and "error" in zero
     with Ledger(tmp_path / "ledger") as ledger:
-        assert ledger.release_of(outcome["execution"], 1) is not None
-        assert ledger.release_of(outcome["execution"], 2) is None
-        [release] = ledger.releases.releases_of(outcome["execution"], "checkpoint")
+        assert ledger.release_of(zero["execution"], 1) is not None
+        assert ledger.release_of(zero["execution"], 2) is None
+        [release] = ledger.releases.releases_of(zero["execution"], "checkpoint")
         assert release.sequence == 1
 
 
-@pytest.mark.parametrize("inputs", ["copies", "drift"])
-def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, inputs: str):
-    exits, outcome = _two_ranks(tmp_path, die_at=None, inputs=inputs)
+@pytest.mark.parametrize("case", ["copies", "drift", "late"])
+def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, case: str):
+    exits, outcomes, _ = _two_ranks(tmp_path, case)
 
     assert exits == [0, 0]
+    zero, one = outcomes
+    assert zero is not None and one is not None
     with Ledger(tmp_path / "ledger") as ledger:
-        execution = outcome["execution"]
+        execution = zero["execution"]
         assert ledger.release_of(execution, 1) is not None
-        if inputs == "copies":
-            assert outcome["saved"] == [1, 2]
+        if case == "copies":
+            assert len(zero["saved"]) == 2 and one["saved"] == zero["saved"]
             outputs = ledger.releases.bundle(ledger.release_of(execution, 2).release_id).outputs
             pinned = ledger.builds.get_build(execution).params["inputs"]["train"]
             # Each rank's own copy, as it found it: rank 1's in its report, rank 0's in
             # the manifest it signed past the barrier.
-            [one] = [v for v in outputs if v.params.get("rank") == 1]
+            [report] = [v for v in outputs if v.params.get("rank") == 1]
             [manifest] = [v for v in outputs if v.params.get("manifest")]
             found = {
-                1: json.loads(ledger.store.read_blob(one.id, one.version))["inputs"],
+                1: json.loads(ledger.store.read_blob(report.id, report.version))["inputs"],
                 0: json.loads(ledger.store.read_blob(manifest.id, manifest.version))["inputs"],
             }
             for rank, inputs_found in found.items():
                 assert inputs_found == {
                     "train": {"path": str(tmp_path / f"rank{rank}" / "train.bin"), "pin": pinned}
                 }
-        else:
-            assert outcome["saved"] == [1] and outcome["error"] == "InputChanged"
-            assert "on rank 1" in outcome["message"]
+        elif case == "drift":
+            # Rank 0's acceptance failed, and both ranks raised it.
+            for each in (zero, one):
+                assert len(each["saved"]) == 1 and each["error"] == "InputChanged"
+                assert "on rank 1" in each["message"]
             assert ledger.release_of(execution, 2) is None
             assert ledger.builds.get_build(execution).lease_owner is None
+        else:
+            # Both saves landed; the finish did not, on either rank.
+            for each in (zero, one):
+                assert len(each["saved"]) == 2 and each["error"] == "InputChanged"
+                assert "now on rank 1" in each["message"]
+            assert ledger.builds.get_build(execution).state == "building"
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("mismatch", "ValueError", "rank 1's program differ"),
+        ("badcopy", "InputChanged", "has other bytes on rank 1"),
+    ],
+)
+def test_a_rank_that_runs_something_else_stops_every_rank(
+    tmp_path: Path, case: str, error: str, message: str
+):
+    exits, outcomes, _ = _two_ranks(tmp_path, case)
+
+    assert exits == [0, 0]
+    for each in outcomes:
+        assert each is not None and each["error"] == error and message in each["message"]
+    with Ledger(tmp_path / "ledger") as ledger:
+        builds = _builds(ledger)
+        if case == "mismatch":
+            # Refused before rank 0 opened anything.
+            assert builds == []
+        else:
+            [build] = [ledger.builds.get_build(each) for each in builds]
+            # Opened, then failed with no checkpoint: nothing to resume.
+            assert build is not None and build.state == "failed"
 
 
 # --- Observed implementations ---
