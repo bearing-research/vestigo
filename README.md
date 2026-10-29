@@ -60,7 +60,7 @@ The package exports nothing at its top level; a consumer imports each module.
   `GCSBlobStore`, `AzureBlobStore`.
 - `vestigo.build_store`: `BuildStore(db_path, dialect=None)`, the builds with
   their leases and attempts (`create_build`, `open_attempt` with the attempt's
-  `principal`, `renew_lease`,
+  `principal`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `complete_attempt_within`, `list_runnable_builds` for the
   builds whose `dispatch` is `runner`); `BuildState`, `AttemptState`, `DISPATCHES`.
 - `vestigo.releases`: `ReleaseStore(artifacts, builds)`, a build's checkpoint
@@ -105,9 +105,9 @@ The package exports nothing at its top level; a consumer imports each module.
   while the run holds its lease, and `Run.restore(state)` loads them back in
   place, each file checked against its digest. `define_model`,
   `define_program`, `start`, `resume`, `branch` and `find` are the explicit
-  steps. A `Path` in `inputs` is pinned to its bytes in the key and must stay
-  as hashed: a save or finish after any change to it raises `InputChanged`;
-  a `str` is a label taken as given; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
+  steps. A `Path` in `inputs` is pinned to its bytes in the key, and a checkpoint
+  or finish after those bytes change raises `InputChanged`; a `str` is a
+  label taken as given; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
   rank's `CheckpointManager.Config` at `LedgerStorage`.
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the

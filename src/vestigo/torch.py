@@ -49,7 +49,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Generator, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -193,14 +193,16 @@ def _file_digest(path: Path) -> tuple[int, str]:
 
 
 class InputChanged(Exception):
-    """A verified input is not as its run resolved it: written, touched, or gone."""
+    """A verified input's bytes are not the ones its run resolved, or are gone."""
 
 
 # A file is (where its bytes are, the stat that changes with any write to them).
 _Scanned = tuple[str, tuple[int, ...]]
-# A digest is cached only for a file whose mtime is older than this, since a write in
-# the same timestamp tick as the lookup could leave every stat field as it was.
+# A digest is cached only for a file whose mtime and ctime are older than this, since
+# a write in the same timestamp tick as the lookup could leave every stat field as it was.
 _RACY_NS = 2_000_000_000
+# What an operating system writes into a folder someone browses; never a dataset's.
+_JUNK = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 
 
 def _stat_key(st: os.stat_result) -> tuple[int, ...]:
@@ -212,17 +214,27 @@ def _reraise(exc: OSError) -> None:
     raise exc
 
 
+def _real(path: Path) -> Path:
+    try:
+        return path.resolve(strict=True)
+    except RuntimeError as exc:
+        # A link loop raises RuntimeError before 3.13, OSError after.
+        raise OSError(f"{path} is a link loop") from exc
+
+
 def _scan(path: Path) -> list[tuple[str, _Scanned]]:
     """Every file of the input at *path*, by its name under it ("" for a file).
 
     The path named may be a link. Inside a directory a link may name a file of the
-    tree; any other link, or a file that is not a regular one, is refused.
+    tree; any other link, or a file that is not a regular one, is refused. Files an
+    operating system writes into a folder it shows (``.DS_Store``, ``Thumbs.db``,
+    ``desktop.ini``, ``._`` AppleDouble files) are not the input's.
 
     Raises:
         OSError: the input, or a file of it, cannot be read.
         ValueError: a directory holds no file, a link it refuses, or a special file.
     """
-    root = path.resolve(strict=True)
+    root = _real(path)
     if not root.is_dir():
         return [("", _regular(root))]
     files = []
@@ -231,8 +243,11 @@ def _scan(path: Path) -> list[tuple[str, _Scanned]]:
             if os.path.islink(os.path.join(top, name)):
                 raise ValueError(f"{os.path.join(top, name)} links to a directory")
         for name in names:
+            if name in _JUNK or name.startswith("._"):
+                continue
             entry = Path(top, name)
-            real = entry.resolve(strict=True)
+            # Under the real root, only a link's path can lead elsewhere.
+            real = _real(entry) if entry.is_symlink() else entry
             if not real.is_relative_to(root):
                 raise ValueError(f"{entry} links outside {root}")
             files.append((entry.relative_to(root).as_posix(), _regular(real)))
@@ -246,6 +261,12 @@ def _regular(real: Path) -> _Scanned:
     if not stat.S_ISREG(st.st_mode):
         raise ValueError(f"{real} is not a regular file")
     return str(real), _stat_key(st)
+
+
+def _fingerprint(files: Sequence[tuple[str, _Scanned]]) -> str:
+    return hashlib.sha256(
+        _canonical([[name, real, list(key)] for name, (real, key) in files])
+    ).hexdigest()
 
 
 def _cache_path() -> Path:
@@ -276,26 +297,37 @@ def _cache(path: Path) -> sqlite3.Connection:
 def _digests(files: Sequence[_Scanned]) -> list[str]:
     """Each file's sha256, read only where the machine's digest cache has none for its
     stat: a relaunch on the same data costs a stat per file."""
-    path = _cache_path()
     found: list[str | None] = []
+    path = None
     try:
+        path = _cache_path()
         with closing(_cache(path)) as cache:
             for real, key in files:
                 row = cache.execute(
                     "SELECT sha256 FROM digests WHERE path = ? AND stat = ?", (real, str(key))
                 ).fetchone()
                 found.append(row[0] if row else None)
-    except (OSError, sqlite3.Error):
-        # A read-only home, sqlite on NFS: hash everything rather than fail the run.
+    except (OSError, RuntimeError, sqlite3.Error):
+        # No home, a read-only one, sqlite on NFS: hash everything rather than fail.
         logger.warning("No digest cache at %s; hashing every input", path, exc_info=True)
         found = [None] * len(files)
+        path = None
     missing = [i for i, digest in enumerate(found) if digest is None]
-    with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1)) as pool:
-        for i, digest in zip(missing, pool.map(_hash, [files[i] for i in missing]), strict=True):
-            found[i] = digest
+    pool = ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1))
+    try:
+        pending = {pool.submit(_hash, files[i]): i for i in missing}
+        for future in as_completed(pending):
+            found[pending[future]] = future.result()
+    finally:
+        # On the first failure, the files not yet started are not read at all.
+        pool.shutdown(cancel_futures=True)
     settled = time.time_ns() - _RACY_NS
-    rows = [(files[i][0], str(files[i][1]), found[i]) for i in missing if files[i][1][3] < settled]
-    if rows:
+    rows = [
+        (files[i][0], str(files[i][1]), found[i])
+        for i in missing
+        if max(files[i][1][3], files[i][1][4]) < settled
+    ]
+    if path is not None and rows:
         try:
             with closing(_cache(path)) as cache, cache:
                 cache.executemany("INSERT OR REPLACE INTO digests VALUES (?, ?, ?)", rows)
@@ -317,11 +349,13 @@ def _pin(files: list[tuple[str, _Scanned]]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class _Held:
-    """A verified input as its run resolved it: rescanned, it must be the same."""
+    """A verified input as its run resolved it: its scan's fingerprint (a few bytes to
+    every rank and writer, however many files) and the bytes it was pinned to."""
 
     role: str
     path: str
-    files: tuple[tuple[str, _Scanned], ...]
+    scanned: str
+    pinned: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -347,7 +381,7 @@ def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
         if isinstance(value, Path):
             files = _scan(value)
             spec[role] = _pin(files)
-            held.append(_Held(role, str(value.absolute()), tuple(files)))
+            held.append(_Held(role, str(value.absolute()), _fingerprint(files), spec[role]))
         elif isinstance(value, str):
             spec[role] = value
         else:
@@ -356,17 +390,19 @@ def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
 
 
 def _hold(held: Sequence[_Held]) -> None:
-    """Raises InputChanged: a verified input is not as it was scanned."""
+    """Raises InputChanged: a verified input's bytes are not the ones it was pinned to.
+
+    An unchanged stat is the same bytes. A changed one (a chmod, a hardlink, an
+    attribute a file browser adds) is read again, from the digest cache where it can be.
+    """
     for each in held:
         try:
-            now = _scan(Path(each.path))
+            files = _scan(Path(each.path))
+            if _fingerprint(files) == each.scanned or _pin(files) == each.pinned:
+                continue
         except (OSError, ValueError) as exc:
             raise InputChanged(f"input {each.role!r} at {each.path} cannot be read") from exc
-        if tuple(now) != each.files:
-            raise InputChanged(
-                f"input {each.role!r} at {each.path} was written or touched since the run "
-                "resolved it"
-            )
+        raise InputChanged(f"input {each.role!r} at {each.path} has other bytes now")
 
 
 def _stateful(value: object) -> bool:
@@ -699,8 +735,8 @@ class Ledger:
         when None.
 
         Each ``Path`` input is hashed once here (a digest cache on the machine spares
-        a relaunch the read) and must stay as it is: a save or finish after any write
-        to it raises :class:`InputChanged`. Data changed after a crash is another
+        a relaunch the read), and its bytes must stay: a checkpoint or finish after
+        they change raises :class:`InputChanged`. Data changed after a crash is another
         computation, so the run starts fresh rather than resume on it.
 
         Raises:
@@ -1268,6 +1304,15 @@ class Ledger:
             if v.state == "ready" and v.id.startswith(prefix)
         ]
 
+    def _hold(self, writer: Checkpoints) -> None:
+        try:
+            _hold(writer.inputs)
+        except InputChanged:
+            # The data this attempt trained on is gone: a resume need not wait for it.
+            # A lapse, not a renewal to zero, as the run's own renewal goes on meanwhile.
+            self.builds.lapse_lease(writer.execution_id, writer.attempt)
+            raise
+
     def _require_lease(self, writer: Checkpoints) -> None:
         conn = self.store._get_connection()
         try:
@@ -1370,8 +1415,8 @@ class Ledger:
             if step == at.step and bundle.release.attempt == at.attempt:
                 # The writer retried a finalize whose acceptance had landed.
                 return bundle.release
-        # Here as well as in Run.save: an asynchronous write outlasts that check.
-        _hold(writer.inputs)
+        # Here, after the write, so a change while it ran fails it too.
+        self._hold(writer)
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -1811,10 +1856,10 @@ class Run:
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
-            InputChanged: a ``Path`` input was written or touched since the run
-                resolved it; the attempt gives up its lease.
+            InputChanged: a ``Path`` input's bytes changed since the run resolved
+                it (from the future, for an asynchronous save); nothing is released,
+                and the attempt gives up its lease.
         """
-        self._hold()
         pending = self.manager.save(self.checkpoints.checkpoint_id(step), _saved(state))
         if pending is not None:
             return pending
@@ -1886,12 +1931,12 @@ class Run:
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
-            InputChanged: a ``Path`` input was written or touched since the run
-                resolved it; the attempt gives up its lease.
+            InputChanged: a ``Path`` input's bytes changed since the run resolved
+                it; the attempt gives up its lease.
         """
         if self._manager is not None:
             self._manager.close()
-        self._hold()
+        self.ledger._hold(self.checkpoints)
         ended_on = next(
             (
                 bundle.release.release_id
@@ -1906,19 +1951,6 @@ class Run:
             self.ledger.releases.accept(release.release_id, [], operations)
             self.finished = True
             self._stop.set()
-
-    def _hold(self) -> None:
-        try:
-            _hold(self.checkpoints.inputs)
-        except InputChanged:
-            # The data this attempt trained on is gone: a resume need not wait for it.
-            # Renewal stops first, so none lands after the drop.
-            with self._renewing:
-                self._stop.set()
-            self.ledger.builds.renew_lease(
-                self.execution_id, self.attempt, lease_duration_seconds=0.0
-            )
-            raise
 
     def close(self) -> None:
         """Wait for the save in flight and stop renewing. An unfinished execution with a

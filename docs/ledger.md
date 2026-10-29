@@ -171,7 +171,8 @@ An attempt holds the build under a lease, which the worker renews with
 `builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
 lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
 and its releases are rejected, so the build goes on only in a new attempt (a resume)
-or a reclaim. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
+or a reclaim. `builds.lapse_lease(build_id, lease_owner)` ends a lease at once; it
+clears the owner, so a renewal racing it from another thread cannot revive it. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
 build again after a crash.
 
 ## Releases

@@ -59,21 +59,27 @@ path. So:
   and a resume there resumes;
 - data changed between a crash and the rerun is another computation, so the run
   starts fresh instead of resuming a checkpoint on different data;
-- each `run.save` and `finish` first checks that every file is as it was hashed. Any
-  write, `touch`, `chmod`, added or removed file raises `InputChanged`, releases
-  nothing, and drops the lease. Put the bytes back and the same script resumes from
-  the last checkpoint taken before the change.
+- before each checkpoint is accepted, and before `finish`, the files are checked
+  against those bytes. A changed, added or removed file raises `InputChanged`
+  (from `run.save`, or from its future for an asynchronous save), releases nothing,
+  and gives up the lease. Put the bytes back and the same script resumes from the
+  last checkpoint taken before the change.
 
-This proves that every checkpoint was taken while exactly those bytes sat at those
-paths. It cannot prove the training code read them: read the paths you passed.
+The check is a `stat` per file. A file whose stat changed with its bytes the same (a
+`chmod`, a `touch`, a hardlink, an attribute a file browser adds) is hashed again and
+passes. So the record says every checkpoint was accepted while exactly those bytes
+sat at those paths; an edit undone between two checkpoints goes unseen. Nor can it
+prove the training code read them: read the paths you passed.
 
-A directory takes every file in it, hidden ones too, so pass a clean path. It refuses
-a link out of the tree or to a directory, a special file such as a pipe, and a
-directory with no files; a link to a file inside the tree counts as that file. A
-relaunch costs a `stat` per file, not a read: digests are cached per machine in
-`$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, else `~/.cache/vestigo`. A file
-written in the last two seconds is hashed again each time, since a write in the same
-timestamp tick could leave its stat unchanged.
+A directory takes every file in it, hidden ones too, except what an operating system
+writes into a folder it shows: `.DS_Store`, `Thumbs.db`, `desktop.ini` and `._`
+AppleDouble files. It refuses a link out of the tree or to a directory, a link loop,
+a special file such as a pipe, and a directory with no files; a link to a file inside
+the tree counts as that file. A relaunch costs a `stat` per file, not a read: digests
+are cached per machine in `$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, else
+`~/.cache/vestigo` (with none usable, every file is hashed). A file whose mtime or
+ctime is within the last two seconds is hashed again each time, since a write in the
+same timestamp tick could leave its stat unchanged.
 
 **A `str` is a label.** Nothing reads it. It must change whenever the data does, so
 pin a version: an object store's version id or ETag, a table snapshot, a dataset
@@ -130,8 +136,9 @@ with a `Path` input resumes only with its inputs, which must be its own.
 
 Run the same script again. `ledger.run` finds the unfinished execution and resumes it
 in a new attempt, from its latest accepted checkpoint. `run.restores_from` is that
-release, or None for a fresh start. `ledger.resume(execution, from_release=...)`
-resumes from an older checkpoint.
+release, or None for a fresh start. `ledger.resume(execution, from_release=...,
+inputs=...)` resumes from an older checkpoint (`inputs` as the run had them, needed
+when one is a `Path`).
 
 How the old process ended decides when you can resume:
 

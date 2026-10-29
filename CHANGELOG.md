@@ -75,14 +75,22 @@ All notable changes to vestigo are recorded here. The format follows
   (a file's sha256, a directory's over its files' names, sizes and digests)
   in the computation key, where it lives left out. Data changed after a
   crash is another computation, so the run starts fresh instead of resuming
-  on it. Each `Run.save` and `finish`, and rank 0's acceptance of an
-  asynchronous save, rescans the files: any write, touch, or added or
-  removed file raises `InputChanged`, releases nothing and drops the lease.
-  A directory refuses links out of it or to a directory, special files and
-  no files. Digests are cached per machine under `VESTIGO_CACHE_DIR` (else
-  the XDG cache), so a relaunch costs a `stat` per file. `Ledger.resume`
-  takes `inputs=`, which an execution with a `Path` input needs. A `str`
-  stays a label, taken as given (#46).
+  on it. Rank 0's acceptance of each checkpoint and `finish` rescan the
+  files: other bytes, or an added or removed file, raise `InputChanged`,
+  release nothing and lapse the lease; a changed stat over the same bytes
+  (a chmod, a hardlink, a browser's attribute) is hashed again and passes.
+  Every rank and writer carries a fingerprint of the scan, not the file
+  list. A directory skips `.DS_Store`, `Thumbs.db`, `desktop.ini` and `._`
+  files, and refuses links out of it or to a directory, link loops, special
+  files and no files. Digests are cached per machine under
+  `VESTIGO_CACHE_DIR` (else the XDG cache), so a relaunch costs a `stat` per
+  file; a file whose mtime or ctime is under two seconds old is not cached,
+  and the first failed read stops the hashing. `Ledger.resume` takes
+  `inputs=`, which an execution with a `Path` input needs. A `str` stays a
+  label, taken as given (#46, #47).
+- `BuildStore.lapse_lease(build_id, lease_owner)` ends a lease for good from
+  any thread or process: it clears the owner, so a renewal that read the
+  clock first cannot revive it, as one could after a renewal to zero (#47).
 
 ### Changed
 

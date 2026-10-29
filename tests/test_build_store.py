@@ -575,6 +575,19 @@ class TestLeases:
         clock.now = build_store.get_build(live).lease_expires_at
         assert build_store.renew_lease(live, "runner-a", 60.0)
 
+    def test_a_lapsed_lease_is_not_renewed_by_a_renewal_that_read_the_clock_first(
+        self, build_store, clock
+    ):
+        build_id = self._building(build_store)
+        assert not build_store.lapse_lease(build_id, "runner-b")
+        assert build_store.lapse_lease(build_id, "runner-a")
+        # A renewal whose clock read came before the lapse.
+        clock.now -= 1
+        assert not build_store.renew_lease(build_id, "runner-a", 60.0)
+        clock.now += 2
+        assert [b.build_id for b in build_store.list_expired_leases()] == [build_id]
+        assert build_store.reclaim_expired_build(build_id, "runner-b")
+
     def test_a_live_lease_is_not_reclaimed(self, build_store, clock):
         build_id = self._building(build_store)
         assert not build_store.reclaim_expired_build(build_id, "runner-b")
