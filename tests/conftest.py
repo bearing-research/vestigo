@@ -94,6 +94,12 @@ def _no_ambient_cloud_credentials(monkeypatch: pytest.MonkeyPatch, _no_cloud_con
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
 
 
+@pytest.fixture(autouse=True)
+def _own_digest_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A run's input digests are cached per machine; a test keeps its own, not the home's."""
+    monkeypatch.setenv("VESTIGO_CACHE_DIR", str(tmp_path / "digest-cache"))
+
+
 @pytest.fixture(scope="session")
 def docker_daemon() -> None:
     """Skip what needs a container when the Docker daemon is unreachable; fail where required.

@@ -7,6 +7,9 @@ The first command stops after epoch 3; the second finds that run again by its
 computation (the program and its inputs), resumes it from epoch 3 and finishes it,
 deleting after each epoch every checkpoint but the newest one, the best and, until it
 finishes, the one it resumed from.
+The training data is a file the first run writes beside the ledger. It is a ``Path``
+input, so the key holds its digest: edit the file and the next run starts fresh, and
+edit it mid-run and the next save raises ``InputChanged``.
 The lowest-loss epoch is the reference ``regression/best``, which ``branch.py``
 fine-tunes from. Before finishing, the run records the model's exported forward pass;
 after, an evaluation of the last checkpoint is a release derived from it.
@@ -29,14 +32,18 @@ from torch import nn
 
 from vestigo.torch import Ledger
 
-INPUTS = {"train": "synthetic-regression@seed=1"}
 HEAD = "regression/best"
 
 
-def data() -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(1)
-    x = torch.randn(256, 4, generator=generator)
-    return x, x.sum(dim=1, keepdim=True) + 0.1 * torch.randn(256, 1, generator=generator)
+def data(ledger: Path) -> Path:
+    """The training set beside *ledger*, written on the first run."""
+    path = ledger.parent / "regression.pt"
+    if not path.exists():
+        generator = torch.Generator().manual_seed(1)
+        x = torch.randn(256, 4, generator=generator)
+        y = x.sum(dim=1, keepdim=True) + 0.1 * torch.randn(256, 1, generator=generator)
+        torch.save((x, y), path)
+    return path
 
 
 def main() -> None:
@@ -53,7 +60,8 @@ def main() -> None:
     model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
     shuffle = torch.Generator().manual_seed(2)
-    x, y = data()
+    path = data(args.ledger)
+    x, y = torch.load(path)
 
     with Ledger(args.ledger, signing_key=signing_key) as ledger:
         # Resumes this computation's unfinished execution, if there is one.
@@ -62,7 +70,7 @@ def main() -> None:
             optimizer,
             loss=nn.MSELoss(),
             version="regression-v1",
-            inputs=INPUTS,
+            inputs={"train": path},
             config={"batch": 32},
         ) as run:
             # The model and optimizer load in place; the rest are defaults for a fresh start.

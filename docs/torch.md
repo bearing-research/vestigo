@@ -36,9 +36,52 @@ Weights are not part of a model's identity: a retrained model keeps its node. So
 not hashed either; bump `version` when behaviour changes. Two programs that differ in
 loss, optimizer or config are two programs over one model.
 
-`inputs` maps a role to a concrete version, such as `{"train": "vestigo://artifact/ds@v=3"}`
-or a table at a snapshot. The program, inputs and starting release make the
-computation key, and that key is how a run is found again.
+`inputs` maps a role you choose to the data the run trains on. The program, inputs and
+starting release make the computation key, and that key is how a run is found again.
+
+## Inputs
+
+An input is a `Path` or a `str`:
+
+```python
+inputs = {
+    "train": Path("data/train.parquet"),  # a file: pinned to its bytes
+    "shards": Path("data/shards/"),  # a directory: pinned to every file in it
+    "eval": "s3://bucket/eval.parquet@version=3HL4kq",  # a label, taken as given
+}
+```
+
+**A `Path` is verified.** `ledger.run` hashes it (sha256 of a file; for a directory,
+over every file's name, size and digest), and the digest goes into the key, not the
+path. So:
+
+- the same bytes in another checkout or on another machine are the same computation,
+  and a resume there resumes;
+- data changed between a crash and the rerun is another computation, so the run
+  starts fresh instead of resuming a checkpoint on different data;
+- each `run.save` and `finish` first checks that every file is as it was hashed. Any
+  write, `touch`, `chmod`, added or removed file raises `InputChanged`, releases
+  nothing, and drops the lease. Put the bytes back and the same script resumes from
+  the last checkpoint taken before the change.
+
+This proves that every checkpoint was taken while exactly those bytes sat at those
+paths. It cannot prove the training code read them: read the paths you passed.
+
+A directory takes every file in it, hidden ones too, so pass a clean path. It refuses
+a link out of the tree or to a directory, a special file such as a pipe, and a
+directory with no files; a link to a file inside the tree counts as that file. A
+relaunch costs a `stat` per file, not a read: digests are cached per machine in
+`$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, else `~/.cache/vestigo`. A file
+written in the last two seconds is hashed again each time, since a write in the same
+timestamp tick could leave its stat unchanged.
+
+**A `str` is a label.** Nothing reads it. It must change whenever the data does, so
+pin a version: an object store's version id or ETag, a table snapshot, a dataset
+revision, a vestigo artifact URI with its `@v=`. A bare `s3://bucket/train.parquet`
+resumes a checkpoint on overwritten data without warning.
+
+The role names are yours. Renaming one changes the key, and the next run starts
+fresh.
 
 ## Train and checkpoint
 
@@ -51,7 +94,7 @@ with Ledger("ledger") as ledger:
         optimizer,
         loss=nn.MSELoss(),
         version="regression-v1",
-        inputs={"train": "synthetic-regression@seed=1"},
+        inputs={"train": Path("data/regression.pt")},
         config={"batch": 32},
     ) as run:
         state = run.restore({"model": model, "optim": optimizer, "epoch": 0})
@@ -80,7 +123,8 @@ preemption) keeps the execution resumable.
 
 For explicit control, `ledger.define_model` and `ledger.define_program` return the
 nodes. `ledger.find(program, inputs)`, `ledger.start(program, inputs)` and
-`ledger.resume(execution)` are the three steps `run` takes.
+`ledger.resume(execution, inputs=inputs)` are the three steps `run` takes. An execution
+with a `Path` input resumes only with its inputs, which must be its own.
 
 ## Resume after a crash
 

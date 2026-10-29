@@ -15,7 +15,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from train import HEAD, INPUTS, data
+from train import HEAD, data
 
 from vestigo.torch import Ledger
 
@@ -29,7 +29,8 @@ def main() -> None:
 
     model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    x, y = data()
+    path = data(args.ledger)
+    x, y = torch.load(path)
 
     with Ledger(args.ledger) as ledger:
         head = ledger.releases.reference(HEAD)
@@ -42,7 +43,7 @@ def main() -> None:
             optimizer,
             loss=nn.MSELoss(),
             version="regression-v1",
-            inputs=INPUTS,
+            inputs={"train": path},
             config={"batch": 32},
             from_release=source,
         ) as run:

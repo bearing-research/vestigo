@@ -71,6 +71,18 @@ All notable changes to vestigo are recorded here. The format follows
   promotion gate. It opens no execution and takes no lease; a save through
   it raises `PermissionError`; with a verify key every load checks the
   signature (#39).
+- Verified inputs: a `Path` in a torch run's `inputs` is pinned to its bytes
+  (a file's sha256, a directory's over its files' names, sizes and digests)
+  in the computation key, where it lives left out. Data changed after a
+  crash is another computation, so the run starts fresh instead of resuming
+  on it. Each `Run.save` and `finish`, and rank 0's acceptance of an
+  asynchronous save, rescans the files: any write, touch, or added or
+  removed file raises `InputChanged`, releases nothing and drops the lease.
+  A directory refuses links out of it or to a directory, special files and
+  no files. Digests are cached per machine under `VESTIGO_CACHE_DIR` (else
+  the XDG cache), so a relaunch costs a `stat` per file. `Ledger.resume`
+  takes `inputs=`, which an execution with a `Path` input needs. A `str`
+  stays a label, taken as given (#46).
 
 ### Changed
 

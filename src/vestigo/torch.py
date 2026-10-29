@@ -41,14 +41,16 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import stat
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
-from collections.abc import Generator, Iterator, Mapping
-from concurrent.futures import Future
-from contextlib import contextmanager
+from collections.abc import Generator, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -185,6 +187,186 @@ def _file_digest(path: Path) -> tuple[int, str]:
             hasher.update(chunk)
             size += len(chunk)
     return size, hasher.hexdigest()
+
+
+# --- Verified inputs ---
+
+
+class InputChanged(Exception):
+    """A verified input is not as its run resolved it: written, touched, or gone."""
+
+
+# A file is (where its bytes are, the stat that changes with any write to them).
+_Scanned = tuple[str, tuple[int, ...]]
+# A digest is cached only for a file whose mtime is older than this, since a write in
+# the same timestamp tick as the lookup could leave every stat field as it was.
+_RACY_NS = 2_000_000_000
+
+
+def _stat_key(st: os.stat_result) -> tuple[int, ...]:
+    # ctime too: nothing sets it back, so an edit that restores the mtime still shows.
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _reraise(exc: OSError) -> None:
+    raise exc
+
+
+def _scan(path: Path) -> list[tuple[str, _Scanned]]:
+    """Every file of the input at *path*, by its name under it ("" for a file).
+
+    The path named may be a link. Inside a directory a link may name a file of the
+    tree; any other link, or a file that is not a regular one, is refused.
+
+    Raises:
+        OSError: the input, or a file of it, cannot be read.
+        ValueError: a directory holds no file, a link it refuses, or a special file.
+    """
+    root = path.resolve(strict=True)
+    if not root.is_dir():
+        return [("", _regular(root))]
+    files = []
+    for top, dirs, names in os.walk(root, onerror=_reraise):
+        for name in dirs:
+            if os.path.islink(os.path.join(top, name)):
+                raise ValueError(f"{os.path.join(top, name)} links to a directory")
+        for name in names:
+            entry = Path(top, name)
+            real = entry.resolve(strict=True)
+            if not real.is_relative_to(root):
+                raise ValueError(f"{entry} links outside {root}")
+            files.append((entry.relative_to(root).as_posix(), _regular(real)))
+    if not files:
+        raise ValueError(f"{path} holds no file")
+    return sorted(files)
+
+
+def _regular(real: Path) -> _Scanned:
+    st = os.stat(real)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{real} is not a regular file")
+    return str(real), _stat_key(st)
+
+
+def _cache_path() -> Path:
+    if root := os.environ.get("VESTIGO_CACHE_DIR"):
+        return Path(root) / "digests.sqlite"
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "vestigo" / "digests.sqlite"
+
+
+def _hash(scanned: _Scanned) -> str:
+    real, key = scanned
+    _, digest = _file_digest(Path(real))
+    if _stat_key(os.stat(real)) != key:
+        raise InputChanged(f"{real} changed while it was hashed")
+    return digest
+
+
+def _cache(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache = sqlite3.connect(path, timeout=30)
+    cache.execute(
+        "CREATE TABLE IF NOT EXISTS digests "
+        "(path TEXT PRIMARY KEY, stat TEXT NOT NULL, sha256 TEXT NOT NULL)"
+    )
+    return cache
+
+
+def _digests(files: Sequence[_Scanned]) -> list[str]:
+    """Each file's sha256, read only where the machine's digest cache has none for its
+    stat: a relaunch on the same data costs a stat per file."""
+    path = _cache_path()
+    found: list[str | None] = []
+    try:
+        with closing(_cache(path)) as cache:
+            for real, key in files:
+                row = cache.execute(
+                    "SELECT sha256 FROM digests WHERE path = ? AND stat = ?", (real, str(key))
+                ).fetchone()
+                found.append(row[0] if row else None)
+    except (OSError, sqlite3.Error):
+        # A read-only home, sqlite on NFS: hash everything rather than fail the run.
+        logger.warning("No digest cache at %s; hashing every input", path, exc_info=True)
+        found = [None] * len(files)
+    missing = [i for i, digest in enumerate(found) if digest is None]
+    with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1)) as pool:
+        for i, digest in zip(missing, pool.map(_hash, [files[i] for i in missing]), strict=True):
+            found[i] = digest
+    settled = time.time_ns() - _RACY_NS
+    rows = [(files[i][0], str(files[i][1]), found[i]) for i in missing if files[i][1][3] < settled]
+    if rows:
+        try:
+            with closing(_cache(path)) as cache, cache:
+                cache.executemany("INSERT OR REPLACE INTO digests VALUES (?, ?, ?)", rows)
+        except (OSError, sqlite3.Error):
+            logger.warning("Could not cache input digests at %s", path, exc_info=True)
+    return cast(list[str], found)
+
+
+def _pin(files: list[tuple[str, _Scanned]]) -> dict[str, Any]:
+    """What the key holds of a verified input: its bytes' digest, not where they are."""
+    digests = _digests([scanned for _, scanned in files])
+    if files[0][0] == "":
+        return {"sha256": digests[0], "size": files[0][1][1][2]}
+    listing = [
+        [name, key[2], digest] for (name, (_, key)), digest in zip(files, digests, strict=True)
+    ]
+    return {"tree": hashlib.sha256(_canonical(listing)).hexdigest(), "files": len(listing)}
+
+
+@dataclass(frozen=True)
+class _Held:
+    """A verified input as its run resolved it: rescanned, it must be the same."""
+
+    role: str
+    path: str
+    files: tuple[tuple[str, _Scanned], ...]
+
+
+@dataclass(frozen=True)
+class _Inputs:
+    """A run's inputs: by role as the key hashes them (a label, or a path's pinned
+    bytes), and the verified ones as they were scanned."""
+
+    spec: dict[str, Any]
+    held: tuple[_Held, ...] = ()
+
+
+def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
+    """*inputs* with each ``Path`` pinned to its bytes; each ``str`` is a label.
+
+    Raises:
+        OSError: a path cannot be read.
+        ValueError: a directory holds no file, a link it refuses, or a special file.
+        TypeError: an input is neither.
+    """
+    spec: dict[str, Any] = {}
+    held = []
+    for role, value in (inputs or {}).items():
+        if isinstance(value, Path):
+            files = _scan(value)
+            spec[role] = _pin(files)
+            held.append(_Held(role, str(value.absolute()), tuple(files)))
+        elif isinstance(value, str):
+            spec[role] = value
+        else:
+            raise TypeError(f"input {role!r} is a str label or a Path, not {type(value)}")
+    return _Inputs(spec, tuple(held))
+
+
+def _hold(held: Sequence[_Held]) -> None:
+    """Raises InputChanged: a verified input is not as it was scanned."""
+    for each in held:
+        try:
+            now = _scan(Path(each.path))
+        except (OSError, ValueError) as exc:
+            raise InputChanged(f"input {each.role!r} at {each.path} cannot be read") from exc
+        if tuple(now) != each.files:
+            raise InputChanged(
+                f"input {each.role!r} at {each.path} was written or touched since the run "
+                "resolved it"
+            )
 
 
 def _stateful(value: object) -> bool:
@@ -467,18 +649,28 @@ class Ledger:
     # --- Executions ---
 
     def computation_key(
-        self, program: Definition, inputs: Mapping[str, str], init: str | None = None
+        self,
+        program: Definition,
+        inputs: Mapping[str, str | Path] | None = None,
+        init: str | None = None,
     ) -> str:
         """The bound computation: the program, its inputs by role, the release it starts from.
 
-        *inputs* name concrete versions (an artifact URI with its version, a table at a
-        snapshot); two runs of one program on two snapshots share the program's node
-        and differ here.
+        *inputs* name concrete versions. A ``Path`` is pinned to its bytes: a file's
+        sha256, or a directory's over its files' names and digests; where they are is
+        not part of it, so the same bytes on another machine are the same computation.
+        A ``str`` is a label taken as given (an artifact URI with its version, a table
+        at a snapshot): nothing checks it names what the run reads.
+
+        Raises:
+            OSError: a path cannot be read.
+            ValueError: a directory holds no file, a link out of it or to a directory,
+                or a special file.
         """
-        return compute_provenance_hash([], self._spec(program, inputs, init))
+        return compute_provenance_hash([], self._spec(program, _resolve(inputs).spec, init))
 
     @staticmethod
-    def _spec(program: Definition, inputs: Mapping[str, str], init: str | None) -> TransformSpec:
+    def _spec(program: Definition, inputs: Mapping[str, Any], init: str | None) -> TransformSpec:
         return TransformSpec(
             EXECUTOR,
             {"program": program.node_id, "inputs": dict(inputs), "init": init},
@@ -492,7 +684,7 @@ class Ledger:
         *,
         loss: Any,
         version: str,
-        inputs: Mapping[str, str] | None = None,
+        inputs: Mapping[str, str | Path] | None = None,
         config: Mapping[str, Any] | None = None,
         from_release: str | None = None,
         checkpointing: Any = None,
@@ -501,9 +693,15 @@ class Ledger:
 
         The computation is the program over *model* (:meth:`define_model` under
         *version*; :meth:`define_program` with *loss*, *optimizer* and *config*), its
-        *inputs*, and *from_release*, an accepted checkpoint of any run to branch from.
-        *checkpointing* is the ``CheckpointManager.Config`` the run saves and loads
-        with, synchronous saves when None.
+        *inputs* (see :meth:`computation_key`), and *from_release*, an accepted
+        checkpoint of any run to branch from. *checkpointing* is the
+        ``CheckpointManager.Config`` the run saves and loads with, synchronous saves
+        when None.
+
+        Each ``Path`` input is hashed once here (a digest cache on the machine spares
+        a relaunch the read) and must stay as it is: a save or finish after any write
+        to it raises :class:`InputChanged`. Data changed after a crash is another
+        computation, so the run starts fresh rather than resume on it.
 
         Raises:
             ValueError: the unfinished execution's lease is live under another attempt
@@ -516,28 +714,29 @@ class Ledger:
             optimizer=optimizer,
             config=config,
         )
-        execution = self.find(program, inputs, from_release)
+        resolved = _resolve(inputs)
+        execution = self._find(program, resolved, from_release)
         if execution is not None:
-            return self.resume(execution, checkpointing=checkpointing)
+            return self._resume(execution, None, resolved, checkpointing)
         if from_release is not None:
-            return self.branch(program, from_release, inputs, checkpointing=checkpointing)
-        return self.start(program, inputs, checkpointing=checkpointing)
+            return self._branch(program, from_release, resolved, checkpointing)
+        return self._open(program, resolved, None, checkpointing)
 
     def start(
         self,
         program: Definition,
-        inputs: Mapping[str, str] | None = None,
+        inputs: Mapping[str, str | Path] | None = None,
         *,
         checkpointing: Any = None,
     ) -> Run:
         """A new execution of *program* on *inputs*, in its first attempt."""
-        return self._open(program, dict(inputs or {}), None, checkpointing)
+        return self._open(program, _resolve(inputs), None, checkpointing)
 
     def branch(
         self,
         program: Definition,
         from_release: str,
-        inputs: Mapping[str, str] | None = None,
+        inputs: Mapping[str, str | Path] | None = None,
         *,
         checkpointing: Any = None,
     ) -> Run:
@@ -549,18 +748,23 @@ class Ledger:
         Raises:
             ValueError: *from_release* is not an accepted checkpoint, or was collected.
         """
+        return self._branch(program, from_release, _resolve(inputs), checkpointing)
+
+    def _branch(
+        self, program: Definition, from_release: str, inputs: _Inputs, checkpointing: Any
+    ) -> Run:
         self.checkpoint_id(from_release)
         source = self.releases.bundle(from_release)
         assert source is not None
         # A use now, so a collection with min_idle_seconds spares it until the load.
         for output in source.outputs:
             self.store.record_use(output.id, output.version)
-        return self._open(program, dict(inputs or {}), from_release, checkpointing)
+        return self._open(program, inputs, from_release, checkpointing)
 
     def _open(
-        self, program: Definition, inputs: dict[str, str], init: str | None, checkpointing: Any
+        self, program: Definition, inputs: _Inputs, init: str | None, checkpointing: Any
     ) -> Run:
-        spec = self._spec(program, inputs, init)
+        spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
         build_id = uuid.uuid4().hex
         # A build references a version, so a run whose outputs do not exist yet targets
@@ -591,32 +795,64 @@ class Ledger:
             lease_owner=attempt,
             lease_duration_seconds=self.lease_seconds,
         )
-        checkpoints = Checkpoints(self.config, build_id, attempt, key, program.spec)
+        checkpoints = Checkpoints(
+            self.config, build_id, attempt, key, program.spec, inputs=inputs.held
+        )
         return Run(self, checkpoints, init, checkpointing)
 
     def find(
-        self, program: Definition, inputs: Mapping[str, str] | None = None, init: str | None = None
+        self,
+        program: Definition,
+        inputs: Mapping[str, str | Path] | None = None,
+        init: str | None = None,
     ) -> str | None:
         """The newest unfinished execution of this computation, to resume; or None."""
-        build = self.builds.find_open_build(self.computation_key(program, inputs or {}, init))
+        return self._find(program, _resolve(inputs), init)
+
+    def _find(self, program: Definition, inputs: _Inputs, init: str | None) -> str | None:
+        key = compute_provenance_hash([], self._spec(program, inputs.spec, init))
+        build = self.builds.find_open_build(key)
         return build.build_id if build is not None else None
 
     def resume(
-        self, execution_id: str, from_release: str | None = None, *, checkpointing: Any = None
+        self,
+        execution_id: str,
+        from_release: str | None = None,
+        *,
+        inputs: Mapping[str, str | Path] | None = None,
+        checkpointing: Any = None,
     ) -> Run:
         """Continue *execution_id* in a new attempt, fencing every earlier one.
 
         *from_release* defaults to the execution's latest accepted checkpoint; with
-        none, the attempt starts from the execution's own initial state.
+        none, the attempt starts from the execution's own initial state. *inputs*, when
+        given, must be the execution's; an execution with a ``Path`` input needs them,
+        since the attempt holds those paths as the first resolved them.
 
         Raises:
             ValueError: the execution does not exist, is finished, another attempt's
-                lease on it is live, or *from_release* is not an accepted checkpoint of
-                it, or was collected.
+                lease on it is live, *inputs* are not its own or are missing, or
+                *from_release* is not an accepted checkpoint of it, or was collected.
         """
+        resolved = None if inputs is None else _resolve(inputs)
+        return self._resume(execution_id, from_release, resolved, checkpointing)
+
+    def _resume(
+        self,
+        execution_id: str,
+        from_release: str | None,
+        inputs: _Inputs | None,
+        checkpointing: Any,
+    ) -> Run:
         build = self.builds.get_build(execution_id)
         if build is None or build.computation_key is None:
             raise ValueError(f"execution {execution_id} does not exist")
+        params = build.params or {}
+        recorded = params.get("inputs", {})
+        if inputs is None and any(isinstance(value, dict) for value in recorded.values()):
+            raise ValueError(f"execution {execution_id} reads paths: resume it with its inputs")
+        if inputs is not None and inputs.spec != recorded:
+            raise ValueError(f"these are not the inputs of execution {execution_id}")
         if from_release is None:
             latest = self.releases.latest_accepted(execution_id)
             from_release = latest.release_id if latest is not None else None
@@ -631,10 +867,14 @@ class Ledger:
             lease_duration_seconds=self.lease_seconds,
             from_release=from_release,
         )
-        params = build.params or {}
         program = self._definition(params["program"])
         checkpoints = Checkpoints(
-            self.config, execution_id, attempt, build.computation_key, program.spec
+            self.config,
+            execution_id,
+            attempt,
+            build.computation_key,
+            program.spec,
+            inputs=inputs.held if inputs is not None else (),
         )
         return Run(self, checkpoints, from_release or params.get("init"), checkpointing)
 
@@ -1130,6 +1370,8 @@ class Ledger:
             if step == at.step and bundle.release.attempt == at.attempt:
                 # The writer retried a finalize whose acceptance had landed.
                 return bundle.release
+        # Here as well as in Run.save: an asynchronous write outlasts that check.
+        _hold(writer.inputs)
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -1219,6 +1461,8 @@ class Checkpoints:
     attempt: str
     computation_key: str
     program: NodeSpec
+    # The verified inputs, rescanned before each release on rank 0 (its own paths).
+    inputs: tuple[_Held, ...] = ()
 
     def checkpoint_id(self, step: int) -> str:
         """Where to save *step*: a name under this attempt, never reused."""
@@ -1567,7 +1811,10 @@ class Run:
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
+            InputChanged: a ``Path`` input was written or touched since the run
+                resolved it; the attempt gives up its lease.
         """
+        self._hold()
         pending = self.manager.save(self.checkpoints.checkpoint_id(step), _saved(state))
         if pending is not None:
             return pending
@@ -1639,9 +1886,12 @@ class Run:
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
+            InputChanged: a ``Path`` input was written or touched since the run
+                resolved it; the attempt gives up its lease.
         """
         if self._manager is not None:
             self._manager.close()
+        self._hold()
         ended_on = next(
             (
                 bundle.release.release_id
@@ -1656,6 +1906,19 @@ class Run:
             self.ledger.releases.accept(release.release_id, [], operations)
             self.finished = True
             self._stop.set()
+
+    def _hold(self) -> None:
+        try:
+            _hold(self.checkpoints.inputs)
+        except InputChanged:
+            # The data this attempt trained on is gone: a resume need not wait for it.
+            # Renewal stops first, so none lands after the drop.
+            with self._renewing:
+                self._stop.set()
+            self.ledger.builds.renew_lease(
+                self.execution_id, self.attempt, lease_duration_seconds=0.0
+            )
+            raise
 
     def close(self) -> None:
         """Wait for the save in flight and stop renewing. An unfinished execution with a
