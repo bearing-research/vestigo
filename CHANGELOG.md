@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-29
+
 ### Added
 
 - `vestigo.torch`, behind a new `torch` extra: PyTorch checkpoints as ledger
