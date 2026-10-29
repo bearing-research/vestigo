@@ -15,6 +15,7 @@ import logging
 import multiprocessing
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -42,12 +43,14 @@ from vestigo.store import ArtifactStore, BuildLeaseLost
 from vestigo.torch import (
     Checkpoints,
     Definition,
+    InputChanged,
     Ledger,
     LedgerStorage,
     RemoteBlobs,
     Run,
     _archive_metadata,
     _canonical,
+    _file_digest,
     report,
 )
 
@@ -154,13 +157,13 @@ def _outputs(ledger: Ledger, run: Run, step: int):
 # --- The run API ---
 
 
-def _run(ledger: Ledger, trainer: Trainer, **kwargs) -> Run:
+def _run(ledger: Ledger, trainer: Trainer, inputs: dict | None = None, **kwargs) -> Run:
     return ledger.run(
         trainer.model,
         trainer.optimizer,
         loss=nn.MSELoss(),
         version="tiny-v1",
-        inputs={"train": "data@v=1"},
+        inputs=inputs or {"train": "data@v=1"},
         config={"batch": 16},
         **kwargs,
     )
@@ -364,6 +367,253 @@ def test_runs_on_two_inputs_share_the_program_and_differ_in_computation(ledger: 
             )
     [output, *_] = _outputs(ledger, one, 1)
     assert ledger.store.definition_of(output.id, output.version) == trainer.program.node_id
+
+
+# --- Verified inputs ---
+
+
+def _settled(path: Path, content: bytes = b"rows") -> Path:
+    """*path* holding *content*, written long enough ago that its digest is cached."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    return path
+
+
+def _tree(root: Path) -> Path:
+    _settled(root / "a.bin", b"a")
+    _settled(root / "sub" / "b.bin", b"b")
+    return root
+
+
+def _key(ledger: Ledger, path: Path) -> str:
+    return ledger.computation_key(Trainer(ledger).program, {"train": path})
+
+
+def test_a_path_input_is_its_bytes_wherever_they_are(ledger: Ledger, tmp_path: Path):
+    data = _settled(tmp_path / "one" / "train.bin")
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, {"train": data, "seed": "seed=1"}) as run:
+        params = ledger.builds.get_build(run.execution_id).params
+        assert params["inputs"] == {
+            "train": {"sha256": hashlib.sha256(b"rows").hexdigest(), "size": 4},
+            "seed": "seed=1",
+        }
+
+    assert _key(ledger, _settled(tmp_path / "two" / "copy.bin")) == _key(ledger, data)
+    assert _key(ledger, _settled(tmp_path / "three" / "train.bin", b"rowz")) != _key(ledger, data)
+    with pytest.raises(TypeError):
+        ledger.computation_key(trainer.program, {"train": 3})
+
+
+def test_a_directory_input_is_its_files_names_and_bytes(ledger: Ledger, tmp_path: Path):
+    tree = _tree(tmp_path / "tree")
+    key = _key(ledger, tree)
+    assert _key(ledger, _tree(tmp_path / "elsewhere")) == key
+
+    # A link to a file of the tree is that file's bytes under the link's name.
+    linked = _tree(tmp_path / "linked")
+    (linked / "c.bin").symlink_to(linked / "a.bin")
+    copied = _tree(tmp_path / "copied")
+    _settled(copied / "c.bin", b"a")
+    assert _key(ledger, linked) == _key(ledger, copied) != key
+
+    changes = {
+        # Kept in sorted order, so only the name in the listing differs.
+        "renamed": lambda t: (t / "a.bin").rename(t / "aa.bin"),
+        "written": lambda t: _settled(t / "a.bin", b"A"),
+        "removed": lambda t: (t / "sub" / "b.bin").unlink(),
+        "hidden": lambda t: _settled(t / ".DS_Store", b""),
+    }
+    for name, change in changes.items():
+        changed = _tree(tmp_path / name)
+        change(changed)
+        assert _key(ledger, changed) != key, name
+
+
+def test_a_directory_refuses_what_it_cannot_pin(ledger: Ledger, tmp_path: Path):
+    outside = _settled(tmp_path / "outside.bin")
+    refused = {
+        "a link out of the tree": lambda t: (t / "out.bin").symlink_to(outside),
+        "a link to a directory": lambda t: (t / "dir").symlink_to(t / "sub"),
+        "a special file": lambda t: os.mkfifo(t / "pipe"),
+    }
+    for name, make in refused.items():
+        tree = _tree(tmp_path / name.replace(" ", "-"))
+        make(tree)
+        with pytest.raises(ValueError):
+            _key(ledger, tree)
+    (tmp_path / "empty" / "sub").mkdir(parents=True)
+    with pytest.raises(ValueError, match="holds no file"):
+        _key(ledger, tmp_path / "empty")
+    with pytest.raises(FileNotFoundError):
+        _key(ledger, tmp_path / "missing")
+
+
+def test_data_changed_after_a_crash_is_a_fresh_run_and_unchanged_resumes(
+    ledger: Ledger, tmp_path: Path
+):
+    data = _settled(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data}) as first:
+        trainer.train(first, 1)
+
+    with _run(ledger, Trainer(ledger), {"train": data}) as resumed:
+        assert resumed.execution_id == first.execution_id
+        assert resumed.restores_from == first.release_of(1).release_id
+
+    _settled(data, b"rowz")
+    with _run(ledger, Trainer(ledger), {"train": data}) as fresh:
+        assert fresh.execution_id != first.execution_id
+        assert fresh.restores_from is None
+
+
+@pytest.mark.parametrize("change", ["written", "touched", "added", "removed", "deleted"])
+def test_a_save_after_any_change_to_an_input_releases_nothing(
+    ledger: Ledger, tmp_path: Path, change: str
+):
+    tree = _tree(tmp_path / "tree")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": tree}) as run:
+        trainer.train(run, 1)
+        if change == "written":
+            (tree / "a.bin").write_bytes(b"A")
+        elif change == "touched":
+            # The same bytes: what was read cannot be told from what is there now.
+            (tree / "a.bin").chmod(0o600)
+        elif change == "added":
+            (tree / "sub" / "c.bin").write_bytes(b"c")
+        elif change == "removed":
+            (tree / "sub" / "b.bin").unlink()
+        else:
+            shutil.rmtree(tree)
+
+        with pytest.raises(InputChanged):
+            trainer.train(run, 2)
+        assert run.release_of(2) is None
+        # Refused before the write: nothing of step 2 was staged.
+        staged = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@")
+        assert not any("@step=2" in version.id for version in staged)
+
+
+def test_a_changed_input_drops_the_lease_so_a_resume_need_not_wait(ledger: Ledger, tmp_path: Path):
+    data = _settled(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    run = _run(ledger, trainer, {"train": data})
+    trainer.train(run, 1)
+    data.write_bytes(b"rowz")
+    with pytest.raises(InputChanged):
+        trainer.train(run, 2)
+
+    # The bytes put back are the same computation, taken over though `run` is open.
+    data.write_bytes(b"rows")
+    with _run(ledger, Trainer(ledger), {"train": data}) as resumed:
+        assert resumed.execution_id == run.execution_id
+        assert resumed.restores_from == run.release_of(1).release_id
+    run.close()
+
+
+def test_finish_after_a_change_to_an_input_does_not_finish(ledger: Ledger, tmp_path: Path):
+    data = _settled(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data}) as run:
+        trainer.train(run, 1)
+        data.chmod(0o600)
+        with pytest.raises(InputChanged):
+            run.finish()
+    assert ledger.builds.get_build(run.execution_id).state == "building"
+    assert ledger.final_checkpoint(run.execution_id) is None
+
+
+def test_the_writer_holds_the_inputs_as_well(ledger: Ledger, tmp_path: Path):
+    data = _settled(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data}) as run:
+        trainer.train(run, 1)
+        data.chmod(0o600)
+        # Past Run.save's check, as a write still in flight when the change lands.
+        manager = _manager(run.checkpoints)
+        try:
+            with pytest.raises(InputChanged):
+                manager.save(run.checkpoints.checkpoint_id(2), {"step": 2})
+        finally:
+            manager.close()
+        assert run.release_of(2) is None
+
+
+def test_resume_takes_the_execution_s_own_inputs_and_holds_them(ledger: Ledger, tmp_path: Path):
+    data = _settled(tmp_path / "train.bin")
+    other = _settled(tmp_path / "other.bin", b"rowz")
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, {"train": data}) as first:
+        trainer.train(first, 1)
+
+    with pytest.raises(ValueError, match="resume it with its inputs"):
+        ledger.resume(first.execution_id)
+    with pytest.raises(ValueError, match="not the inputs"):
+        ledger.resume(first.execution_id, inputs={"train": other})
+    resumed_trainer = Trainer(ledger)
+    with ledger.resume(first.execution_id, inputs={"train": data}) as resumed:
+        resumed_trainer.restore(resumed)
+        data.chmod(0o600)
+        with pytest.raises(InputChanged):
+            resumed_trainer.train(resumed, 2)
+
+
+def test_a_relaunch_reads_no_input_again_but_a_fresh_or_touched_one(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    reads: list[Path] = []
+
+    def counted(path: Path) -> tuple[int, str]:
+        reads.append(path)
+        return _file_digest(path)
+
+    monkeypatch.setattr("vestigo.torch._file_digest", counted)
+    settled = _settled(tmp_path / "settled.bin")
+    key = _key(ledger, settled)
+    assert _key(ledger, settled) == key
+    assert len(reads) == 1
+
+    settled.chmod(0o600)
+    assert _key(ledger, settled) == key
+    assert len(reads) == 2
+
+    # Written this instant: a write in the same tick could keep its stat, so no cache.
+    fresh = tmp_path / "fresh.bin"
+    fresh.write_bytes(b"rows")
+    _key(ledger, fresh)
+    _key(ledger, fresh)
+    assert len(reads) == 4
+
+
+def test_a_file_written_while_it_is_hashed_is_refused(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def raced(path: Path) -> tuple[int, str]:
+        read = _file_digest(path)
+        path.write_bytes(b"rowz")
+        return read
+
+    monkeypatch.setattr("vestigo.torch._file_digest", raced)
+    with pytest.raises(InputChanged, match="while it was hashed"):
+        _key(ledger, _settled(tmp_path / "train.bin"))
+
+
+def test_an_unusable_digest_cache_hashes_every_input(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    blocked = tmp_path / "a-file"
+    blocked.write_bytes(b"")
+    monkeypatch.setenv("VESTIGO_CACHE_DIR", str(blocked / "cache"))
+    data = _settled(tmp_path / "train.bin")
+    with caplog.at_level(logging.WARNING, logger="vestigo.torch"):
+        assert _key(ledger, data) == ledger.computation_key(
+            Trainer(ledger).program,
+            {"train": _settled(tmp_path / "again" / "train.bin")},
+        )
+    assert "No digest cache" in caplog.text
 
 
 # --- Checkpoints ---
