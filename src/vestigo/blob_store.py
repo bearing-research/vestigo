@@ -6,6 +6,7 @@ artifact store's database.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -38,7 +39,7 @@ the blob-store streams without extra copying.
 """
 
 
-OBJECT_STORE_OPERATIONS = ("put", "get", "head", "delete")
+OBJECT_STORE_OPERATIONS = ("put", "get", "head", "list", "delete")
 
 GCS_READ_CHUNK_BYTES = 8 * 1024 * 1024
 """What a GCS reader fetches per request; the SDK's default of 40 MiB is what a reader
@@ -571,6 +572,32 @@ class S3BlobStore(BlobStore):
             return None
         return int(head["ContentLength"])
 
+    def objects(self, path: str) -> list[tuple[str, int, str]]:
+        """Each object at *path* in the bucket, a key or a prefix ending in ``/``, as its
+        key, size and ETag (``etag:<value>``), which changes with its bytes; folder
+        markers left out. Not under :attr:`prefix`: any key of the bucket.
+
+        A backend error propagates.
+        """
+        if not path.endswith("/"):
+            try:
+                with _object_store_call("head", _s3_absent):
+                    head = self._client.head_object(Bucket=self.bucket, Key=path)
+            except FileNotFoundError:
+                return []
+            etag = head["ETag"].strip('"')
+            return [(path, int(head["ContentLength"]), f"etag:{etag}")]
+        found = []
+        with _object_store_call("list"):
+            for page in self._client.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=path
+            ):
+                for item in page.get("Contents", []):
+                    if not item["Key"].endswith("/"):
+                        etag = item["ETag"].strip('"')
+                        found.append((item["Key"], int(item["Size"]), f"etag:{etag}"))
+        return found
+
     def delete_blob(self, artifact_id: str, version: int) -> bool:
         """Delete blob from S3; False when it was not there, and a backend error propagates.
 
@@ -847,6 +874,32 @@ class GCSBlobStore(BlobStore):
         except FileNotFoundError:
             return None
         return int(blob.size) if blob.size is not None else None
+
+    def objects(self, path: str) -> list[tuple[str, int, str]]:
+        """Each object at *path* in the bucket, a name or a prefix ending in ``/``, as its
+        name, size and what names its bytes: its MD5 (``md5:<base64>``), else, for a
+        composite object, which has none, its generation (``generation:<n>``). Folder
+        markers left out. Not under :attr:`prefix`: any name of the bucket.
+
+        A backend error propagates.
+        """
+
+        def named(blob: Any) -> tuple[str, int, str]:
+            bytes_name = (
+                f"md5:{blob.md5_hash}" if blob.md5_hash else f"generation:{blob.generation}"
+            )
+            return blob.name, int(blob.size), bytes_name
+
+        if not path.endswith("/"):
+            with _object_store_call("head"):
+                blob = self._client.bucket(self.bucket).get_blob(path)
+            return [] if blob is None else [named(blob)]
+        with _object_store_call("list"):
+            return [
+                named(blob)
+                for blob in self._client.list_blobs(self.bucket, prefix=path)
+                if not blob.name.endswith("/")
+            ]
 
     def delete_blob(self, artifact_id: str, version: int) -> bool:
         """Delete blob from GCS; False when it was not there, and a backend error propagates."""
@@ -1142,6 +1195,37 @@ class AzureBlobStore(BlobStore):
             return None
         size = getattr(props, "size", None)
         return int(size) if size is not None else None
+
+    def objects(self, path: str) -> list[tuple[str, int, str]]:
+        """Each blob at *path* in the container, a name or a prefix ending in ``/``, as
+        its name, size and what names its bytes: its Content-MD5 (``md5:<base64>``) when
+        the uploader set one, else its ETag (``etag:<value>``), which a metadata write
+        changes too. Folder markers left out. Not under :attr:`prefix`: any name of the
+        container.
+
+        A backend error propagates.
+        """
+
+        def named(props: Any) -> tuple[str, int, str]:
+            md5 = props.content_settings.content_md5
+            if md5:
+                return props.name, int(props.size), f"md5:{base64.b64encode(bytes(md5)).decode()}"
+            etag = props.etag.strip('"')
+            return props.name, int(props.size), f"etag:{etag}"
+
+        if not path.endswith("/"):
+            try:
+                with _object_store_call("head", _azure_absent):
+                    props = self._client.get_blob_client(path).get_blob_properties()
+            except FileNotFoundError:
+                return []
+            return [named(props)]
+        with _object_store_call("list"):
+            return [
+                named(props)
+                for props in self._client.list_blobs(name_starts_with=path)
+                if not props.name.endswith("/")
+            ]
 
     def delete_blob(self, artifact_id: str, version: int) -> bool:
         """Delete blob from Azure Blob Storage."""

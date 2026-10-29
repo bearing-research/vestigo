@@ -662,6 +662,19 @@ class TestS3BlobStore:
 
         assert get_object_store_errors().snapshot()["head"] == before + 3
 
+    def test_objects_counts_a_failed_listing_and_takes_a_missing_key_as_none(self, s3_store):
+        def denied(**kwargs):
+            raise _client_error(403, "AccessDenied", "ListObjectsV2")
+
+        s3_store._client.list_objects_v2 = denied
+        before = get_object_store_errors().snapshot()
+        with pytest.raises(ClientError, match="AccessDenied"):
+            s3_store.objects("data/")
+        assert get_object_store_errors().snapshot()["list"] == before["list"] + 1
+
+        assert s3_store.objects("data/missing.bin") == []
+        assert get_object_store_errors().snapshot()["head"] == before["head"]
+
     def test_a_missing_bucket_on_read_is_an_error(self, s3_store):
         """A 404 is not always a missing object: a misnamed bucket must not read as empty."""
 
@@ -1061,8 +1074,8 @@ def _assert_a_mid_stream_failure_counts(store: BlobStore) -> None:
 
 
 def test_the_error_metric_names_only_operations_a_store_makes():
-    # No store lists, so a ``list`` series could never move.
-    assert set(get_object_store_errors().snapshot()) == {"put", "get", "head", "delete"}
+    # A remote store lists only for objects(), a verified input's check.
+    assert set(get_object_store_errors().snapshot()) == {"put", "get", "head", "list", "delete"}
 
 
 class TestAzureDownloadReader:

@@ -46,6 +46,7 @@ from vestigo.torch import (
     InputChanged,
     Ledger,
     LedgerStorage,
+    Remote,
     RemoteBlobs,
     Run,
     _archive_metadata,
@@ -791,6 +792,116 @@ def test_an_unusable_digest_cache_hashes_every_input(
             Trainer(ledger).program, {"train": _file(tmp_path / "again" / "train.bin")}
         )
     assert "No digest cache" in caplog.text
+
+
+def _bucket(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str]]:
+    """An object store in memory, by URI: each object's size and its bytes' name."""
+    objects: dict[str, tuple[int, str]] = {}
+
+    def listed(remote: Remote) -> list[tuple[str, int, str]]:
+        if remote.uri == "s3://down/":
+            raise ConnectionError("the endpoint is not answering")
+        bucket = remote.uri.split("/")[2]
+        found = []
+        for uri, (size, name) in objects.items():
+            key = uri.removeprefix(f"s3://{bucket}/")
+            if key != uri and (
+                uri == remote.uri or remote.uri.endswith("/") and uri.startswith(remote.uri)
+            ):
+                found.append((key, size, name))
+        return found
+
+    monkeypatch.setattr(Remote, "objects", listed)
+    return objects
+
+
+def test_a_remote_input_is_pinned_to_its_store_s_names_with_its_uri(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://lake/data/b.bin"] = (2, "etag:b")
+    objects["s3://lake/data/a.bin"] = (1, "etag:a")
+    objects["s3://copy/data/a.bin"] = (1, "etag:a")
+    objects["s3://copy/data/b.bin"] = (2, "etag:b")
+
+    def key(uri: str) -> str:
+        return ledger.computation_key(Trainer(ledger).program, {"train": Remote(uri)})
+
+    trainer = Trainer(ledger)
+    inputs = {"shards": Remote("s3://lake/data/"), "one": Remote("s3://lake/data/a.bin")}
+    with ledger.start(trainer.program, inputs) as run:
+        pinned = ledger.builds.get_build(run.execution_id).params["inputs"]
+    assert pinned["one"] == {"uri": "s3://lake/data/a.bin", "size": 1, "object": "etag:a"}
+    assert pinned["shards"]["uri"] == "s3://lake/data/" and pinned["shards"]["objects"] == 2
+
+    prefix = key("s3://lake/data/")
+    # The same objects under another bucket are another input: a URI names them anywhere.
+    assert key("s3://copy/data/") != prefix
+    objects["s3://lake/data/a.bin"] = (1, "etag:A")
+    assert key("s3://lake/data/") != prefix
+    objects["s3://lake/data/a.bin"] = (1, "etag:a")
+    assert key("s3://lake/data/") == prefix
+    objects["s3://lake/data/c.bin"] = (3, "etag:c")
+    assert key("s3://lake/data/") != prefix
+
+    with pytest.raises(ValueError, match="holds no object"):
+        key("s3://lake/missing/")
+    with pytest.raises(ValueError, match="holds no object"):
+        key("s3://lake/data/missing.bin")
+    for bad in ("file:///data", "s3://", "hdfs://lake/data"):
+        with pytest.raises(ValueError):
+            Remote(bad)
+    assert "secret" not in repr(Remote("s3://lake/", BlobSettings(s3_secret_key="secret")))
+
+
+def test_a_remote_input_with_other_objects_fails_the_save_and_lapses_the_lease(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://lake/data/a.bin"] = (1, "etag:a")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": Remote("s3://lake/data/")}) as run:
+        trainer.train(run, 1)
+        objects["s3://lake/data/a.bin"] = (1, "etag:A")
+        with pytest.raises(InputChanged, match="at s3://lake/data/ has other bytes"):
+            trainer.train(run, 2)
+        assert run.release_of(2) is None
+        assert ledger.builds.get_build(run.execution_id).lease_owner is None
+
+
+def test_a_store_that_does_not_answer_fails_that_step_only(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://down/a.bin"] = (1, "etag:a")
+    listed = Remote.objects
+    monkeypatch.setattr(Remote, "objects", lambda remote: [("a.bin", 1, "etag:a")])
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": Remote("s3://down/")}) as run:
+        trainer.train(run, 1)
+        monkeypatch.setattr(Remote, "objects", listed)
+        with pytest.raises(InputChanged, match="cannot be read.*not answering"):
+            trainer.train(run, 2)
+        assert ledger.builds.get_build(run.execution_id).lease_owner == run.attempt
+        monkeypatch.setattr(Remote, "objects", lambda remote: [("a.bin", 1, "etag:a")])
+        trainer.train(run, 3)
+        assert run.release_of(3) is not None
+
+
+def test_a_rank_names_its_own_copies_of_local_inputs_only(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://lake/eval.bin"] = (1, "etag:e")
+    data = _file(tmp_path / "rank0" / "train.bin")
+    copy = _file(tmp_path / "rank1" / "train.bin")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data, "eval": Remote("s3://lake/eval.bin")}) as run:
+        config = run.checkpoints.configure(
+            CheckpointManager.Config.with_sync_save(), inputs={"train": copy}
+        )
+        held = {each.role: each.path for each in config.storage_config.checkpoints.inputs}
+        assert held == {"train": str(copy.absolute()), "eval": "s3://lake/eval.bin"}
 
 
 # --- Checkpoints ---
@@ -2027,6 +2138,58 @@ def remote(request) -> RemoteBlobs:
     else:
         store._client.create_container()  # type: ignore[attr-defined]
     return blobs
+
+
+def _put(remote: RemoteBlobs, key: str, data: bytes) -> None:
+    client = remote.open()._client  # type: ignore[attr-defined]
+    if remote.backend == "s3":
+        client.put_object(Bucket=remote.bucket, Key=key, Body=data)
+    elif remote.backend == "gcs":
+        client.bucket(remote.bucket).blob(key).upload_from_string(data)
+    else:
+        client.upload_blob(key, data, overwrite=True)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_store_names_each_object_s_bytes(remote: RemoteBlobs):
+    scheme = {"s3": "s3", "gcs": "gs", "azure": "az"}[remote.backend]
+    _put(remote, "data/a.bin", b"a")
+    _put(remote, "data/sub/b.bin", b"bb")
+    _put(remote, "data/marker/", b"")
+    _put(remote, "other/c.bin", b"c")
+
+    def listed(path: str) -> dict[str, tuple[int, str]]:
+        found = Remote(f"{scheme}://{remote.bucket}/{path}", remote.settings).objects()
+        return {key: (size, name) for key, size, name in found}
+
+    under = listed("data/")
+    assert {key: size for key, (size, _) in under.items()} == {
+        "data/a.bin": 1,
+        "data/sub/b.bin": 2,
+    }
+    assert listed("data/a.bin") == {"data/a.bin": under["data/a.bin"]}
+    assert listed("data/none.bin") == {}
+    # The same bytes again keep their name; other bytes change it.
+    _put(remote, "data/a.bin", b"a")
+    assert listed("data/a.bin") == {"data/a.bin": under["data/a.bin"]}
+    _put(remote, "data/a.bin", b"A")
+    assert listed("data/a.bin")["data/a.bin"] != under["data/a.bin"]
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_run_holds_its_inputs_in_an_object_store(tmp_path: Path, remote: RemoteBlobs):
+    scheme = {"s3": "s3", "gcs": "gs", "azure": "az"}[remote.backend]
+    _put(remote, "data/a.bin", b"a")
+    with Ledger(tmp_path / "ledger") as ledger:
+        trainer = Trainer(ledger)
+        data = Remote(f"{scheme}://{remote.bucket}/data/", remote.settings)
+        with _run(ledger, trainer, {"train": data}) as run:
+            trainer.train(run, 1)
+            _put(remote, "data/a.bin", b"A")
+            with pytest.raises(InputChanged, match="has other bytes"):
+                trainer.train(run, 2)
 
 
 @pytest.mark.integration

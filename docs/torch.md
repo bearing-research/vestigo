@@ -41,13 +41,16 @@ starting release make the computation key, and that key is how a run is found ag
 
 ## Inputs
 
-An input is a `Path` or a `str`:
+An input is a `Path`, a `Remote` or a `str`:
 
 ```python
+from vestigo.torch import Remote
+
 inputs = {
     "train": Path("data/train.parquet"),  # a file: pinned to its bytes
     "shards": Path("data/shards/"),  # a directory: pinned to every file in it
-    "eval": "s3://bucket/eval.parquet@version=3HL4kq",  # a label, taken as given
+    "eval": Remote("s3://bucket/eval/"),  # objects: pinned to their store's names
+    "seed": "seed=1",  # a label, taken as given
 }
 ```
 
@@ -81,10 +84,30 @@ are cached per machine in `$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, 
 ctime is within the last two seconds is hashed again each time, since a write in the
 same timestamp tick could leave its stat unchanged.
 
+**A `Remote` is verified through its object store.** `Remote("s3://bucket/key")` names
+one object and `Remote("gs://bucket/prefix/")` (ending in `/`) every object under it;
+`az://container/...` is Azure. Nothing is downloaded: `ledger.run` lists the objects
+and pins each by what its store says names its bytes, and every check lists them again.
+
+| Store | Names the bytes | Same bytes uploaded again |
+| --- | --- | --- |
+| S3 | ETag | same name |
+| GCS | MD5; a composite object's generation | same name; a new generation |
+| Azure | Content-MD5 when the upload set one, else ETag | same name; a new ETag |
+
+The URI is part of the pin, unlike a local path: it names the same objects on every
+machine, and the same objects in another bucket are another input. Other names, or an
+object added or removed under a prefix, fail the next save as for a `Path`; a store
+that does not answer fails only that step. Credentials and endpoint come from
+`Remote(uri, settings=BlobSettings(...))`, as for the ledger's own `RemoteBlobs`, else
+the provider's defaults. Every rank lists the objects with them, and they travel to
+every rank inside `Checkpoints`. The store's names say the objects were not replaced;
+like a `Path`, they cannot say what the code read, so read the URI you passed.
+
 **A `str` is a label.** Nothing reads it. It must change whenever the data does, so
-pin a version: an object store's version id or ETag, a table snapshot, a dataset
-revision, a vestigo artifact URI with its `@v=`. A bare `s3://bucket/train.parquet`
-resumes a checkpoint on overwritten data without warning.
+pin a version: a table snapshot, a dataset revision, a vestigo artifact URI with its
+`@v=`. A bare `s3://bucket/train.parquet` as a `str` resumes a checkpoint on
+overwritten data without warning; pass it as a `Remote`.
 
 The role names are yours. Renaming one changes the key, and the next run starts
 fresh.

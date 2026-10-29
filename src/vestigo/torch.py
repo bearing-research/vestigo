@@ -348,14 +348,70 @@ def _pin(files: list[tuple[str, _Scanned]]) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class Remote:
+    """A verified input in an object store: ``s3://``, ``gs://`` or ``az://``, the bucket
+    (the container on Azure), then a key, or a prefix ending in ``/`` for every object
+    under it. *settings* are the credentials and endpoint, as for :class:`RemoteBlobs`;
+    every rank needs them, and they travel with :class:`Checkpoints`.
+
+    Nothing is downloaded. Each object is pinned by what its store says names its bytes:
+    S3's ETag; GCS's MD5, or a composite object's generation; Azure's Content-MD5 when
+    the uploader set one, else its ETag, which a metadata write changes too. The URI is
+    part of the pin: unlike a local path, it names the same objects everywhere.
+
+    Raises:
+        ValueError: the URI has another scheme, or no bucket.
+    """
+
+    uri: str
+    settings: BlobSettings = field(default_factory=BlobSettings, repr=False)
+
+    def __post_init__(self) -> None:
+        scheme, _, rest = self.uri.partition("://")
+        if scheme not in _REMOTE_STORES or not rest.partition("/")[0]:
+            raise ValueError(f"{self.uri!r} is not s3://, gs:// or az:// with a bucket")
+
+    def objects(self) -> list[tuple[str, int, str]]:
+        """Each object the URI names: its key, size and its bytes' name, from its store.
+
+        A backend error propagates.
+        """
+        scheme, _, rest = self.uri.partition("://")
+        bucket, _, path = rest.partition("/")
+        store = _REMOTE_STORES[scheme].from_settings(self.settings, bucket, "")
+        return store.objects(path)
+
+
+_REMOTE_STORES: dict[str, Any] = {"s3": S3BlobStore, "gs": GCSBlobStore, "az": AzureBlobStore}
+Input = str | Path | Remote
+
+
+def _pin_remote(remote: Remote, objects: list[tuple[str, int, str]]) -> dict[str, Any]:
+    if not objects:
+        raise ValueError(f"{remote.uri} holds no object")
+    if not remote.uri.endswith("/"):
+        [(_, size, name)] = objects
+        return {"uri": remote.uri, "size": size, "object": name}
+    under = len(remote.uri.partition("://")[2].partition("/")[2])
+    listing = sorted([key[under:], size, name] for key, size, name in objects)
+    return {
+        "uri": remote.uri,
+        "tree": hashlib.sha256(_canonical(listing)).hexdigest(),
+        "objects": len(listing),
+    }
+
+
+@dataclass(frozen=True)
 class _Held:
     """A verified input as its run resolved it: its scan's fingerprint (a few bytes to
-    every rank and writer, however many files) and the bytes it was pinned to."""
+    every rank and writer, however many files) and the bytes it was pinned to; for a
+    remote one, the object store's, listed again at each check."""
 
     role: str
     path: str
     scanned: str
     pinned: dict[str, Any]
+    remote: Remote | None = None
 
 
 @dataclass(frozen=True)
@@ -367,13 +423,15 @@ class _Inputs:
     held: tuple[_Held, ...] = ()
 
 
-def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
-    """*inputs* with each ``Path`` pinned to its bytes; each ``str`` is a label.
+def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
+    """*inputs* with each ``Path`` and :class:`Remote` pinned to its bytes; each ``str``
+    is a label.
 
     Raises:
         OSError: a path cannot be read.
-        ValueError: a directory holds no file, a link it refuses, or a special file.
-        TypeError: an input is neither.
+        ValueError: a directory holds no file, a link it refuses, or a special file; a
+            remote URI names no object.
+        TypeError: an input is none of them.
     """
     spec: dict[str, Any] = {}
     held = []
@@ -382,10 +440,13 @@ def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
             files = _scan(value)
             spec[role] = _pin(files)
             held.append(_Held(role, str(value.absolute()), _fingerprint(files), spec[role]))
+        elif isinstance(value, Remote):
+            spec[role] = _pin_remote(value, value.objects())
+            held.append(_Held(role, value.uri, "", spec[role], value))
         elif isinstance(value, str):
             spec[role] = value
         else:
-            raise TypeError(f"input {role!r} is a str label or a Path, not {type(value)}")
+            raise TypeError(f"input {role!r} is a str label, a Path or a Remote, not {type(value)}")
     return _Inputs(spec, tuple(held))
 
 
@@ -399,6 +460,15 @@ def _seen(held: Sequence[_Held], known: dict[str, str]) -> dict[str, Any]:
     """
     seen: dict[str, Any] = {}
     for each in held:
+        if each.remote is not None:
+            try:
+                pin = _pin_remote(each.remote, each.remote.objects())
+            except Exception as exc:
+                # Any SDK's error, an outage among them: unreadable, so this step only.
+                seen[each.role] = {"path": each.path, "unreadable": str(exc)}
+            else:
+                seen[each.role] = {"path": each.path, "pin": pin}
+            continue
         try:
             files = _scan(Path(each.path))
             scanned = _fingerprint(files)
@@ -696,7 +766,7 @@ class Ledger:
     def computation_key(
         self,
         program: Definition,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         init: str | None = None,
     ) -> str:
         """The bound computation: the program, its inputs by role, the release it starts from.
@@ -704,13 +774,14 @@ class Ledger:
         *inputs* name concrete versions. A ``Path`` is pinned to its bytes: a file's
         sha256, or a directory's over its files' names and digests; where they are is
         not part of it, so the same bytes on another machine are the same computation.
-        A ``str`` is a label taken as given (an artifact URI with its version, a table
-        at a snapshot): nothing checks it names what the run reads.
+        A :class:`Remote` is pinned to what its object store says names each object's
+        bytes, with its URI. A ``str`` is a label taken as given (an artifact URI with
+        its version, a table at a snapshot): nothing checks it names what the run reads.
 
         Raises:
             OSError: a path cannot be read.
             ValueError: a directory holds no file, a link out of it or to a directory,
-                or a special file.
+                or a special file; a remote URI names no object.
         """
         return compute_provenance_hash([], self._spec(program, _resolve(inputs).spec, init))
 
@@ -729,7 +800,7 @@ class Ledger:
         *,
         loss: Any,
         version: str,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         config: Mapping[str, Any] | None = None,
         from_release: str | None = None,
         checkpointing: Any = None,
@@ -743,10 +814,10 @@ class Ledger:
         ``CheckpointManager.Config`` the run saves and loads with, synchronous saves
         when None.
 
-        Each ``Path`` input is hashed once here (a digest cache on the machine spares
-        a relaunch the read), and its bytes must stay: a checkpoint or finish after
-        they change raises :class:`InputChanged`. Data changed after a crash is another
-        computation, so the run starts fresh rather than resume on it.
+        Each ``Path`` or :class:`Remote` input is pinned once here (a digest cache on
+        the machine spares a relaunch the read), and its bytes must stay: a checkpoint
+        or finish after they change raises :class:`InputChanged`. Data changed after a
+        crash is another computation, so the run starts fresh rather than resume on it.
 
         Raises:
             ValueError: the unfinished execution's lease is live under another attempt
@@ -770,7 +841,7 @@ class Ledger:
     def start(
         self,
         program: Definition,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         *,
         checkpointing: Any = None,
     ) -> Run:
@@ -781,7 +852,7 @@ class Ledger:
         self,
         program: Definition,
         from_release: str,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         *,
         checkpointing: Any = None,
     ) -> Run:
@@ -848,7 +919,7 @@ class Ledger:
     def find(
         self,
         program: Definition,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         init: str | None = None,
     ) -> str | None:
         """The newest unfinished execution of this computation, to resume; or None."""
@@ -864,7 +935,7 @@ class Ledger:
         execution_id: str,
         from_release: str | None = None,
         *,
-        inputs: Mapping[str, str | Path] | None = None,
+        inputs: Mapping[str, Input] | None = None,
         checkpointing: Any = None,
     ) -> Run:
         """Continue *execution_id* in a new attempt, fencing every earlier one.
@@ -1575,7 +1646,9 @@ class Checkpoints:
             if not isinstance(value, Path):
                 raise TypeError(f"input {role!r} is this rank's copy, a Path, not {type(value)}")
         resolved = _resolve(inputs)
-        pinned = {each.role: each.pinned for each in self.inputs}
+        # A remote input names the same objects on every rank: nothing to point at.
+        remote = tuple(each for each in self.inputs if each.remote is not None)
+        pinned = {each.role: each.pinned for each in self.inputs if each.remote is None}
         if resolved.spec.keys() != pinned.keys():
             raise ValueError(
                 f"the run's Path inputs are {sorted(pinned)}, not {sorted(resolved.spec)}"
@@ -1583,7 +1656,7 @@ class Checkpoints:
         for role, pin in resolved.spec.items():
             if pin != pinned[role]:
                 raise InputChanged(f"input {role!r} at {inputs[role]} has other bytes in this copy")
-        return replace(self, inputs=resolved.held)
+        return replace(self, inputs=remote + resolved.held)
 
     def __call__(self, args: Any) -> None:
         """``finalize_callback``: on rank 0, make the step a release."""
