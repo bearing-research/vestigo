@@ -310,6 +310,7 @@ with the same arguments.
 
 ```python
 dist.init_process_group("nccl")
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))  # as DistributedDataParallel needs
 ledger = Ledger("ledger")  # the same ledger on every rank
 with ledger.run(
     model,
@@ -333,20 +334,33 @@ after the barrier has seen every rank write. If a rank dies before writing, the 
 times out, and that step never becomes a release.
 
 Every rank first checks that it runs what rank 0 runs: the same model (class,
-`state_dict` shapes and `version`), loss, optimizer, `config`, `from_release` and input
-names. A rank with another config would train another computation under rank 0's
-key, so a difference raises `ValueError` on every rank, naming the rank and what
-differs, before anything is written.
+`state_dict` shapes and `version`), loss, optimizer, `config`, `from_release`, input
+names, save mode (synchronous or not) and barrier timeout, and verify key. A rank with
+another config would train another computation under rank 0's key, so a difference
+raises `ValueError` on every rank, naming the rank and what differs, before anything is
+written; a term that is not JSON on one rank raises `TypeError` on all. Then rank 0
+pins the inputs, every other rank checks its copies against the pins, and only then
+does rank 0 open the run. Each rank writes through its own `Ledger`, which must be
+rank 0's: a rank whose ledger does not hold the run raises on every rank, and rank 0
+closes it.
+
+These exchanges go over a gloo group of their own, so they need no GPU whatever the
+training backend.
 
 A synchronous `save` and `finish` are collective too. Every rank gets rank 0's outcome:
 `save` returns the step's release on every rank, and an error rank 0 hit accepting the
-step (another rank's copy changed, the lease was lost) is raised on every rank. An
-asynchronous `save` returns each rank's own write future. `close` is each rank's own;
-only rank 0's touches the lease.
+step (another rank's copy changed, the lease was lost, the barrier timed out) is raised
+on every rank. Rank 0 posts a save's outcome to the process group's store, waiting for
+no one; every other rank waits for it at most the barrier's timeout. So a rank that
+comes to the barrier after rank 0 gave up raises rank 0's error, and one that hears
+nothing raises rather than wait. If the other ranks gave up at the barrier and rank 0
+reached it late, the step is accepted (every rank's files are whole) though their saves
+raised. An asynchronous `save` returns each rank's own write future. `close` is each
+rank's own; only rank 0's touches the lease.
 
-A rank that raises between these calls leaves the others waiting at the next one until
-the process group's timeout. A launcher such as `torchrun` ends every rank when one
-fails.
+A rank that raises outside a save leaves the others waiting at the next `ledger.run` or
+`finish` until the process group's timeout. A launcher such as `torchrun` ends every
+rank when one fails.
 
 ### Inputs on several ranks
 
@@ -362,7 +376,7 @@ every copy has the bytes the run pinned. Otherwise every rank's save raises
 `InputChanged` naming the rank and path: other bytes lapse the lease, and a copy that
 cannot be read (say, a transient error on a shared mount) fails only that step. No rank
 raises before the barrier, so a bad copy never holds the others up. `finish` checks
-every rank's copy once more.
+every rank's copy once more, and rank 0 lists the `Remote` inputs once for all.
 
 Every rank walks its copy at every save, a `stat` per file, before the barrier: on a
 large tree, save less often rather than check less.

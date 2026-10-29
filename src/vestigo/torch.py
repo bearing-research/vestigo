@@ -53,6 +53,7 @@ from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, cast
@@ -61,6 +62,7 @@ from urllib.parse import quote
 try:
     import torch.distributed as dist
     import torch.export
+    from torch.distributed.distributed_c10d import _get_default_store
     from torch_checkpointing.checkpoint_manager import CheckpointManager
     from torch_checkpointing.config import SyncCheckpointSaverConfig
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
@@ -518,17 +520,6 @@ def _load(manager: Any, checkpoint_id: str, state: Mapping[str, Any]) -> dict[st
     return restored
 
 
-def _rank() -> tuple[int, int]:
-    """This process's rank and the world size: the process group's, else the launcher's.
-
-    Read when a rank configures its manager: an asynchronous writer's subprocess has
-    no process group, nor the environment when the group was given its rank directly.
-    """
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
-
-
 def _group() -> tuple[int, int]:
     """This process's rank and the world size in its process group; one rank without.
 
@@ -543,7 +534,7 @@ def _group() -> tuple[int, int]:
     return 0, 1
 
 
-def _portable(exc: Exception) -> Exception:
+def _portable(exc: BaseException) -> BaseException:
     """*exc* as another rank can raise it: itself if it pickles back, else its repr."""
     try:
         return pickle.loads(pickle.dumps(exc))
@@ -552,41 +543,117 @@ def _portable(exc: Exception) -> Exception:
         return RuntimeError(repr(exc))
 
 
-def _share(result: Any = None, error: Exception | None = None) -> Any:
-    """Rank 0's *result* or *error*, sent by rank 0 and returned or raised on the rest."""
-    box = [result, None if error is None else _portable(error)]
-    dist.broadcast_object_list(box, src=0)
-    if box[1] is not None and dist.get_rank():
-        raise box[1]
-    return box[0]
+class _Apart(RuntimeError):
+    """The ranks did not meet at one of vestigo's exchanges within its timeout."""
 
 
-def _from_rank_0(rank: int, world: int, work: Callable[[], Any]) -> Any:
-    """``work()`` run on rank 0; on every rank its result, or its error raised."""
-    if world == 1:
-        return work()
-    if rank:
-        return _share()
-    try:
-        result = work()
-    except Exception as exc:
-        _share(error=exc)
-        raise
-    return _share(result)
+def _term_digests(terms: Mapping[str, Any]) -> dict[str, str]:
+    """Raises TypeError: a term is not JSON (an optimizer default held as a tensor)."""
+    return {key: hashlib.sha256(_canonical(value)).hexdigest() for key, value in terms.items()}
 
 
-def _agree(world: int, terms: Mapping[str, Any]) -> None:
-    """Raises ValueError on every rank: a rank's *terms* are not rank 0's."""
-    digests = {key: hashlib.sha256(_canonical(value)).hexdigest() for key, value in terms.items()}
-    everyone: list[Any] = [None] * world
-    dist.all_gather_object(everyone, digests)
-    differ = [
-        f"rank {rank}'s {', '.join(k for k in digests if theirs[k] != everyone[0][k])}"
-        for rank, theirs in enumerate(everyone)
-        if theirs != everyone[0]
-    ]
-    if differ:
-        raise ValueError(f"every rank must run what rank 0 runs: {'; '.join(differ)} differ")
+@dataclass(frozen=True)
+class _Ranks:
+    """This process's place in its process group, and how vestigo's ranks exchange
+    what they must agree on.
+
+    *group* is a gloo group of every rank, for objects on the CPU whatever the
+    training backend; it opens and finishes a run, at the process group's timeout,
+    as rank 0 may hash a dataset meanwhile. A save's outcome goes through *store*,
+    the process group's own: rank 0 posts it whoever is listening, and a rank that
+    passed the barrier waits for it at most *barrier_seconds*. A gloo broadcast
+    would wait for a rank that died forever, and one that timed out can abort the
+    process when the late rank's bytes land.
+    """
+
+    rank: int = 0
+    world: int = 1
+    group: Any = None
+    store: Any = None
+    barrier_seconds: float = 0.0
+
+    @classmethod
+    def joined(cls, rank: int, world: int, barrier_seconds: float) -> _Ranks:
+        """Every rank's, together: each rank makes the group at the same point."""
+        store = dist.PrefixStore(f"{ROOT}/", _get_default_store())
+        return cls(rank, world, dist.new_group(backend="gloo"), store, barrier_seconds)
+
+    def share(self, result: Any = None, error: BaseException | None = None) -> Any:
+        """Rank 0's *result* or *error*, sent by rank 0; returned or raised on the rest."""
+        box = [result, None if error is None else _portable(error)]
+        dist.broadcast_object_list(box, src=0, group=self.group)
+        if box[1] is not None and self.rank:
+            raise box[1]
+        return box[0]
+
+    def post(self, key: str, result: Any = None, error: BaseException | None = None) -> None:
+        """Rank 0's outcome under *key*, for the ranks still waiting for it."""
+        outcome = (result, None if error is None else _portable(error))
+        self.store.set(key, pickle.dumps(outcome))
+
+    def posted(self, key: str, at: str) -> Any:
+        """Rank 0's outcome under *key*: returned, or its error raised.
+
+        Raises:
+            _Apart: rank 0 posted none within the barrier's timeout.
+        """
+        try:
+            self.store.wait([key], timedelta(seconds=self.barrier_seconds))
+        except RuntimeError as exc:
+            # The store's timeout, a DistStoreError.
+            raise _Apart(f"rank {self.rank} heard nothing from rank 0 {at}") from exc
+        result, error = pickle.loads(self.store.get(key))
+        if error is not None:
+            raise error
+        return result
+
+    def from_rank_0(self, work: Callable[[], Any]) -> Any:
+        """``work()`` run on rank 0; on every rank its result, or its error raised."""
+        if self.world == 1:
+            return work()
+        if self.rank:
+            return self.share()
+        try:
+            result = work()
+        except BaseException as exc:
+            # An interrupt too: the others are waiting for word of it.
+            self.share(error=exc)
+            raise
+        return self.share(result)
+
+    def raise_any(self, error: BaseException | None) -> None:
+        """Raises on every rank once any rank has an *error*: its own, else the first."""
+        if self.world == 1:
+            if error is not None:
+                raise error
+            return
+        errors: list[Any] = [None] * self.world
+        dist.all_gather_object(
+            errors, None if error is None else _portable(error), group=self.group
+        )
+        failed = next((each for each in errors if each is not None), None)
+        if failed is not None:
+            raise error or failed
+
+    def agree(self, terms: Callable[[], Mapping[str, Any]]) -> None:
+        """Raises on every rank: a rank's *terms* are not rank 0's (ValueError), or are
+        not JSON (TypeError)."""
+        digests: dict[str, str] = {}
+        error: TypeError | None = None
+        try:
+            digests = _term_digests(terms())
+        except TypeError as exc:
+            error = exc
+        self.raise_any(error)
+        everyone: list[Any] = [None] * self.world
+        dist.all_gather_object(everyone, digests, group=self.group)
+        differ = [
+            f"rank {rank}'s {', '.join(k for k in digests if theirs[k] != everyone[0][k])}"
+            for rank, theirs in enumerate(everyone)
+            if theirs != everyone[0]
+        ]
+        if differ:
+            raise ValueError(f"every rank must run what rank 0 runs: {'; '.join(differ)} differ")
 
 
 def _kinds(inputs: Mapping[str, Input] | None) -> dict[str, Any]:
@@ -826,7 +893,10 @@ class Ledger:
         changing it, and a comment would change it without changing behaviour, so the
         caller names the version.
         """
-        return self._put(NodeSpec(MODEL_DOMAIN, _canonical(_model_payload(model, version))))
+        return self._model(_model_payload(model, version))
+
+    def _model(self, payload: Mapping[str, Any]) -> Definition:
+        return self._put(NodeSpec(MODEL_DOMAIN, _canonical(payload)))
 
     def define_program(
         self,
@@ -846,7 +916,9 @@ class Ledger:
         Raises:
             TypeError: a value is not JSON (an optimizer default held as a tensor).
         """
-        payload = _program_payload(loss, optimizer, config)
+        return self._program(model, _program_payload(loss, optimizer, config))
+
+    def _program(self, model: Definition, payload: Mapping[str, Any]) -> Definition:
         return self._put(
             NodeSpec(PROGRAM_DOMAIN, _canonical(payload), edges=(Edge("impl", 0, model.node_id),))
         )
@@ -936,25 +1008,18 @@ class Ledger:
             InputChanged: a rank's copy of a ``Path`` input has other bytes.
             RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up.
         """
-        terms = {
-            "model": _model_payload(model, version),
-            "program": _program_payload(loss, optimizer, config),
-            "from_release": from_release,
-        }
+        model_payload = _model_payload(model, version)
+        program_payload = _program_payload(loss, optimizer, config)
+        terms = {"model": model_payload, "program": program_payload, "from_release": from_release}
 
-        def opened(resolved: _Inputs) -> Run:
-            program = self.define_program(
-                self.define_model(model, version=version),
-                loss=loss,
-                optimizer=optimizer,
-                config=config,
-            )
+        def opened(resolved: _Inputs, ranks: _Ranks) -> Run:
+            program = self._program(self._model(model_payload), program_payload)
             execution = self._find(program, resolved, from_release)
             if execution is not None:
-                return self._resume(execution, None, resolved, checkpointing)
+                return self._resume(execution, None, resolved, checkpointing, ranks)
             if from_release is not None:
-                return self._branch(program, from_release, resolved, checkpointing)
-            return self._open(program, resolved, None, checkpointing)
+                return self._branch(program, from_release, resolved, checkpointing, ranks)
+            return self._open(program, resolved, None, checkpointing, ranks)
 
         return self._collective(terms, inputs, opened, checkpointing)
 
@@ -962,43 +1027,70 @@ class Ledger:
         self,
         terms: dict[str, Any],
         inputs: Mapping[str, Input] | None,
-        opened: Callable[[_Inputs], Run],
+        opened: Callable[[_Inputs, _Ranks], Run],
         checkpointing: Any,
     ) -> Run:
         """The run *opened* makes, on every rank once all agree on *terms* and inputs.
 
-        Rank 0 opens it; every other rank gets its attempt and checks its own copies.
-        A failure on any rank raises on all, and rank 0 closes the run.
+        Every rank checks it runs what rank 0 runs. Rank 0 pins the inputs, every
+        other rank checks its own copies against the pins, and only then does rank 0
+        open the run; each other rank checks its own ledger holds it. A failure on any
+        rank raises on all, and once the run is open rank 0 closes it.
         """
+        saver = (checkpointing or CheckpointManager.Config.with_sync_save()).save
+        barrier = saver.writer_config.checkpoint_write_barrier_timeout_sec
+
+        def agreed() -> dict[str, Any]:
+            verify_key = self.config.verify_key
+            return {
+                **terms,
+                "inputs": _kinds(inputs),
+                # A save is collective only when synchronous, and meets at the barrier.
+                "saves": [isinstance(saver, SyncCheckpointSaverConfig), barrier],
+                "verify_key": verify_key.hex() if verify_key is not None else None,
+            }
+
         rank, world = _group()
         if world == 1:
-            return opened(_resolve(inputs))
-        _agree(world, {**terms, "inputs": _kinds(inputs)})
-        own: list[Run] = []
+            # Checked before the inputs are hashed: a bad term fails at once.
+            _term_digests(agreed())
+            return opened(_resolve(inputs), _Ranks())
+        ranks = _Ranks.joined(rank, world, barrier)
+        ranks.agree(agreed)
+        resolved = ranks.from_rank_0(lambda: _resolve(inputs))
+        copies = resolved.held
+        error: BaseException | None = None
+        if rank:
+            try:
+                copies = _copies(inputs or {}, resolved.held, rank)
+            except (OSError, ValueError, InputChanged) as exc:
+                error = exc
+        ranks.raise_any(error)
 
         def start() -> tuple[_Checkpoints, str | None]:
-            run = opened(_resolve(inputs))
+            run = opened(resolved, ranks)
             own.append(run)
             return run._checkpoints, run.restores_from
 
-        checkpoints, restores_from = _from_rank_0(rank, world, start)
-        error: Exception | None = None
-        copies = checkpoints.inputs
-        if rank:
-            try:
-                copies = _copies(inputs or {}, checkpoints.inputs, rank)
-            except (OSError, ValueError, InputChanged) as exc:
-                error = exc
-        errors: list[Any] = [None] * world
-        dist.all_gather_object(errors, None if error is None else _portable(error))
-        failed = next((each for each in errors if each is not None), None)
-        if failed is not None:
-            if own:
-                own[0].close()
-            raise error or failed
-        if own:
-            return own[0]
-        return Run(self, replace(checkpoints, inputs=copies), restores_from, checkpointing)
+        own: list[Run] = []
+        checkpoints, restores_from = ranks.from_rank_0(start)
+        if rank == 0:
+            run = own[0]
+        else:
+            # This rank writes through its own ledger, which must be rank 0's.
+            if self.builds.get_build(checkpoints.execution_id) is None:
+                error = ValueError(
+                    f"rank {rank}'s ledger does not hold execution {checkpoints.execution_id}:"
+                    " every rank must open rank 0's ledger"
+                )
+            writer = replace(checkpoints, ledger=self.config, inputs=copies)
+            run = Run(self, writer, restores_from, checkpointing, ranks)
+        try:
+            ranks.raise_any(error)
+        except BaseException:
+            run.close()
+            raise
+        return run
 
     def start(
         self,
@@ -1012,7 +1104,7 @@ class Ledger:
         return self._collective(
             {"program": program.node_id},
             inputs,
-            lambda resolved: self._open(program, resolved, None, checkpointing),
+            lambda resolved, ranks: self._open(program, resolved, None, checkpointing, ranks),
             checkpointing,
         )
 
@@ -1036,12 +1128,19 @@ class Ledger:
         return self._collective(
             {"program": program.node_id, "from_release": from_release},
             inputs,
-            lambda resolved: self._branch(program, from_release, resolved, checkpointing),
+            lambda resolved, ranks: self._branch(
+                program, from_release, resolved, checkpointing, ranks
+            ),
             checkpointing,
         )
 
     def _branch(
-        self, program: Definition, from_release: str, inputs: _Inputs, checkpointing: Any
+        self,
+        program: Definition,
+        from_release: str,
+        inputs: _Inputs,
+        checkpointing: Any,
+        ranks: _Ranks,
     ) -> Run:
         self.checkpoint_id(from_release)
         source = self.releases.bundle(from_release)
@@ -1049,10 +1148,15 @@ class Ledger:
         # A use now, so a collection with min_idle_seconds spares it until the load.
         for output in source.outputs:
             self.store.record_use(output.id, output.version)
-        return self._open(program, inputs, from_release, checkpointing)
+        return self._open(program, inputs, from_release, checkpointing, ranks)
 
     def _open(
-        self, program: Definition, inputs: _Inputs, init: str | None, checkpointing: Any
+        self,
+        program: Definition,
+        inputs: _Inputs,
+        init: str | None,
+        checkpointing: Any,
+        ranks: _Ranks,
     ) -> Run:
         spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
@@ -1088,7 +1192,7 @@ class Ledger:
         checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )
-        return Run(self, checkpoints, init, checkpointing)
+        return Run(self, checkpoints, init, checkpointing, ranks)
 
     def find(
         self,
@@ -1128,8 +1232,12 @@ class Ledger:
         return self._collective(
             {"execution": execution_id, "from_release": from_release, "given": inputs is not None},
             inputs,
-            lambda resolved: self._resume(
-                execution_id, from_release, None if inputs is None else resolved, checkpointing
+            lambda resolved, ranks: self._resume(
+                execution_id,
+                from_release,
+                None if inputs is None else resolved,
+                checkpointing,
+                ranks,
             ),
             checkpointing,
         )
@@ -1140,6 +1248,7 @@ class Ledger:
         from_release: str | None,
         inputs: _Inputs | None,
         checkpointing: Any,
+        ranks: _Ranks,
     ) -> Run:
         build = self.builds.get_build(execution_id)
         if build is None or build.computation_key is None:
@@ -1173,9 +1282,9 @@ class Ledger:
             program.spec,
             inputs=inputs.held if inputs is not None else (),
         )
-        return Run(self, checkpoints, from_release or params.get("init"), checkpointing)
+        return Run(self, checkpoints, from_release or params.get("init"), checkpointing, ranks)
 
-    # --- _Checkpoints ---
+    # --- Checkpoints ---
 
     def _accepted(self, execution_id: str) -> Iterator[tuple[int, ReleaseBundle]]:
         """The execution's accepted checkpoints with their steps, newest first."""
@@ -1796,14 +1905,14 @@ class _Checkpoints:
         """Where to save *step*: a name under this attempt, never reused."""
         return f"{ROOT}/{self.execution_id}/{self.attempt}/step-{step}"
 
-    def configure(self, config: Any) -> Any:
-        """Point a ``CheckpointManager.Config`` at the ledger; returns it.
+    def configure(self, config: Any, rank: int = 0, world: int = 1) -> Any:
+        """Point a ``CheckpointManager.Config`` at the ledger, as *rank* of *world*;
+        returns it.
 
         Sets its storage, both write callbacks and ``write_to_temp_dir=False`` (the
-        barrier stays: rank 0 accepts only after every rank has written). The rank and
-        world size are read here, once the process group is up.
+        barrier stays: rank 0 accepts only after every rank has written). The storage
+        carries the rank to an asynchronous writer's subprocess, which has no group.
         """
-        rank, world = _rank()
         config.storage_config = LedgerStorageConfig(self.ledger, self, rank, world)
         config.pre_finalize_callback = _report_written
         config.finalize_callback = self
@@ -2069,20 +2178,21 @@ class Run:
 
     In a process group, :meth:`finish` and a synchronous :meth:`save` are collective:
     every rank calls them, and rank 0's outcome (the release, or its error) is every
-    rank's. A rank that raises before one leaves the others waiting at it until the
-    group's timeout, unless the launcher (``torchrun``) ends them.
+    rank's. A rank that raises before one leaves the others waiting at it: at a save
+    until the barrier's timeout, at a finish until the process group's, unless the
+    launcher (``torchrun``) ends them first.
     """
 
     ledger: Ledger
     _checkpoints: _Checkpoints
     restores_from: str | None = None
     checkpointing: Any = None
+    _ranks: _Ranks = field(default_factory=_Ranks, repr=False)
     finished: bool = False
-    rank: int = field(init=False)
-    world: int = field(init=False)
     _manager: Any = field(default=None, repr=False)
-    # Set by rank 0's acceptance, which runs only once every rank has passed the barrier.
-    _accepting: bool = field(default=False, repr=False)
+    # Every rank's count of its synchronous saves, which names each one's outcome: a
+    # save of a step again after a failed one must not read that one's.
+    _saves: int = field(default=0, repr=False)
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renewal: threading.Thread | None = field(default=None, repr=False)
     # Held by a renewal and by finish's final release, so no renewal reads a finish
@@ -2090,12 +2200,19 @@ class Run:
     _renewing: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
-        self.rank, self.world = _group()
         if self.rank == 0:
             self._renewal = threading.Thread(
                 target=self._renew, name=f"lease:{self.execution_id}", daemon=True
             )
             self._renewal.start()
+
+    @property
+    def rank(self) -> int:
+        return self._ranks.rank
+
+    @property
+    def world(self) -> int:
+        return self._ranks.world
 
     @property
     def execution_id(self) -> str:
@@ -2143,15 +2260,7 @@ class Run:
         """The run's ``CheckpointManager``, built on first use; the run closes it."""
         if self._manager is None:
             # A copy: configure sets the storage and callbacks on it, which are this run's.
-            config = self._checkpoints.configure(copy.copy(self._config))
-            if self.rank == 0 and self._synchronous:
-                accept = config.finalize_callback
-
-                def finalize(args: Any) -> None:
-                    self._accepting = True
-                    accept(args)
-
-                config.finalize_callback = finalize
+            config = self._checkpoints.configure(copy.copy(self._config), self.rank, self.world)
             self._manager = config.build()
         return self._manager
 
@@ -2190,19 +2299,19 @@ class Run:
 
         if self.world == 1:
             return accepted()
+        self._saves += 1
+        key = f"{self.attempt}/save-{self._saves}"
         if self.rank:
             # Back from the barrier: rank 0 accepts, and says how it went.
             self.manager.save(checkpoint_id, _saved(state))
-            return _share()
-        self._accepting = False
+            return self._ranks.posted(key, f"after step {step}")
         try:
             release = accepted()
-        except Exception as exc:
-            # Short of the barrier a rank failed or died there, so none is listening.
-            if self._accepting:
-                _share(error=exc)
+        except BaseException as exc:
+            self._ranks.post(key, error=exc)
             raise
-        return _share(release)
+        self._ranks.post(key, release)
+        return release
 
     def restore(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """*state* as of ``restores_from``; as given when the attempt starts fresh.
@@ -2274,18 +2383,27 @@ class Run:
         """
         if self._manager is not None:
             self._manager.close()
-        seen = _seen(self._checkpoints.inputs, {})
+        # A remote input names the same objects on every rank: rank 0 lists them.
+        held = self._checkpoints.inputs if self.rank == 0 else self._local
+        seen = _seen(held, {})
         everyone: list[Any] = [seen]
         if self.world > 1:
-            everyone = [None] * self.world
-            dist.all_gather_object(everyone, seen)
-        _from_rank_0(self.rank, self.world, lambda: self._finish(everyone))
+            everyone = [None] * self.world if self.rank == 0 else []
+            dist.gather_object(
+                seen, everyone if self.rank == 0 else None, dst=0, group=self._ranks.group
+            )
+        self._ranks.from_rank_0(lambda: self._finish(everyone))
         self.finished = True
 
+    @property
+    def _local(self) -> tuple[_Held, ...]:
+        return tuple(each for each in self._checkpoints.inputs if each.remote is None)
+
     def _finish(self, everyone: Sequence[Mapping[str, Any]]) -> None:
+        local = replace(self._checkpoints, inputs=self._local)
         for rank, seen in enumerate(everyone):
             where = "now" if len(everyone) == 1 else f"now on rank {rank}"
-            self.ledger._hold(self._checkpoints, seen, where)
+            self.ledger._hold(self._checkpoints if rank == 0 else local, seen, where)
         ended_on = next(
             (
                 bundle.release.release_id

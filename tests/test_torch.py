@@ -709,6 +709,19 @@ def test_ranks_agree_on_labels_and_uris_but_not_where_their_copies_are(tmp_path:
     assert terms != _kinds({"label": "data@v=1", "eval": remote, "train": str(tmp_path)})
 
 
+def test_a_term_that_is_not_json_fails_before_any_input_is_read(ledger: Ledger, tmp_path: Path):
+    trainer = Trainer(ledger)
+    with pytest.raises(TypeError, match="JSON"):
+        ledger.run(
+            trainer.model,
+            trainer.optimizer,
+            loss=nn.MSELoss(),
+            version="tiny-v1",
+            inputs={"train": tmp_path / "missing"},
+            config={"seed": torch.tensor(1)},
+        )
+
+
 def test_a_launcher_s_ranks_need_their_process_group(
     ledger: Ledger, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1004,18 +1017,12 @@ def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
             storage.getsize(Path(run._checkpoints.checkpoint_id(1)) / "model_0.pt")
 
 
-def test_only_rank_zero_accepts_by_the_rank_it_configured_with(
-    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
-):
+def test_only_rank_zero_accepts_by_the_rank_it_configured_with(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
-        monkeypatch.setenv("RANK", "1")
-        monkeypatch.setenv("WORLD_SIZE", "2")
-        config = run._checkpoints.configure(CheckpointManager.Config())
-        # An async writer's subprocess may see neither a process group nor the variables.
-        monkeypatch.delenv("RANK")
-        monkeypatch.delenv("WORLD_SIZE")
-        storage = config.storage_config.create_storage()
+        config = run._checkpoints.configure(CheckpointManager.Config(), 1, 2)
+        # An async writer's subprocess has no process group: the storage carries the rank.
+        storage = pickle.loads(pickle.dumps(config.storage_config)).create_storage()
 
         config.finalize_callback(
             SimpleNamespace(path=run._checkpoints.checkpoint_id(1), storage=storage)
@@ -2240,16 +2247,20 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     """One rank of a two-rank run, every rank calling ``Ledger.run``; writes what it saw.
 
     Cases: ``sync`` and ``async`` save and finish; in ``die`` rank 1 dies before
-    writing step 2; ``copies`` and ``drift`` give each rank its own copy of a ``Path``
-    input, which in ``drift`` rank 1 rewrites before step 2 and in ``late`` before it
-    finishes; ``mismatch`` gives rank 1
-    another config, and ``badcopy`` rank 1 a copy with other bytes.
+    writing step 2, and in ``slow`` comes to its barrier after rank 0 gave up; in
+    ``mute`` rank 0 never says how a save went;
+    ``copies`` and ``drift`` give each rank its own copy of a ``Path`` input, which in
+    ``drift`` rank 1 rewrites before step 2 and in ``late`` before it finishes; in
+    ``retry`` rank 1's copy cannot be read for one save of step 2, saved again. Rank 1
+    has another config in ``mismatch``, one that is not JSON in ``nonjson``, async
+    saves in ``modes``, another signing key in ``otherkey``, another ledger in
+    ``otherledger``, and a copy with other bytes in ``badcopy``.
 
     Asynchronous, the group gets its rank directly and the environment names none, so
     the writer's subprocess has only what each rank configured.
     """
-    asynchronous = case == "async"
-    if asynchronous:
+    asynchronous = case == "async" or (case == "modes" and rank == 1)
+    if case == "async":
         os.environ.pop("RANK", None)
         os.environ.pop("WORLD_SIZE", None)
     else:
@@ -2257,7 +2268,12 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     dist.init_process_group(
         "gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=world
     )
-    ledger = Ledger(Path(root) / "ledger", signing_key=signing_key)
+    if rank == 0 and case == "mute":
+        vestigo.torch._Ranks.post = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    if rank == 1 and case == "otherkey":
+        signing_key = Ed25519PrivateKey.generate().private_bytes_raw()
+    elsewhere = rank == 1 and case == "otherledger"
+    ledger = Ledger(Path(root) / ("elsewhere" if elsewhere else "ledger"), signing_key=signing_key)
     model = _model()
     copy = Path(root, f"rank{rank}", "train.bin")
     if case == "badcopy" and rank == 1:
@@ -2267,7 +2283,14 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         if asynchronous
         else CheckpointManager.Config.with_sync_save()
     )
-    checkpointing.save.writer_config.checkpoint_write_barrier_timeout_sec = 5
+    checkpointing.save.writer_config.checkpoint_write_barrier_timeout_sec = (
+        2 if case in ("slow", "mute") else 5
+    )
+    config: dict[str, object] = {"batch": 16}
+    if rank == 1 and case == "mismatch":
+        config["batch"] = 32
+    if rank == 1 and case == "nonjson":
+        config["seed"] = torch.tensor(1)
     saved: list[int] = []
     returned: list[str] = []
     outcome: dict[str, object] = {"saved": saved, "returned": returned}
@@ -2277,8 +2300,10 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
             torch.optim.AdamW(model.parameters()),
             loss=nn.MSELoss(),
             version="tiny-v1",
-            inputs={"train": copy} if case in ("copies", "drift", "late", "badcopy") else None,
-            config={"batch": 32 if case == "mismatch" and rank == 1 else 16},
+            inputs={"train": copy}
+            if case in ("copies", "drift", "late", "retry", "badcopy")
+            else None,
+            config=config,
             checkpointing=checkpointing,
         )
     except Exception as exc:
@@ -2286,9 +2311,15 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         run = None
     if run is not None:
         outcome["execution"] = run.execution_id
-        for step in (1, 2):
+        retried = False
+        for index, step in enumerate((1, 2, 2) if case == "retry" else (1, 2)):
+            if rank == 1 and case == "retry" and index:
+                # Unreadable for the first save of step 2, then readable again.
+                copy.chmod(0 if index == 1 else 0o644)
             if rank == 1 and step == 2 and case == "die":
                 os._exit(3)  # dies before writing: rank 0 never passes the barrier
+            if rank == 1 and step == 2 and case == "slow":
+                time.sleep(5)  # past rank 0's barrier timeout and its word of it
             if rank == 1 and step == 2 and case == "drift":
                 copy.write_bytes(b"rowz")
             try:
@@ -2302,6 +2333,9 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
                 saved.append(step)
             except Exception as exc:
                 outcome.update(error=type(exc).__name__, message=str(exc))
+                if case == "retry" and not retried:
+                    retried = True
+                    continue
                 break
         else:
             if rank == 1 and case == "late":
@@ -2401,6 +2435,34 @@ def test_every_rank_runs_one_run_whose_releases_rank_zero_makes(tmp_path: Path, 
             public.verify(bytes.fromhex(content.pop("signature")), _canonical(content))
 
 
+def test_a_rank_that_comes_to_the_barrier_late_hears_why_rank_0_gave_up(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "slow")
+
+    # Rank 0 gave up at the barrier; rank 1 passed it later, and raises rank 0's error.
+    assert exits == [0, 0]
+    zero, one = outcomes
+    assert zero is not None and one is not None
+    assert len(zero["saved"]) == 1 and len(one["saved"]) == 1
+    assert one["message"] == zero["message"] or zero["message"] in one["message"]
+    with Ledger(tmp_path / "ledger") as ledger:
+        assert ledger.release_of(zero["execution"], 2) is None
+
+
+def test_a_rank_that_hears_nothing_from_rank_0_stops_at_the_barrier_s_timeout(
+    tmp_path: Path,
+):
+    exits, outcomes, _ = _two_ranks(tmp_path, "mute")
+
+    assert exits == [0, 0]
+    zero, one = outcomes
+    assert zero is not None and one is not None
+    # Rank 0 accepted step 1, which rank 1 never heard of, and so met no one at step 2.
+    assert len(zero["saved"]) == 1 and "error" in zero
+    assert one["saved"] == [] and "heard nothing from rank 0 after step 1" in one["message"]
+    with Ledger(tmp_path / "ledger") as ledger:
+        assert ledger.release_of(zero["execution"], 1) is not None
+
+
 def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
     exits, outcomes, _ = _two_ranks(tmp_path, "die")
 
@@ -2415,7 +2477,7 @@ def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
         assert release.sequence == 1
 
 
-@pytest.mark.parametrize("case", ["copies", "drift", "late"])
+@pytest.mark.parametrize("case", ["copies", "drift", "late", "retry"])
 def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, case: str):
     exits, outcomes, _ = _two_ranks(tmp_path, case)
 
@@ -2441,6 +2503,12 @@ def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path,
                 assert inputs_found == {
                     "train": {"path": str(tmp_path / f"rank{rank}" / "train.bin"), "pin": pinned}
                 }
+        elif case == "retry":
+            # The failed save of step 2 raised on both ranks; saved again, it landed.
+            for each in (zero, one):
+                assert "cannot be read on rank 1" in each["message"]
+                assert each["saved"] == [1, 2] and each["returned"] == zero["released"]
+            assert ledger.builds.get_build(execution).state == "ready"
         elif case == "drift":
             # Rank 0's acceptance failed, and both ranks raised it.
             for each in (zero, one):
@@ -2460,7 +2528,11 @@ def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path,
     ("case", "error", "message"),
     [
         ("mismatch", "ValueError", "rank 1's program differ"),
+        ("nonjson", "TypeError", "JSON"),
+        ("modes", "ValueError", "rank 1's saves differ"),
+        ("otherkey", "ValueError", "rank 1's verify_key differ"),
         ("badcopy", "InputChanged", "has other bytes on rank 1"),
+        ("otherledger", "ValueError", "rank 1's ledger does not hold execution"),
     ],
 )
 def test_a_rank_that_runs_something_else_stops_every_rank(
@@ -2473,7 +2545,7 @@ def test_a_rank_that_runs_something_else_stops_every_rank(
         assert each is not None and each["error"] == error and message in each["message"]
     with Ledger(tmp_path / "ledger") as ledger:
         builds = _builds(ledger)
-        if case == "mismatch":
+        if case != "otherledger":
             # Refused before rank 0 opened anything.
             assert builds == []
         else:
