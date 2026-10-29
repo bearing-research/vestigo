@@ -764,6 +764,28 @@ class BuildStore:
         finally:
             conn.close()
 
+    def lapse_lease(self, build_id: str, lease_owner: str) -> bool:
+        """End ``lease_owner``'s lease now, for good, from any thread or process.
+
+        Unlike a renewal to zero seconds, a renewal that read the clock first cannot
+        revive it: the lease has no owner left to renew. Returns False unless
+        ``lease_owner`` holds it and the build is building.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE artifact_builds
+                SET lease_owner = NULL, lease_expires_at = ?
+                WHERE build_id = ? AND state = 'building' AND lease_owner = ?
+                """,
+                (self._clock(), build_id, lease_owner),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def reclaim_expired_build(
         self,
         build_id: str,
