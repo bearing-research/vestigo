@@ -226,7 +226,10 @@ ledger.descendants(run.execution_id)  # its branches, and theirs, at any depth
 
 `inputs` hold each role's pin as the computation key hashes it: a `str` as given, a
 `Path` or `Remote` as the digests or object names it was pinned to. `reading` is pinned
-the same way, so a copy of the data on another machine finds the same executions. Each
+the same way, so a copy of the data on another machine finds the same executions.
+Attempts come in the order they opened; one with no `resumed_from` started from the
+execution's `init`. Checkpoints come in the order they were accepted, so a step saved
+again after a resume from an earlier checkpoint is listed twice. Each
 branch names the checkpoint it started from in `init`, and still descends from its run
 after `collect` has taken that checkpoint. Lists are oldest first. A derived release is
 not an execution; `ledger.derived(release_id, name)` finds it.

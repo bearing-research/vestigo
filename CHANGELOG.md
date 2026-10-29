@@ -119,6 +119,12 @@ All notable changes to vestigo are recorded here. The format follows
   branches at any depth, still linked after their checkpoint is collected.
   `BuildStore.builds_of(executor_ref)`, `attempts_of(build_id)` and
   `attempts_resumed_from(release_id)` read the rows they join (#52).
+  Attempts are ordered by when they opened, a new `build_attempts.opened_at`
+  (double precision on Postgres; older rows sort first), not by their write
+  window; `executions(model)` reads one hop of the graph, so no sweep size
+  reaches the traversal cap; indexes on `artifact_builds(executor_ref,
+  created_at)` and `build_attempts(resumed_from)` reach existing databases;
+  `branch.py` prints its lineage (#53).
 - `BuildStore.lapse_lease(build_id, lease_owner)` ends a lease for good from
   any thread or process: it clears the owner, so a renewal that read the
   clock first cannot revive it, as one could after a renewal to zero (#47).

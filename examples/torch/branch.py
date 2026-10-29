@@ -5,7 +5,8 @@
 
 A branch starts from any accepted checkpoint. Its computation names that release, so it
 never deduplicates against the run it came from; its program (the same model under a
-lower learning rate) is a different node over the same model node.
+lower learning rate) is a different node over the same model node. At the end it prints
+the branches of the run it came from, and how many executions read the training data.
 """
 
 from __future__ import annotations
@@ -60,6 +61,13 @@ def main() -> None:
                     loss = nn.functional.mse_loss(model(x), y).item()
                 print(f"epoch {epoch}: loss {loss:.4f}")
             run.finish()
+
+        # The lineage, from what the ledger recorded of each run.
+        parent = ledger.releases.get(source)
+        assert parent is not None
+        for execution in ledger.descendants(parent.build_id):
+            print(f"{execution.execution_id} branched from {parent.build_id} at {execution.init}")
+        print(f"executions reading the data: {len(ledger.executions(reading=path))}")
 
 
 if __name__ == "__main__":

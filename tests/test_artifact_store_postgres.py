@@ -1012,6 +1012,60 @@ class TestBuildStoreSharesTheBackend:
         finally:
             dialect.close()
 
+    def test_attempts_opened_at_and_the_lineage_indexes_reach_an_older_database(
+        self, postgres_dsn, tmp_path
+    ):
+        indexes = {"idx_build_executor", "idx_attempt_resumed_from"}
+
+        def present(conn) -> set[str]:
+            rows = conn.execute("SELECT indexname FROM pg_indexes").fetchall()
+            return {row["indexname"] for row in rows} & indexes
+
+        dialect = PostgresDialect(postgres_dsn)
+        try:
+            conn = dialect.connect()
+            _drop_ledger(conn)
+            conn.commit()
+            conn.close()
+
+            artifacts = ArtifactStore(tmp_path / "a", dialect=dialect)
+            builds = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+            version = artifacts.create_artifact("art", "prov-art", _spec())
+            builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+
+            conn = dialect.connect()
+            assert present(conn) == indexes
+            for index in indexes:
+                conn.execute(f"DROP INDEX {index}")
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN opened_at")
+            conn.commit()
+            conn.close()
+            reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+
+            before = time.time()
+            assert reopened.open_attempt("b", "a1", writable_until=1e12)
+            # To the second: a single-precision column would round it by a minute.
+            assert before <= reopened.get_attempt("b", "a1").opened_at <= time.time()
+            conn = dialect.connect()
+            [column] = conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'build_attempts' AND column_name = 'opened_at'"
+            ).fetchall()
+            conn.close()
+            assert column["data_type"] == "double precision"
+            # A row from before the column comes first, though Postgres sorts NULL last.
+            reopened.record_attempt("b", "art", version, "a0", writable_until=1e12)
+            conn = dialect.connect()
+            conn.execute("UPDATE build_attempts SET opened_at = NULL WHERE attempt = 'a0'")
+            conn.commit()
+            conn.close()
+            assert [a.attempt for a in reopened.attempts_of("b")] == ["a0", "a1"]
+            conn = dialect.connect()
+            assert present(conn) == indexes
+            conn.close()
+        finally:
+            dialect.close()
+
     def test_a_fail_fenced_on_a_claim_needs_that_exact_claim(self, postgres_dsn, tmp_path):
         """The deadline read back from the row matches the one the fence sends."""
         dialect = PostgresDialect(postgres_dsn)

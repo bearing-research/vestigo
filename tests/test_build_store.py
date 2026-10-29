@@ -59,6 +59,14 @@ def seed_build_targets(
         store.close()
 
 
+LINEAGE_INDEXES = {"idx_build_executor", "idx_attempt_resumed_from"}
+
+
+def _indexes(conn) -> set[str]:
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
+    return {row["name"] for row in rows}
+
+
 @pytest.fixture
 def clock():
     """The store's clock, advanced by the tests instead of waited for."""
@@ -884,17 +892,47 @@ class TestAttempts:
         build_id, other = self._pending(build_store), self._pending(build_store)
         assert build_store.open_attempt(build_id, "b1", writable_until=clock() + 100)
         clock.now += 61
+        # A shorter window than the attempt before it, as under another writable_seconds.
         assert build_store.open_attempt(
-            build_id, "a2", writable_until=clock() + 100, resumed_from="r1"
+            build_id, "a2", writable_until=clock() + 10, resumed_from="r1"
         )
-        assert build_store.open_attempt(other, "c1", writable_until=clock() + 50, resumed_from="r1")
+        clock.now += 1
+        assert build_store.open_attempt(other, "c1", writable_until=clock() + 5, resumed_from="r1")
+        # Re-recorded with a later window, an attempt keeps when it opened.
+        build_store.record_attempt(build_id, "art-123", 1, "b1", writable_until=clock() + 999)
 
         assert [a.attempt for a in build_store.attempts_of(build_id)] == ["b1", "a2"]
         assert [(a.build_id, a.attempt) for a in build_store.attempts_resumed_from("r1")] == [
-            (other, "c1"),
             (build_id, "a2"),
+            (other, "c1"),
         ]
         assert build_store.attempts_resumed_from("r2") == []
+
+        # A row from before opened_at was recorded comes before every row that has it.
+        with closing(build_store._get_connection()) as conn:
+            conn.execute("UPDATE build_attempts SET opened_at = NULL WHERE attempt = 'a2'")
+            conn.commit()
+        assert [a.attempt for a in build_store.attempts_of(build_id)] == ["a2", "b1"]
+
+    def test_an_older_database_gains_when_attempts_opened_and_the_lineage_indexes(
+        self, tmp_path, clock
+    ):
+        seed_build_targets(tmp_path)
+        store = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+        build_id = self._pending(store)
+        with closing(store._get_connection()) as conn:
+            assert _indexes(conn) >= LINEAGE_INDEXES
+            for index in LINEAGE_INDEXES:
+                conn.execute(f"DROP INDEX {index}")
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN opened_at")
+            conn.commit()
+
+        reopened = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+
+        assert reopened.open_attempt(build_id, "a1", writable_until=clock() + 10)
+        assert reopened.get_attempt(build_id, "a1").opened_at == clock()
+        with closing(reopened._get_connection()) as conn:
+            assert _indexes(conn) >= LINEAGE_INDEXES
 
     def test_builds_of_an_executor_are_its_own_oldest_first(self, build_store, clock):
         # Ids that sort against the order they were created in.
