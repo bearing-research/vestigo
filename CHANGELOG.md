@@ -99,6 +99,15 @@ All notable changes to vestigo are recorded here. The format follows
   copy, hashed there and checked against the pin; a changed stat that
   hashes to the pin is remembered, so later saves stat again. The
   distributed example trains on shards passed as a `Path` (#48).
+- `vestigo.torch.Remote`: a torch run's input in S3, GCS or Azure, one
+  object or every object under a prefix, pinned without a download to what
+  its store says names its bytes (S3's ETag; GCS's MD5, a composite's
+  generation; Azure's Content-MD5, else its ETag), with its URI, and listed
+  again at every rank's check: other names, or an object added or removed,
+  fail the save as for a `Path`, and a store that does not answer fails only
+  that step. `objects(path)` on `S3BlobStore`, `GCSBlobStore` and
+  `AzureBlobStore` lists a key or prefix of the bucket that way; the object
+  store error counter has a `list` operation (#49).
 - `BuildStore.lapse_lease(build_id, lease_owner)` ends a lease for good from
   any thread or process: it clears the owner, so a renewal that read the
   clock first cannot revive it, as one could after a renewal to zero (#47).

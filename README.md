@@ -106,7 +106,9 @@ The package exports nothing at its top level; a consumer imports each module.
   place, each file checked against its digest. `define_model`,
   `define_program`, `start`, `resume`, `branch` and `find` are the explicit
   steps. A `Path` in `inputs` is pinned to its bytes in the key, and a checkpoint
-  or finish after those bytes change raises `InputChanged`; a `str` is a
+  or finish after those bytes change raises `InputChanged`; a `Remote`
+  (`s3://`, `gs://`, `az://`, a key or a prefix) is pinned to its object
+  store's names for the bytes and listed again at each check; a `str` is a
   label taken as given; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
   rank's `CheckpointManager.Config` at `LedgerStorage`, and
   `configure(config, inputs=)` points that rank at its own copy of the
