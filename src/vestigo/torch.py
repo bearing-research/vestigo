@@ -76,7 +76,7 @@ from vestigo.blob_store import (
     GCSBlobStore,
     S3BlobStore,
 )
-from vestigo.build_store import BuildStore
+from vestigo.build_store import BuildState, BuildStore
 from vestigo.graph import Edge, NodeId, NodeSpec
 from vestigo.operations import AdvanceReference
 from vestigo.provenance import (
@@ -778,6 +778,34 @@ class Definition:
 
 
 @dataclass(frozen=True)
+class Attempt:
+    """One attempt of an execution, and the checkpoint it continued from, if any."""
+
+    execution_id: str
+    attempt: str
+    resumed_from: str | None
+
+
+@dataclass(frozen=True)
+class Execution:
+    """An execution as the ledger recorded it.
+
+    *inputs* are each role's pin as the computation key holds it, *init* the
+    checkpoint it branched from. *state* is ``building`` until it finishes
+    (``ready``) or fails. *attempts* and *checkpoints* (each accepted step that is
+    still stored, with its release) are oldest first.
+    """
+
+    execution_id: str
+    program: NodeId
+    inputs: Mapping[str, Any]
+    init: str | None
+    state: str
+    attempts: tuple[Attempt, ...]
+    checkpoints: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
 class _Location:
     """What a path under :data:`ROOT` names: a step of an attempt, and a file in it."""
 
@@ -1422,6 +1450,93 @@ class Ledger:
         except (InvalidSignature, ValueError, TypeError) as exc:
             raise OSError(f"the signature on {what} does not verify") from exc
         return document
+
+    # --- Lineage ---
+
+    def execution(self, execution_id: str) -> Execution:
+        """What the ledger recorded of *execution_id*.
+
+        Raises:
+            ValueError: the execution does not exist.
+        """
+        build = self.builds.get_build(execution_id)
+        if build is None or build.executor_ref != EXECUTOR:
+            raise ValueError(f"execution {execution_id} does not exist")
+        return self._execution(build)
+
+    def executions(
+        self, of: Definition | None = None, *, reading: Input | None = None
+    ) -> list[Execution]:
+        """Every execution, oldest first, or those of *of* and reading *reading*.
+
+        *of* is a program, or a model: the executions of every program over it.
+        *reading* is pinned as :meth:`computation_key` pins an input, and matches an
+        execution with an input of that pin under any role.
+
+        Raises:
+            OSError, ValueError: *reading* cannot be pinned (see :meth:`computation_key`).
+        """
+        programs = None if of is None else {of.node_id, *self.store.graph.dependents(of.node_id)}
+        pin = None if reading is None else _resolve({"input": reading}).spec["input"]
+        found = []
+        for build in self.builds.builds_of(EXECUTOR):
+            params = build.params or {}
+            if programs is not None and params["program"] not in programs:
+                continue
+            if pin is not None and pin not in params["inputs"].values():
+                continue
+            found.append(self._execution(build))
+        return found
+
+    def resumed_from(self, release_id: str) -> list[Attempt]:
+        """The attempts that continued from *release_id*, in the order they opened."""
+        return [
+            Attempt(a.build_id, a.attempt, a.resumed_from)
+            for a in self.builds.attempts_resumed_from(release_id)
+        ]
+
+    def descendants(self, execution_id: str) -> list[Execution]:
+        """The executions branched from a checkpoint of *execution_id*, at any depth.
+
+        A branch of a branch is one; each names the checkpoint it starts from in
+        ``init``. Oldest first.
+
+        Raises:
+            ValueError: the execution does not exist.
+        """
+        self.execution(execution_id)
+        branches: dict[str, list[BuildState]] = {}
+        for build in self.builds.builds_of(EXECUTOR):
+            init = (build.params or {}).get("init")
+            # A release row outlives the checkpoint's bytes, so a collected one still links.
+            source = self.releases.get(init) if init is not None else None
+            if source is not None:
+                branches.setdefault(source.build_id, []).append(build)
+        found, frontier = [], [execution_id]
+        while frontier:
+            children = [b for parent in frontier for b in branches.get(parent, [])]
+            found += children
+            frontier = [b.build_id for b in children]
+        found.sort(key=lambda b: (b.created_at, b.build_id))
+        return [self._execution(build) for build in found]
+
+    def _execution(self, build: BuildState) -> Execution:
+        params = build.params or {}
+        return Execution(
+            build.build_id,
+            params["program"],
+            params["inputs"],
+            params.get("init"),
+            build.state,
+            tuple(
+                Attempt(a.build_id, a.attempt, a.resumed_from)
+                for a in self.builds.attempts_of(build.build_id)
+            ),
+            tuple(
+                (step, bundle.release.release_id)
+                for step, bundle in reversed(list(self._accepted(build.build_id)))
+            ),
+        )
 
     # --- Derived releases ---
 

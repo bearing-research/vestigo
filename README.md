@@ -124,6 +124,12 @@ The package exports nothing at its top level; a consumer imports each module.
   from an accepted checkpoint (an export, evaluation metrics) as a release of
   its own, which keeps only its own outputs; `Ledger.derived` finds it again,
   and a name derived from a later checkpoint is derived from no earlier one.
+  `Ledger.execution` returns an execution's record (program, input pins, the
+  checkpoint it branched from, its attempts and checkpoints);
+  `Ledger.executions(of, reading=)` finds those of a program or a model and
+  those that read an input's bytes, `Ledger.resumed_from` the attempts that
+  continued from a release, `Ledger.descendants` a run's branches at any
+  depth.
   `Ledger(signing_key=)` (the `sign` extra) has each rank sign its report and
   rank 0 sign each checkpoint's manifest with Ed25519, and `verify_key=` makes
   every load take the files from the signed manifest and check their bytes

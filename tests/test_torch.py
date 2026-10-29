@@ -39,10 +39,13 @@ from torch_checkpointing.checkpoint_manager import CheckpointManager
 import vestigo.torch
 from vestigo.blob_store import BlobSettings
 from vestigo.build_store import BuildStore
-from vestigo.releases import ReleaseRejected, ReleaseStore
+from vestigo.provenance import compute_provenance_hash
+from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost
 from vestigo.torch import (
+    Attempt,
     Definition,
+    Execution,
     InputChanged,
     Ledger,
     LedgerStorage,
@@ -1111,6 +1114,117 @@ def test_a_resume_from_a_collected_checkpoint_fences_nothing(ledger: Ledger):
     with pytest.raises(ValueError, match="was collected"):
         ledger.resume(run.execution_id, from_release=one)
     assert ledger.builds.get_build(run.execution_id).attempt == run.attempt
+
+
+# --- Lineage ---
+
+
+def _ids(executions: list[Execution]) -> list[str]:
+    return [e.execution_id for e in executions]
+
+
+def test_an_execution_records_its_computation_attempts_and_checkpoints(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as first:
+        trainer.train(first, 2)
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as resumed:
+        trainer.restore(resumed)
+        trainer.train(resumed, 3)
+        resumed.finish()
+    one, two, three = (ledger.release_of(first.execution_id, s).release_id for s in (1, 2, 3))
+
+    execution = ledger.execution(first.execution_id)
+    assert execution.checkpoints == ((1, one), (2, two), (3, three))
+    assert execution.attempts == (
+        Attempt(first.execution_id, first.attempt, None),
+        Attempt(first.execution_id, resumed.attempt, two),
+    )
+    assert ledger.resumed_from(two) == [execution.attempts[1]]
+    assert ledger.resumed_from(one) == []
+    # The record is the bound computation: it gives the execution's key again.
+    assert execution.program == trainer.program.node_id and execution.state == "ready"
+    assert (execution.inputs, execution.init) == ({"train": "data@v=1"}, None)
+    assert first.computation_key == ledger.computation_key(
+        trainer.program, execution.inputs, execution.init
+    )
+
+
+def test_executions_are_found_by_program_by_model_and_by_input(ledger: Ledger, tmp_path: Path):
+    trainer = Trainer(ledger)
+    model = ledger.define_model(trainer.model, version="tiny-v1")
+    wide = ledger.define_program(
+        model, loss=nn.MSELoss(), optimizer=trainer.optimizer, config={"batch": 32}
+    )
+    other = _program(ledger, _model(16), trainer.optimizer)
+    data = _file(tmp_path / "here" / "rows.bin")
+    with ledger.start(trainer.program, {"train": data}) as one:
+        trainer.train(one, 1)
+        derived = ledger.derive(one.release_of(1).release_id, "eval", {"metrics": b"1"})
+    with ledger.start(wide, {"train": "data@v=1", "eval": data}) as two:
+        pass
+    with ledger.start(trainer.program, {"train": "data@v=2"}) as three:
+        pass
+    with ledger.start(other, {"train": "data@v=2"}) as four:
+        pass
+    one, two, three, four = (r.execution_id for r in (one, two, three, four))
+
+    assert _ids(ledger.executions()) == [one, two, three, four]
+    assert _ids(ledger.executions(model)) == [one, two, three]
+    assert _ids(ledger.executions(trainer.program)) == [one, three]
+    assert _ids(ledger.executions(wide)) == [two]
+    # An input is its bytes: a copy elsewhere finds the executions that read them.
+    copy = _file(tmp_path / "there" / "copy.bin")
+    assert _ids(ledger.executions(reading=copy)) == [one, two]
+    assert _ids(ledger.executions(trainer.program, reading=copy)) == [one]
+    assert _ids(ledger.executions(reading="data@v=2")) == [three, four]
+    # Each record is its bound computation: it hashes to the execution's key.
+    for execution in ledger.executions():
+        program = ledger._definition(execution.program)
+        spec = Ledger._spec(program, execution.inputs, execution.init)
+        build = ledger.builds.get_build(execution.execution_id)
+        assert compute_provenance_hash([], spec) == build.computation_key
+    for missing in ("0" * 32, derived.release.build_id):
+        with pytest.raises(ValueError, match="does not exist"):
+            ledger.execution(missing)
+
+
+def test_descendants_are_the_branches_of_a_run_at_any_depth(ledger: Ledger):
+    def branch(release: Release | None) -> str:
+        assert release is not None
+        trainer = Trainer(ledger)
+        with ledger.branch(trainer.program, release.release_id) as run:
+            trainer.restore(run)
+            trainer.train(run, trainer.step + 1)
+            run.finish()
+        return run.execution_id
+
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as source:
+        trainer.train(source, 3)
+        source.finish()
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, {"train": "data@v=2"}) as unrelated:
+        trainer.train(unrelated, 1)
+        unrelated.finish()
+    source, unrelated = source.execution_id, unrelated.execution_id
+    a = branch(ledger.release_of(source, 1))
+    b = branch(ledger.release_of(a, 2))
+    c = branch(ledger.release_of(source, 3))
+    d = branch(ledger.release_of(unrelated, 1))
+
+    assert _ids(ledger.descendants(source)) == [a, b, c]
+    assert _ids(ledger.descendants(a)) == [b]
+    assert _ids(ledger.descendants(c)) == []
+    assert _ids(ledger.descendants(unrelated)) == [d]
+    assert ledger.execution(b).init == ledger.release_of(a, 2).release_id
+
+    # The checkpoint a branch started from may be collected; the branch still descends.
+    ledger.collect(keep=1)
+    assert [step for step, _ in ledger.execution(source).checkpoints] == [3]
+    assert _ids(ledger.descendants(source)) == [a, b, c]
+    with pytest.raises(ValueError, match="does not exist"):
+        ledger.descendants("0" * 32)
 
 
 def test_a_load_refuses_bytes_that_differ_from_the_release(ledger: Ledger):

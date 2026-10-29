@@ -880,6 +880,34 @@ class TestAttempts:
         )
         assert build_store.get_build(build_id).lease_expires_at == clock() + 300.0
 
+    def test_attempts_come_in_the_order_they_opened(self, build_store, clock):
+        build_id, other = self._pending(build_store), self._pending(build_store)
+        assert build_store.open_attempt(build_id, "b1", writable_until=clock() + 100)
+        clock.now += 61
+        assert build_store.open_attempt(
+            build_id, "a2", writable_until=clock() + 100, resumed_from="r1"
+        )
+        assert build_store.open_attempt(other, "c1", writable_until=clock() + 50, resumed_from="r1")
+
+        assert [a.attempt for a in build_store.attempts_of(build_id)] == ["b1", "a2"]
+        assert [(a.build_id, a.attempt) for a in build_store.attempts_resumed_from("r1")] == [
+            (other, "c1"),
+            (build_id, "a2"),
+        ]
+        assert build_store.attempts_resumed_from("r2") == []
+
+    def test_builds_of_an_executor_are_its_own_oldest_first(self, build_store, clock):
+        # Ids that sort against the order they were created in.
+        for build_id, executor_ref in (("z", "x@v1"), ("y", "other@v1"), ("a", "x@v1")):
+            build_store.create_build(
+                build_id=build_id, artifact_id="art-123", version=1, executor_ref=executor_ref
+            )
+            clock.now += 1
+
+        assert [b.build_id for b in build_store.builds_of("x@v1")] == ["z", "a"]
+        assert [b.build_id for b in build_store.builds_of("other@v1")] == ["y"]
+        assert build_store.builds_of("none@v1") == []
+
     def test_settled_attempts_are_the_closed_windows_of_ended_builds(self, build_store, clock):
         build_id = self._pending(build_store)
         build_store.record_attempt(build_id, "art-123", 1, "a1", writable_until=clock() + 10)
