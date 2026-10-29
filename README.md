@@ -109,8 +109,8 @@ The package exports nothing at its top level; a consumer imports each module.
   or finish after those bytes change raises `InputChanged`; a `str` is a
   label taken as given; `Checkpoints.configure` (`Run.checkpoints` broadcast) points another
   rank's `CheckpointManager.Config` at `LedgerStorage`, and
-  `Checkpoints.with_inputs` points that rank at its own copy of the inputs,
-  which every rank's report records.
+  `configure(config, inputs=)` points that rank at its own copy of the
+  inputs, which every rank's report records.
   `release_of`, `set_head`, `finish` (which keeps the checkpoint the run
   ended on; `Ledger.final_checkpoint`). `Ledger.collect(keep=)` deletes the
   checkpoints no execution needs: an unfinished run keeps its newest `keep`

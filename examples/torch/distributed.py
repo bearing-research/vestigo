@@ -13,8 +13,8 @@ checkpoint to restore, from rank 0 by broadcast.
 The training data is a directory of shards, one per rank, that the first run writes
 beside the ledger. It is a ``Path`` input: every rank's report says what it found
 there, and rank 0 accepts a step only while every rank's copy is the bytes the run
-pinned. On another machine a rank holds its own copy with
-``checkpoints.with_inputs({"train": Path("/local/shards")})``.
+pinned. On another machine a rank names its own copy when it configures:
+``checkpoints.configure(config, inputs={"train": Path("/local/shards")})``.
 
 One machine and SQLite here. Ranks on several machines need a ledger every rank can
 reach: ``Ledger(path, dsn="postgresql://...", blobs=RemoteBlobs("s3", "bucket"))``.
@@ -23,6 +23,7 @@ reach: ``Ledger(path, dsn="postgresql://...", blobs=RemoteBlobs("s3", "bucket"))
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
 import torch
@@ -38,11 +39,14 @@ def shards(ledger: Path, world: int) -> Path:
     """One training shard per rank, beside *ledger*, written by rank 0 on the first run."""
     root = ledger.parent / f"regression-shards-{world}"
     if dist.get_rank() == 0 and not root.exists():
-        root.mkdir()
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        # Written aside and renamed whole, so a crash midway leaves no partial set.
+        partial = Path(tempfile.mkdtemp(dir=ledger.parent))
         for rank in range(world):
             generator = torch.Generator().manual_seed(1 + rank)
             x = torch.randn(128, 4, generator=generator)
-            torch.save((x, x.sum(dim=1, keepdim=True)), root / f"{rank}.pt")
+            torch.save((x, x.sum(dim=1, keepdim=True)), partial / f"{rank}.pt")
+        partial.rename(root)
     dist.barrier()
     return root
 
