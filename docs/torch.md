@@ -314,6 +314,27 @@ Each rank writes its own files (`model_0.pt`, `model_1.pt`, ...) and loads its o
 Rank 0 accepts a step only after the barrier has seen every rank write. If a rank dies
 before writing, the barrier times out, and that step never becomes a release.
 
+With a `Path` input, every rank checks its own copy at each save. Each other rank's
+report (signed, with a signing key) records the path and bytes it found after its
+write; rank 0 checks its own after the barrier and records that in the manifest. The
+step is accepted only when every copy has the bytes the run pinned. Otherwise rank 0's
+save raises `InputChanged` naming the rank and path: other bytes lapse the lease, and a
+copy that cannot be read (say, a transient error on a shared mount) fails only that
+step. No rank raises before the barrier, so a bad copy never holds the others up.
+
+A rank whose data is not at rank 0's path (another machine's disk) names its own copy
+when it configures, by role; it is hashed there and must be the same bytes:
+
+```python
+config = checkpoints.configure(
+    CheckpointManager.Config.with_sync_save(), inputs={"train": Path("/local/shards")}
+)
+```
+
+A rank that names none checks rank 0's paths on its own machine. Every rank walks its
+copy at every save, a `stat` per file, before the barrier: on a large tree, save less
+often rather than check less.
+
 Each rank reads its rank and the world size when it calls `configure`, from the default
 process group, else from `RANK` and `WORLD_SIZE`, so configure after
 `init_process_group`. The async writer subprocess uses what `configure` read: it has no

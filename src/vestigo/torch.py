@@ -51,7 +51,7 @@ import zipfile
 from collections.abc import Generator, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, cast
@@ -389,20 +389,29 @@ def _resolve(inputs: Mapping[str, str | Path] | None) -> _Inputs:
     return _Inputs(spec, tuple(held))
 
 
-def _hold(held: Sequence[_Held]) -> None:
-    """Raises InputChanged: a verified input's bytes are not the ones it was pinned to.
+def _seen(held: Sequence[_Held], known: dict[str, str]) -> dict[str, Any]:
+    """Each verified input as this process finds it now: its path, and its bytes' pin
+    or why they cannot be read.
 
     An unchanged stat is the same bytes. A changed one (a chmod, a hardlink, an
-    attribute a file browser adds) is read again, from the digest cache where it can be.
+    attribute a file browser adds) is read again, from the digest cache where it can
+    be; *known* keeps the new stat's fingerprint, so the next check is a stat again.
     """
+    seen: dict[str, Any] = {}
     for each in held:
         try:
             files = _scan(Path(each.path))
-            if _fingerprint(files) == each.scanned or _pin(files) == each.pinned:
-                continue
-        except (OSError, ValueError) as exc:
-            raise InputChanged(f"input {each.role!r} at {each.path} cannot be read") from exc
-        raise InputChanged(f"input {each.role!r} at {each.path} has other bytes now")
+            scanned = _fingerprint(files)
+            if scanned in (each.scanned, known.get(each.role)):
+                pin = each.pinned
+            else:
+                pin = _pin(files)
+                if pin == each.pinned:
+                    known[each.role] = scanned
+            seen[each.role] = {"path": each.path, "pin": pin}
+        except (OSError, ValueError, InputChanged) as exc:
+            seen[each.role] = {"path": each.path, "unreadable": str(exc)}
+    return seen
 
 
 def _stateful(value: object) -> bool:
@@ -1304,14 +1313,24 @@ class Ledger:
             if v.state == "ready" and v.id.startswith(prefix)
         ]
 
-    def _hold(self, writer: Checkpoints) -> None:
-        try:
-            _hold(writer.inputs)
-        except InputChanged:
+    def _hold(self, writer: Checkpoints, seen: Mapping[str, Any], where: str) -> None:
+        """Raises InputChanged: a verified input, as *seen* *where*, cannot be read or
+        has bytes other than its pin."""
+        for each in writer.inputs:
+            now = seen.get(each.role, {})
+            if now.get("pin") == each.pinned:
+                continue
+            path = now.get("path", each.path)
+            if "unreadable" in now:
+                # Perhaps for a moment (EIO on a shared mount): this step fails, the
+                # lease stays, the next save checks again.
+                raise InputChanged(
+                    f"input {each.role!r} at {path} cannot be read {where}: {now['unreadable']}"
+                )
             # The data this attempt trained on is gone: a resume need not wait for it.
             # A lapse, not a renewal to zero, as the run's own renewal goes on meanwhile.
             self.builds.lapse_lease(writer.execution_id, writer.attempt)
-            raise
+            raise InputChanged(f"input {each.role!r} at {path} has other bytes {where}")
 
     def _require_lease(self, writer: Checkpoints) -> None:
         conn = self.store._get_connection()
@@ -1381,42 +1400,51 @@ class Ledger:
         return stored
 
     def _report(
-        self, writer: Checkpoints, at: _Location, rank: int, files: list[dict[str, Any]]
+        self,
+        writer: Checkpoints,
+        at: _Location,
+        rank: int,
+        files: list[dict[str, Any]],
+        inputs: dict[str, Any] | None,
     ) -> None:
         artifact_id, version = self._stage(writer, at, f"rank={rank}", {"rank": rank})
         # Signed by the rank that hashed the bytes, so rank 0 signs no digest a bucket
-        # writer swapped in between this report and the acceptance.
+        # writer swapped in between this report and the acceptance. *inputs* are this
+        # rank's copies as it found them, held by rank 0 against what the run pinned
+        # (None on rank 0, which checks its own at acceptance).
         report = {
             "execution": at.execution_id,
             "attempt": at.attempt,
             "step": at.step,
             "rank": rank,
             "files": files,
+            "inputs": inputs,
         }
         self._write_small(artifact_id, version, _canonical(self._sign(report)))
 
-    def _files_reported(self, at: _Location, rank: int, raw: bytes) -> list[dict[str, Any]]:
-        """The files *rank* reported writing of the step; verified, given a signing key.
+    def _reported(self, at: _Location, rank: int, raw: bytes) -> dict[str, Any]:
+        """*rank*'s report of the step: the files it wrote and its inputs as it found
+        them; verified, given a signing key.
 
         Raises:
             OSError: the report does not verify, or is signed for another rank or step.
         """
         if self.config.signing_key is None:
-            return json.loads(raw)["files"]
+            return json.loads(raw)
         what = f"rank {rank}'s report of step {at.step} of execution {at.execution_id}"
         report = self._verified(raw, what)
         named = (report["execution"], report["attempt"], report["step"], report["rank"])
         if named != (at.execution_id, at.attempt, at.step, rank):
             raise OSError(f"{what} is signed for another checkpoint")
-        return report["files"]
+        return report
 
-    def _accept(self, writer: Checkpoints, at: _Location, world: int) -> Release:
+    def _accept(
+        self, writer: Checkpoints, at: _Location, world: int, known: dict[str, str]
+    ) -> Release:
         for step, bundle in self._accepted(at.execution_id):
             if step == at.step and bundle.release.attempt == at.attempt:
                 # The writer retried a finalize whose acceptance had landed.
                 return bundle.release
-        # Here, after the write, so a change while it ran fails it too.
-        self._hold(writer)
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -1429,11 +1457,14 @@ class Ledger:
             if data is None:
                 raise ValueError(f"rank {rank} reported nothing for step {at.step}")
             reports.append((report_id, pending[-1].version, data))
-        files = [
-            entry
-            for rank, (*_, data) in enumerate(reports)
-            for entry in self._files_reported(at, rank, data)
-        ]
+        documents = [self._reported(at, rank, data) for rank, (*_, data) in enumerate(reports)]
+        # Rank 0's copy now, past the barrier; every other rank's as it found it after
+        # its write. Any one that does not hold fails the step.
+        inputs = _seen(writer.inputs, known)
+        self._hold(writer, inputs, "on rank 0")
+        for rank, document in enumerate(documents[1:], start=1):
+            self._hold(writer, document["inputs"], f"on rank {rank}")
+        files = [entry for document in documents for entry in document["files"]]
         if len({entry["file"] for entry in files}) != len(files):
             raise ValueError(f"two ranks wrote one file of step {at.step}")
 
@@ -1466,6 +1497,7 @@ class Ledger:
                 "release": release.release_id,
                 "computation_key": writer.computation_key,
                 "files": files,
+                "inputs": inputs,
             }
             manifest = self._sign(manifest)
             manifest_id, version = self._stage(
@@ -1506,26 +1538,52 @@ class Checkpoints:
     attempt: str
     computation_key: str
     program: NodeSpec
-    # The verified inputs, rescanned before each release on rank 0 (its own paths).
+    # The verified inputs, rank 0's: every rank scans them, or its own copies
+    # (configure's inputs), at each save.
     inputs: tuple[_Held, ...] = ()
 
     def checkpoint_id(self, step: int) -> str:
         """Where to save *step*: a name under this attempt, never reused."""
         return f"{ROOT}/{self.execution_id}/{self.attempt}/step-{step}"
 
-    def configure(self, config: Any) -> Any:
+    def configure(self, config: Any, *, inputs: Mapping[str, Path] | None = None) -> Any:
         """Point a ``CheckpointManager.Config`` at the ledger; returns it.
 
         Sets its storage, both write callbacks and ``write_to_temp_dir=False`` (the
         barrier stays: rank 0 accepts only after every rank has written). Call it once
         the process group is up: the rank and world size are read here.
+
+        Every rank checks the run's ``Path`` inputs at each save, at rank 0's paths
+        unless *inputs* name this rank's own copies (another machine's disk), by role.
+        Each copy is hashed here and must be the bytes the run pinned.
+
+        Raises:
+            TypeError: an input is not a ``Path``.
+            ValueError: *inputs* are not the run's ``Path`` inputs by role.
+            InputChanged: a copy has other bytes.
         """
+        writer = self if inputs is None else self._with(inputs)
         rank, world = _rank()
-        config.storage_config = LedgerStorageConfig(self.ledger, self, rank, world)
+        config.storage_config = LedgerStorageConfig(self.ledger, writer, rank, world)
         config.pre_finalize_callback = report
-        config.finalize_callback = self
+        config.finalize_callback = writer
         config.save.writer_config.write_to_temp_dir = False
         return config
+
+    def _with(self, inputs: Mapping[str, Path]) -> Checkpoints:
+        for role, value in inputs.items():
+            if not isinstance(value, Path):
+                raise TypeError(f"input {role!r} is this rank's copy, a Path, not {type(value)}")
+        resolved = _resolve(inputs)
+        pinned = {each.role: each.pinned for each in self.inputs}
+        if resolved.spec.keys() != pinned.keys():
+            raise ValueError(
+                f"the run's Path inputs are {sorted(pinned)}, not {sorted(resolved.spec)}"
+            )
+        for role, pin in resolved.spec.items():
+            if pin != pinned[role]:
+                raise InputChanged(f"input {role!r} at {inputs[role]} has other bytes in this copy")
+        return replace(self, inputs=resolved.held)
 
     def __call__(self, args: Any) -> None:
         """``finalize_callback``: on rank 0, make the step a release."""
@@ -1534,7 +1592,7 @@ class Checkpoints:
         if storage.rank != 0:
             return
         with self.ledger.open() as ledger:
-            ledger._accept(self, at, storage.world)
+            ledger._accept(self, at, storage.world, storage.known)
 
     def _own(self, path: Path | str) -> _Location:
         at = _Location.of(path)
@@ -1654,6 +1712,8 @@ class LedgerStorage(Storage):
         self.rank, self.world = rank, world
         self._lock = threading.Lock()
         self._written: dict[_Location, list[dict[str, Any]]] = {}
+        # By role, a stat fingerprint of this rank's copy that hashed to the pin.
+        self.known: dict[str, str] = {}
 
     @property
     def mmap_fill_workers(self) -> int | None:
@@ -1694,8 +1754,11 @@ class LedgerStorage(Storage):
         at = writer._own(path)
         with self._lock:
             files = self._written.pop(at, [])
+        # Recorded, not raised: a rank that raised here would hold every other one at
+        # the barrier. Rank 0 checks its own after the barrier, in the manifest.
+        inputs = _seen(writer.inputs, self.known) if self.rank else None
         with self.ledger.open() as ledger:
-            ledger._report(writer, at, self.rank, files)
+            ledger._report(writer, at, self.rank, files, inputs)
 
     def mkdir(self, path: Path, recursive: bool = True) -> None:
         # Ids, not directories: nothing to make.
@@ -1936,7 +1999,7 @@ class Run:
         """
         if self._manager is not None:
             self._manager.close()
-        self.ledger._hold(self.checkpoints)
+        self.ledger._hold(self.checkpoints, _seen(self.checkpoints.inputs, {}), "now")
         ended_on = next(
             (
                 bundle.release.release_id
