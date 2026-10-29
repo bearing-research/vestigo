@@ -128,6 +128,17 @@ All notable changes to vestigo are recorded here. The format follows
   `vestigo.torch.report` are gone from the API: the broadcast and the
   hand-built manager are internal. The distributed example and the guide
   use one code path for every rank (#50).
+- A collective run settles before it opens and never waits forever on a save.
+  Rank 0 pins the inputs, every rank checks its copies, and only then does
+  rank 0 open the run, so a bad copy leaves no failed build. The ranks also
+  agree on the save mode, barrier timeout and verify key, and a term that is
+  not JSON on one rank raises on all (before any input is hashed, on one
+  rank too). Each rank writes through its own ledger and checks it holds the
+  run. A save's outcome goes through the process group's store: rank 0 posts
+  it, and a rank that reached the barrier after rank 0 gave up raises rank
+  0's error instead of waiting forever. The exchanges use a gloo group of
+  their own (no GPU needed on NCCL); `finish` gathers to rank 0 only, which
+  lists `Remote` inputs once; `configure` takes the rank from the run (#51).
 - `vestigo.torch` trains through one call and two methods. `Ledger.run(model,
   optimizer, *, loss, version, inputs, config, from_release, checkpointing)`
   defines the model and program, then resumes the computation's unfinished
