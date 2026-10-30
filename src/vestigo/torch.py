@@ -2621,8 +2621,9 @@ class HostedRun:
             raise RuntimeError("a hosted run is one process; run several ranks with Ledger.run")
         self.host = host
         config = CheckpointManager.Config.with_sync_save()
-        # The writer's default storage; O_DIRECT is Linux's only.
-        config.storage_config = LocalFileSystemStorageConfig(use_direct_io=hasattr(os, "O_DIRECT"))
+        # torch-checkpointing 0.1.1 writes unaligned buffers, which O_DIRECT refuses on
+        # flush (EINVAL on Linux); macOS has no O_DIRECT.
+        config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
         self.manager = config.build()
 
     def save(self, step: int, state: Mapping[str, Any]) -> int:
