@@ -40,6 +40,7 @@ publishes the files as one release in the layout of :mod:`vestigo.checkpoint_fil
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import io
 import json
@@ -60,7 +61,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
-from types import TracebackType
+from types import BuiltinFunctionType, FunctionType, MethodType, TracebackType
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
@@ -715,9 +716,45 @@ def _model_payload(model: Any, version: str) -> dict[str, Any]:
     return {"class": _fqn(model), "state_dict": schema, "version": version}
 
 
+def _loss_payload(loss: Any) -> Any:
+    """*loss* as its program records it: a name as given, a class or function by its
+    qualified name, a ``partial`` with its arguments, and an object (a loss module) by
+    its class, public attributes and the digest of each tensor in its ``state_dict``.
+
+    Raises:
+        TypeError: an attribute or argument is not JSON.
+        ValueError: the loss is a lambda, which has no name.
+    """
+    if isinstance(loss, str):
+        return loss
+    if isinstance(loss, functools.partial):
+        return {
+            "function": _loss_payload(loss.func),
+            "args": list(loss.args),
+            "keywords": dict(loss.keywords),
+        }
+    if isinstance(loss, (type, FunctionType, BuiltinFunctionType, MethodType)):
+        if loss.__name__ == "<lambda>":
+            raise ValueError("a lambda loss has no name; pass a named function or a str")
+        return f"{loss.__module__}.{loss.__qualname__}"
+    settings = {key: value for key, value in vars(loss).items() if not key.startswith("_")}
+    tensors = {}
+    if isinstance(loss, torch.nn.Module):
+        del settings["training"]
+        tensors = {key: _tensor_digest(value) for key, value in loss.state_dict().items()}
+    return {"class": _fqn(loss), "settings": settings, "tensors": tensors}
+
+
+def _tensor_digest(tensor: Any) -> list[Any]:
+    data = tensor.detach().cpu().contiguous()
+    # Viewed as bytes, as numpy has no bfloat16.
+    raw = data.reshape(-1).view(torch.uint8).numpy()
+    return [list(data.shape), str(data.dtype), hashlib.sha256(raw).hexdigest()]
+
+
 def _program_payload(loss: Any, optimizer: Any, config: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
-        "loss": loss if isinstance(loss, str) else _fqn(loss),
+        "loss": _loss_payload(loss),
         "optimizer": {"class": _fqn(optimizer), "defaults": dict(optimizer.defaults)},
         "config": dict(config or {}),
     }
@@ -958,13 +995,16 @@ class Ledger:
     ) -> Definition:
         """The training program's node: the model it implements, its loss and update.
 
-        *loss* is a loss module, class or name; *optimizer* an optimizer, read as its
-        class and ``defaults``; *config* whatever else the caller declares part of the
-        program (schedule, accumulation, precision), as JSON. Two programs that differ
-        in any of them are different programs over one model.
+        *loss* is a loss module (read as its class, settings and tensors), a class, a
+        function, a ``partial`` of one, or a name; *optimizer* an optimizer, read as
+        its class and ``defaults``; *config* every other setting that changes the
+        trained weights (batch size, schedule, seed, accumulation, precision), as
+        JSON. Two programs that differ in any of them are different programs over one
+        model.
 
         Raises:
             TypeError: a value is not JSON (an optimizer default held as a tensor).
+            ValueError: the loss is a lambda.
         """
         return self._program(model, _program_payload(loss, optimizer, config))
 

@@ -8,6 +8,7 @@ asynchronously, on one rank and on two (gloo, one process each).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
@@ -364,6 +365,44 @@ def test_a_program_is_its_loss_and_update_over_the_model(ledger: Ledger):
     assert program(nn.MSELoss(), 1e-2).node_id != base.node_id
     [impl] = ledger.store.graph.inputs(base.node_id)
     assert (impl.role, impl.target_node_id) == ("impl", definition.node_id)
+
+
+class _Scaled(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.tensor(2.0)  # an attribute, not a buffer
+
+
+def test_a_program_records_its_loss_s_settings_and_tensors(ledger: Ledger):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+
+    def program(loss: object) -> str:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        return ledger.define_program(definition, loss=loss, optimizer=optimizer).node_id
+
+    huber = program(nn.HuberLoss(delta=1.0))
+    assert program(nn.HuberLoss(delta=1.0)) == huber
+    assert program(nn.HuberLoss(delta=1.0).eval()) == huber
+    assert program(nn.HuberLoss(delta=2.0)) != huber
+
+    weighted = program(nn.CrossEntropyLoss(weight=torch.ones(3)))
+    assert program(nn.CrossEntropyLoss(weight=torch.ones(3))) == weighted
+    assert program(nn.CrossEntropyLoss(weight=torch.tensor([1.0, 2.0, 1.0]))) != weighted
+    assert program(nn.CrossEntropyLoss(weight=torch.ones(3, dtype=torch.bfloat16))) != weighted
+    assert program(nn.CrossEntropyLoss()) != weighted
+
+    f = nn.functional
+    assert program(f.mse_loss) == program(f.mse_loss)
+    assert program(f.mse_loss) != program(f.l1_loss)
+    assert program(nn.MSELoss) != program(nn.L1Loss)
+    assert program(functools.partial(f.huber_loss, delta=1.0)) != program(
+        functools.partial(f.huber_loss, delta=2.0)
+    )
+    with pytest.raises(ValueError, match="lambda"):
+        program(lambda output, target: f.mse_loss(output, target))
+    with pytest.raises(TypeError, match="JSON"):
+        program(_Scaled())
 
 
 def test_runs_on_two_inputs_share_the_program_and_differ_in_computation(ledger: Ledger):

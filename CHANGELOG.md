@@ -5,6 +5,15 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- `vestigo.torch` records a loss module's public attributes and the digest of
+  each tensor in its `state_dict` in the program node, a function loss by its
+  qualified name (every function was `builtins.function`), and a
+  `functools.partial` with its arguments; a lambda loss is refused. Program
+  nodes change, so a run started before resumes nowhere and starts fresh. The
+  guide says what goes in `inputs` and `config` (#PR).
+
 ## 0.3.1 - 2026-10-29
 
 ### Added

@@ -100,7 +100,7 @@ The package exports nothing at its top level; a consumer imports each module.
   machines) with `run(model, optimizer, *, loss, version, inputs=None,
   config=None, from_release=None, checkpointing=None)`, which defines the
   model and program nodes (a model's class and `state_dict` schema under a
-  declared version; a program's loss and optimizer over it) and resumes the
+  declared version; a program's loss with its settings and optimizer over it) and resumes the
   computation's unfinished execution or starts one, branching from
   `from_release` when given. The `Run` it returns owns a `torch_checkpointing`
   `CheckpointManager` (synchronous saves by default, or the `checkpointing`
