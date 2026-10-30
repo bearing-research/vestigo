@@ -30,6 +30,11 @@ and gets its own :class:`Run`; rank 0 starts or resumes the build and holds its 
 An ``ExportedProgram`` the run captured is recorded beside its checkpoints as an
 observed implementation: the archive with its versions and constraints, and a declared
 scope and coverage. It never enters a node, so no definition changes because of it.
+
+Where another system holds the execution, as a Strata cell's server does, a
+:class:`HostedRun` writes each checkpoint into a folder that system hands it, which
+publishes the files as one release in the layout of :mod:`vestigo.checkpoint_files`;
+:meth:`Ledger.load` reads such a checkpoint as it reads its own.
 """
 
 from __future__ import annotations
@@ -56,7 +61,7 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from types import TracebackType
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from urllib.parse import quote
 
 try:
@@ -66,9 +71,11 @@ try:
     from torch_checkpointing.checkpoint_manager import CheckpointManager
     from torch_checkpointing.config import SyncCheckpointSaverConfig
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
+    from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 except ImportError as exc:
     raise ImportError("vestigo.torch needs the torch extra: install vestigo[torch]") from exc
 
+from vestigo import checkpoint_files
 from vestigo.blob_store import (
     AzureBlobStore,
     BlobSettings,
@@ -1334,9 +1341,9 @@ class Ledger:
         for bundle in reversed(self.releases.bundles_of(execution_id, "checkpoint")):
             if bundle.release.state != "accepted":
                 continue
-            for version in bundle.outputs:
-                if version.params.get("manifest") and "step" in version.params:
-                    yield version.params["step"], bundle
+            step = checkpoint_files.step_of(bundle.outputs)
+            if step is not None:
+                yield step, bundle
 
     def release_of(self, execution_id: str, step: int) -> Release | None:
         """The execution's newest accepted checkpoint of *step*, or None."""
@@ -1406,9 +1413,8 @@ class Ledger:
             return None
         if self.config.verify_key is None:
             return {
-                v.params["file"]: _File(v.id, v.version, v.byte_size, v.content_sha256)
-                for v in bundle.outputs
-                if "file" in v.params
+                path: _File(v.id, v.version, v.byte_size, v.content_sha256)
+                for path, v in checkpoint_files.files_of(bundle.outputs).items()
             }
         where = f"step {at.step} of execution {at.execution_id}"
         rows = [v for v in bundle.outputs if v.params.get("manifest")]
@@ -2001,7 +2007,7 @@ class Ledger:
                 writer,
                 at,
                 "manifest",
-                {"manifest": True},
+                checkpoint_files.manifest_params(at.step),
                 requires=[(e["artifact_id"], e["version"]) for e in files],
                 release_id=release.release_id,
             )
@@ -2204,7 +2210,9 @@ class LedgerStorage(Storage):
             raise IsADirectoryError(f"{path} is a checkpoint, not a file in one")
         label = f"file={quote(at.file, safe='')}"
         with self.ledger.open() as ledger:
-            artifact_id, version = ledger._stage(writer, at, label, {"file": at.file})
+            artifact_id, version = ledger._stage(
+                writer, at, label, checkpoint_files.file_params(at.file, at.step)
+            )
         return _Upload(self, at, artifact_id, version)
 
     def write(self, path: Path, data: Any) -> None:
@@ -2578,3 +2586,68 @@ class Run:
             builds.fail_build(
                 self.execution_id, "ended before a checkpoint", lease_owner=self.attempt
             )
+
+
+# --- Inside another system's execution ---
+
+
+class Host(Protocol):
+    """What publishes a run's checkpoints where the trainer holds no ledger: a Strata
+    cell's ``strata``, whose server holds the run's build and lease."""
+
+    def checkpoint_files(self, step: int, write: Callable[[Path], object]) -> int:
+        """Publish, as checkpoint *step*, the files *write* puts in the empty folder it
+        is given; returns the checkpoint's sequence in the host's run."""
+        ...
+
+    def restore_files(self) -> Path | None:
+        """The folder holding the files of the checkpoint the run starts from, or None."""
+        ...
+
+
+class HostedRun:
+    """A run whose execution *host* holds: saves and restores as :class:`Run` does.
+
+    Each save is synchronous and written to local disk in the folder the host gives;
+    the host publishes it once written. Its checkpoints are unsigned, so a ledger with
+    a verify key refuses them. One process: the host is one rank's.
+
+    Raises:
+        RuntimeError: the process is one rank of several.
+    """
+
+    def __init__(self, host: Host) -> None:
+        if _group()[1] > 1:
+            raise RuntimeError("a hosted run is one process; run several ranks with Ledger.run")
+        self.host = host
+        config = CheckpointManager.Config.with_sync_save()
+        # The writer's default storage; O_DIRECT is Linux's only.
+        config.storage_config = LocalFileSystemStorageConfig(use_direct_io=hasattr(os, "O_DIRECT"))
+        self.manager = config.build()
+
+    def save(self, step: int, state: Mapping[str, Any]) -> int:
+        """Save *state* as checkpoint *step*; returns its sequence in the host's run."""
+        saved = _saved(state)
+        return self.host.checkpoint_files(
+            step, lambda folder: self.manager.save(str(folder), saved)
+        )
+
+    def restore(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        """*state* as of the checkpoint the host's run starts from; as given without one.
+
+        Raises:
+            FileNotFoundError: the checkpoint saved nothing under a key of *state*.
+        """
+        folder = self.host.restore_files()
+        if folder is None:
+            return dict(state)
+        return _load(self.manager, str(folder), state)
+
+    def close(self) -> None:
+        self.manager.close()
+
+    def __enter__(self) -> HostedRun:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()

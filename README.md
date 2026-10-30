@@ -89,6 +89,10 @@ The package exports nothing at its top level; a consumer imports each module.
   copy order, and `TRANSIENT_TABLES`.
 - `vestigo.file_modes`: `private_dir`, `private_file`, `narrow`, the modes the
   stores create their directories and files with.
+- `vestigo.checkpoint_files`: the layout of a checkpoint made of files
+  (`file_params`, `manifest_params`, `manifest`, `files_of`, `step_of`,
+  `checked_path`), which `vestigo.torch` writes and a host publishing for a
+  trainer records; it imports no torch.
 - `vestigo.torch` (the `torch` extra): PyTorch checkpoints as releases.
   `Ledger(artifact_dir, *, dsn=None, blobs=None, lease_seconds=60.0,
   writable_seconds=604800.0, signing_key=None, verify_key=None)` (Postgres
@@ -141,6 +145,9 @@ The package exports nothing at its top level; a consumer imports each module.
   scope=, coverage=)` records an `ExportedProgram` as an observed
   implementation (the PT2 archive with its versions and constraints; no
   node changes), `Ledger.observations` lists them.
+  `HostedRun(host)` saves and restores for a trainer whose run another system
+  holds (a Strata cell): the host publishes each checkpoint's files in the
+  layout `Ledger.load` reads.
   [`docs/torch.md`](docs/torch.md) is the guide; [`examples/torch/`](examples/torch/)
   trains, resumes after a crash, branches, runs on two ranks under `torchrun`,
   and gates a signed checkpoint before it ships (with a tamper drill).
