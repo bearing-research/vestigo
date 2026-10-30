@@ -27,7 +27,7 @@ suite runs them too (`tests/test_torch.py`, "The examples").
 | Term | What it is | How you get it |
 | --- | --- | --- |
 | model | a node: the module's class and `state_dict` schema (every key's shape and dtype) under a version you name | `ledger.run(model, ..., version=...)` |
-| program | a node over the model: its loss, optimizer class and defaults, and any config you declare | `ledger.run(..., optimizer, loss=..., config=...)` |
+| program | a node over the model: its loss and settings, optimizer class and defaults, and the config you declare | `ledger.run(..., optimizer, loss=..., config=...)` |
 | execution | one run of a program on concrete inputs (a build), found again by its computation key | `ledger.run(...)` starts one, or resumes the unfinished one |
 | attempt | one process's hold on an execution, with a lease a thread renews | each `ledger.run` |
 | checkpoint | one step's files from every rank, accepted together as one release | `run.save(step, state)` |
@@ -38,6 +38,36 @@ loss, optimizer or config are two programs over one model.
 
 `inputs` maps a role you choose to the data the run trains on. The program, inputs and
 starting release make the computation key, and that key is how a run is found again.
+
+## What goes in `inputs` and `config`
+
+The computation key is a run's identity, so it must hold everything that changes the
+trained weights and nothing else.
+
+- **`inputs`: what the run reads.** Each dataset, tokenizer or pretrained file the
+  training reads, under a role name: a `Path` or a `Remote` when vestigo can read the
+  bytes, a versioned `str` label when it cannot ([Inputs](#inputs)).
+- **`config`: every setting that varies between runs.** Batch size, the learning-rate
+  schedule and the totals it depends on (epochs, warmup steps), the seed,
+  augmentation, gradient clipping and accumulation, precision: whatever comes from the
+  command line, an environment variable or a config file. A constant written in the
+  script is code, which is not hashed: change it and bump `version`.
+- **Recorded for you.** The optimizer's class and `defaults` (`lr`, `weight_decay`,
+  `betas`, ...). The loss: a module by its class, its public attributes and the digest
+  of each tensor in its `state_dict`, so `nn.HuberLoss(delta=2.0)` and
+  `nn.CrossEntropyLoss(weight=...)` are recorded with their arguments; a function or a
+  class by its qualified name; a `functools.partial` with its arguments. A lambda has
+  no name and is refused. A loss module with an attribute that is not JSON raises
+  `TypeError`: register a tensor as a buffer, or pass the loss's name as a `str` and
+  its settings in `config`. Anything the optimizer and loss do not hold, such as a
+  scheduler, goes in `config`.
+- **Left out.** What does not change the weights: logging and checkpoint intervals,
+  `num_workers`, output paths, progress bars.
+
+When unsure, put it in. A setting left out that changes the weights fails silently:
+change it and rerun after a crash, and the run resumes a checkpoint trained under the
+old value and goes on under the new one, one execution in the record. A setting put in
+that changes nothing costs a resume: with another value the run starts fresh.
 
 ## Inputs
 
@@ -50,7 +80,7 @@ inputs = {
     "train": Path("data/train.parquet"),  # a file: pinned to its bytes
     "shards": Path("data/shards/"),  # a directory: pinned to every file in it
     "eval": Remote("s3://bucket/eval/"),  # objects: pinned to their store's names
-    "seed": "seed=1",  # a label, taken as given
+    "vocab": "vocab@v=3",  # a label, taken as given
 }
 ```
 
