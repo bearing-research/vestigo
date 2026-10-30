@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.3.1 - 2026-10-29
+
 ### Added
 
 - `vestigo.torch.HostedRun(host)`: a run whose execution another system holds,
