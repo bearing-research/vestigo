@@ -5,6 +5,17 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `vestigo.torch.HostedRun(host)`: a run whose execution another system holds,
+  such as a Strata cell's server (Investigation 09, T3). `save(step, state)`
+  writes the checkpoint with `torch_checkpointing` into a folder the host
+  gives and the host publishes it; `restore(state)` loads from the folder the
+  host restores. `Host` is the protocol. `vestigo.checkpoint_files` is the
+  layout such a checkpoint is recorded in, torch-free for the host:
+  `Ledger.load` reads a hosted checkpoint, and a hosted run restores one
+  `Ledger.run` wrote (#55).
+
 ## 0.3.0 - 2026-10-29
 
 ### Added

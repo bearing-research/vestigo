@@ -81,7 +81,8 @@ containers on the runner. ty checks `src` only.
 | `provenance` | `TransformSpec`, `compute_provenance_hash`, `derive_subkey` and the labelled output keys |
 | `uris` | the URI grammar and the per-process scheme (`set_uri_scheme`, default `vestigo`) |
 | `tables`, `file_modes` | the tables the ledger owns in copy order; private directory and file modes |
-| `torch` | the PyTorch adapter: model and program nodes, executions as builds, `LedgerStorage` (`torch_checkpointing`'s storage over the ledger: each file a `building` version before its bytes, any blob backend), each checkpoint a release of every rank's report under a manifest, accepted by rank 0 after the barrier under the run's lease, signed when the ledger has a key; `Ledger.configure` a storage that only loads; `Ledger.execution`, `executions`, `resumed_from` and `descendants` read the lineage; `Run.observe` records an `ExportedProgram` beside them, in no node |
+| `checkpoint_files` | the layout of a checkpoint made of files (each file's params, the manifest), torch-free: what `torch` writes and reads and a host publishing for a `HostedRun` records |
+| `torch` | the PyTorch adapter: model and program nodes, executions as builds, `LedgerStorage` (`torch_checkpointing`'s storage over the ledger: each file a `building` version before its bytes, any blob backend), each checkpoint a release of every rank's report under a manifest, accepted by rank 0 after the barrier under the run's lease, signed when the ledger has a key; `Ledger.configure` a storage that only loads; `Ledger.execution`, `executions`, `resumed_from` and `descendants` read the lineage; `Run.observe` records an `ExportedProgram` beside them, in no node; `HostedRun` saves into folders a `Host` (a Strata cell) publishes |
 
 The README's API section is the public surface; keep it in step when a
 module gains an entry point.

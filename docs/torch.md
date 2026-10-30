@@ -435,6 +435,38 @@ ledger = Ledger(
 Each backend needs its extra: `vestigo[torch,postgres,s3]`, or `gcs` or `azure` in
 place of `s3`.
 
+## When another system holds the run
+
+Sometimes the training code runs inside a system that already holds the run's build
+and lease, such as a Strata cell, whose server records every run. The trainer then
+opens no ledger. It hands a `HostedRun` that system's host object instead, and saves
+and restores as a `Run` does:
+
+```python
+from vestigo.torch import HostedRun
+
+with HostedRun(host) as run:
+    state = run.restore({"model": model, "optim": optimizer, "epoch": 0})
+    for epoch in range(state["epoch"] + 1, epochs + 1):
+        ...
+        sequence = run.save(epoch, {"model": model, "optim": optimizer, "epoch": epoch})
+```
+
+A host has two methods (the `Host` protocol):
+
+- `checkpoint_files(step, write)` hands `write` an empty folder, then publishes
+  what `write` left in it as one release and returns the release's sequence.
+- `restore_files()` returns a folder holding the files of the checkpoint the run
+  starts from, or None.
+
+The host records each file as a version whose params name its path and step, plus a
+manifest. That is the layout in `vestigo.checkpoint_files`, which imports no torch,
+and `LedgerStorage` writes its own checkpoints the same way. So `Ledger.load` reads a
+hosted checkpoint as it reads its own, and a hosted run can restore from a checkpoint
+`Ledger.run` wrote. Saves are synchronous and go to local disk first. A hosted run is
+one process. Its checkpoints are unsigned, so a ledger with a verify key refuses
+them.
+
 ## Record an exported program
 
 ```python

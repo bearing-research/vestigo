@@ -37,15 +37,17 @@ from torch import nn
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 
 import vestigo.torch
+from vestigo import checkpoint_files
 from vestigo.blob_store import BlobSettings
 from vestigo.build_store import BuildStore
-from vestigo.provenance import compute_provenance_hash
+from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
-from vestigo.store import ArtifactStore, BuildLeaseLost
+from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
 from vestigo.torch import (
     Attempt,
     Definition,
     Execution,
+    HostedRun,
     InputChanged,
     Ledger,
     LedgerStorage,
@@ -1263,6 +1265,141 @@ def test_a_load_refuses_bytes_that_differ_from_the_release(ledger: Ledger):
     with ledger.branch(trainer.program, release.release_id) as branch:
         with pytest.raises(OSError, match="differs from the checkpoint"):
             Trainer(ledger).restore(branch)
+
+
+# --- Hosted runs ---
+
+
+class _Host:
+    """A host as a Strata cell's server is one: it holds an attempt of an execution and
+    publishes each folder the run writes as one checkpoint release of it, in the layout
+    of ``vestigo.checkpoint_files``; it restores a release by writing its files out."""
+
+    def __init__(self, ledger: Ledger, held: Run, root: Path, restore: str | None = None):
+        self.ledger, self.held, self.root, self.restore = ledger, held, root, restore
+        self.released: list[str] = []
+        self.folders: list[set[str]] = []
+
+    def checkpoint_files(self, step: int, write) -> int:
+        folder = self.root / "checkpoints" / str(len(self.released) + 1)
+        folder.mkdir(parents=True)
+        write(folder)
+        files = {p.relative_to(folder).as_posix(): p.read_bytes() for p in folder.rglob("*")}
+        releases, store = self.ledger.releases, self.ledger.store
+        release = releases.prepare(self.held.execution_id, self.held.attempt, "checkpoint")
+        staged = []
+
+        def put(artifact_id: str, params: dict, data: bytes) -> None:
+            version = store.create_artifact(
+                artifact_id,
+                uuid.uuid4().hex,
+                TransformSpec("host", params, []),
+                release_id=release.release_id,
+            )
+            store.write_blob(artifact_id, version, data)
+            digest = hashlib.sha256(data).hexdigest()
+            staged.append(StagedVersion(artifact_id, version, "", None, len(data), digest))
+
+        for path, data in files.items():
+            put(f"host_{len(staged)}", checkpoint_files.file_params(path, step), data)
+        listed = {
+            path: (len(data), hashlib.sha256(data).hexdigest()) for path, data in files.items()
+        }
+        put(
+            "host_manifest",
+            checkpoint_files.manifest_params(step),
+            checkpoint_files.manifest(step, listed),
+        )
+        releases.accept(release.release_id, staged)
+        self.released.append(release.release_id)
+        self.folders.append(set(files))
+        return len(self.released)
+
+    def restore_files(self) -> Path | None:
+        if self.restore is None:
+            return None
+        folder = self.root / "restore"
+        bundle = self.ledger.releases.bundle(self.restore)
+        for path, version in checkpoint_files.files_of(bundle.outputs).items():
+            (folder / path).parent.mkdir(parents=True, exist_ok=True)
+            (folder / path).write_bytes(self.ledger.store.read_blob(version.id, version.version))
+        return folder
+
+
+def _hosted_restore(trainer: Trainer, run: HostedRun) -> None:
+    state = run.restore(
+        {"model": trainer.model, "optim": trainer.optimizer, "shuffle": None, "step": None}
+    )
+    trainer.shuffle.set_state(state["shuffle"])
+    trainer.step = state["step"]
+
+
+def test_a_hosted_checkpoint_is_one_release_the_ledger_loads(ledger: Ledger, tmp_path: Path):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as held:
+        host = _Host(ledger, held, tmp_path / "run")
+        with HostedRun(host) as run:
+            assert run.restore({"step": 0}) == {"step": 0}
+            trainer.train(run, 2)
+    assert host.folders[1] == {"model_0.pt", "optim_0.pt", "shuffle_0.pt", "step_0.pt"}
+    # The ledger finds it by step, as it finds its own.
+    assert ledger.release_of(held.execution_id, 2).release_id == host.released[1]
+
+    reader = Trainer(ledger)
+    loaded = ledger.load(
+        host.released[1], {"model": reader.model, "optim": reader.optimizer, "step": None}
+    )
+    assert loaded["step"] == 2
+    assert _same(reader.weights(), trainer.weights())
+    assert reader.optimizer.state_dict()["state"][0]["step"] == 2 * 4
+
+
+def test_a_hosted_run_resumes_and_branches_from_either_writer_s_checkpoints(
+    ledger: Ledger, tmp_path: Path
+):
+    expected = _uninterrupted(ledger)
+
+    # Interrupted after step 3 of a hosted run, resumed from its checkpoint.
+    first = Trainer(ledger)
+    with ledger.start(first.program, {"train": "cell"}) as held:
+        host = _Host(ledger, held, tmp_path / "first")
+        with HostedRun(host) as run:
+            first.train(run, 3)
+        resumed = Trainer(ledger)
+        with HostedRun(_Host(ledger, held, tmp_path / "again", host.released[2])) as run:
+            _hosted_restore(resumed, run)
+            assert resumed.step == 3
+            resumed.train(run, STEPS)
+    assert _same(resumed.weights(), expected)
+
+    # Branched from step 2 of a run the ledger's own storage wrote.
+    source = Trainer(ledger)
+    with ledger.start(source.program, {"train": "job"}) as job:
+        source.train(job, 2)
+        branch = Trainer(ledger)
+        host = _Host(ledger, job, tmp_path / "branch", job.release_of(2).release_id)
+        with HostedRun(host) as run:
+            _hosted_restore(branch, run)
+            branch.train(run, STEPS)
+    assert _same(branch.weights(), expected)
+
+
+def test_a_verifying_ledger_refuses_a_hosted_checkpoint(tmp_path: Path):
+    with Ledger(tmp_path / "ledger") as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as held:
+            host = _Host(ledger, held, tmp_path / "run")
+            with HostedRun(host) as run:
+                trainer.train(run, 1)
+    with Ledger(tmp_path / "ledger", verify_key=_keypair()[1]) as reader:
+        with pytest.raises(OSError, match="is not signed"):
+            reader.load(host.released[0], {"model": _model()})
+
+
+def test_a_hosted_run_is_one_process(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(vestigo.torch, "_group", lambda: (0, 2))
+    with pytest.raises(RuntimeError, match="one process"):
+        HostedRun(SimpleNamespace())
 
 
 # --- Signed checkpoints ---
