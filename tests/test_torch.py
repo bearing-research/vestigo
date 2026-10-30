@@ -3010,7 +3010,9 @@ def test_an_archive_without_torch_s_metadata_entries_reads_as_none(tmp_path: Pat
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples" / "torch"
 
 
-def _example(script: str, *args: str, ranks: int = 1) -> subprocess.CompletedProcess[str]:
+def _example(
+    script: str, *args: str, ranks: int = 1, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, str(EXAMPLES / script), *args]
     if ranks > 1:
         with socket.socket() as probe:
@@ -3019,13 +3021,39 @@ def _example(script: str, *args: str, ranks: int = 1) -> subprocess.CompletedPro
         launch = ["-m", "torch.distributed.run", f"--nproc-per-node={ranks}"]
         rendezvous = ["--master-addr=127.0.0.1", f"--master-port={port}"]
         command = [sys.executable, *launch, *rendezvous, *command[1:]]
-    return subprocess.run(command, capture_output=True, text=True, timeout=300)
+    return subprocess.run(command, capture_output=True, text=True, timeout=300, cwd=cwd)
 
 
 def _said(result: subprocess.CompletedProcess[str], pattern: str) -> str:
     match = re.search(pattern, result.stdout)
     assert match is not None, result.stdout + result.stderr
     return match.group(1)
+
+
+def test_the_quick_start_is_the_guide_s_script_and_resumes_to_the_uninterrupted_loss(
+    tmp_path: Path,
+):
+    guide = (EXAMPLES.parent.parent / "docs" / "torch.md").read_text()
+    assert f"```python\n{(EXAMPLES / 'quickstart.py').read_text()}```" in guide
+    stopped_at, whole_at = tmp_path / "stopped", tmp_path / "whole"
+    stopped_at.mkdir()
+    whole_at.mkdir()
+
+    stopped = _example("quickstart.py", "--stop-after=3", cwd=stopped_at)
+    assert stopped.returncode == 1 and "stopped after epoch 3" in stopped.stderr
+    execution = _said(stopped, r"started execution (\w+)")
+    resumed = _example("quickstart.py", cwd=stopped_at)
+    assert resumed.returncode == 0, resumed.stderr
+    assert _said(resumed, r"resumed execution (\w+) after epoch 3") == execution
+    assert "epoch 3:" not in resumed.stdout and "finished in 2 attempt(s)" in resumed.stdout
+
+    whole = _example("quickstart.py", cwd=whole_at)
+    assert whole.returncode == 0, whole.stderr
+    last = r"epoch 6: loss (\S+),"
+    assert _said(resumed, last) == _said(whole, last)
+    # Finished, so the same computation again is a new execution.
+    again = _example("quickstart.py", cwd=stopped_at)
+    assert _said(again, r"started execution (\w+)") != execution
 
 
 def test_keys_replaces_neither_key_of_a_pair(tmp_path: Path):

@@ -1,18 +1,23 @@
 # PyTorch checkpoints in the ledger
 
-`vestigo.torch` makes every checkpoint a PyTorch run saves an accepted release of the
-ledger. Your model and optimizer stay plain PyTorch objects; the run saves them through
-[torch-checkpointing](https://pypi.org/project/torch-checkpointing/), whose
-`CheckpointManager` it builds and closes for you. In return you get:
+`vestigo.torch` keeps a training run's checkpoints in a vestigo ledger. Your model,
+optimizer and training loop stay plain PyTorch: you wrap the loop in `ledger.run` and
+call `run.save` where you would save a checkpoint. In return:
 
-- runs found again by what they compute, resumed after a crash in a new attempt that
-  locks out the old process;
-- branches that start a new run from any accepted checkpoint;
-- named heads, such as the best epoch so far;
-- reads that serve only accepted checkpoints and check every byte against its digest;
-- signed checkpoints that a separate job verifies before it loads or ships them;
-- metadata on SQLite or Postgres, bytes on local disk, S3, GCS or Azure;
-- one checkpoint across every rank of a distributed job.
+- start the same script again after a crash and it picks up from its last checkpoint,
+  with no checkpoint path to pass, and the old process can no longer overwrite it;
+- change the data, the model or a hyperparameter you declare and the run starts fresh
+  instead of resuming a checkpoint trained on something else;
+- start a new run from any checkpoint of any run (a branch), and name checkpoints,
+  such as the best epoch so far;
+- every load checks each file against the digest recorded when it was saved, and with
+  a signing key, a separate job verifies a checkpoint before it loads or ships it;
+- the record lives on SQLite or Postgres, the bytes on local disk, S3, GCS or Azure,
+  and one checkpoint spans every rank of a distributed job.
+
+Checkpoints are written by
+[torch-checkpointing](https://pypi.org/project/torch-checkpointing/), whose
+`CheckpointManager` the run builds and closes for you.
 
 ```bash
 uv add "vestigo[torch]"   # torch and the pinned torch-checkpointing
@@ -22,7 +27,233 @@ uv add "vestigo[torch,sign]"  # and Ed25519 signatures on checkpoints
 The scripts in [`examples/torch/`](../examples/torch/) run everything below, and the
 suite runs them too (`tests/test_torch.py`, "The examples").
 
-## The pieces
+## Quick start
+
+[`examples/torch/quickstart.py`](../examples/torch/quickstart.py) is a complete
+training script:
+
+```python
+"""Train a small model with every epoch a checkpoint in a vestigo ledger.
+
+    uv run python examples/torch/quickstart.py --stop-after 3
+    uv run python examples/torch/quickstart.py
+
+The first command trains three epochs and stops, as a crash would; the second resumes
+after epoch 3 and finishes. The ledger and the training data are written to the
+current directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import torch
+from torch import nn
+
+from vestigo.torch import Ledger
+
+EPOCHS = 6
+BATCH = 32
+DATA = Path("quickstart-data.pt")
+
+
+def make_data(path: Path) -> None:
+    generator = torch.Generator().manual_seed(0)
+    x = torch.randn(512, 4, generator=generator)
+    torch.save((x, x.sum(dim=1, keepdim=True)), path)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    shuffle: torch.Generator,
+) -> float:
+    """One pass over the data in shuffled batches: plain PyTorch, no vestigo."""
+    total = 0.0
+    for batch in torch.randperm(len(x), generator=shuffle).split(BATCH):
+        optimizer.zero_grad()
+        loss = criterion(model(x[batch]), y[batch])
+        loss.backward()
+        optimizer.step()
+        total += loss.item() * len(batch)
+    return total / len(x)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stop-after", type=int, help="stop after this epoch, as a crash")
+    args = parser.parse_args()
+
+    if not DATA.exists():
+        make_data(DATA)
+    x, y = torch.load(DATA)
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    criterion = nn.MSELoss()
+    shuffle = torch.Generator().manual_seed(1)
+
+    with Ledger("ledger") as ledger:
+        with ledger.run(
+            model,
+            optimizer,
+            loss=criterion,
+            version="quickstart-v1",
+            inputs={"train": DATA},
+            config={"batch": BATCH},
+        ) as run:
+            state = run.restore(
+                {"model": model, "optim": optimizer, "shuffle": shuffle.get_state(), "epoch": 0}
+            )
+            shuffle.set_state(state["shuffle"])
+            if run.restores_from is None:
+                print(f"started execution {run.execution_id}")
+            else:
+                print(f"resumed execution {run.execution_id} after epoch {state['epoch']}")
+
+            for epoch in range(state["epoch"] + 1, EPOCHS + 1):
+                loss = train_one_epoch(model, optimizer, criterion, x, y, shuffle)
+                release = run.save(
+                    epoch,
+                    {
+                        "model": model,
+                        "optim": optimizer,
+                        "shuffle": shuffle.get_state(),
+                        "epoch": epoch,
+                    },
+                )
+                print(f"epoch {epoch}: loss {loss:.4f}, checkpoint {release.release_id}")
+                if epoch == args.stop_after:
+                    raise SystemExit(f"stopped after epoch {epoch}; run again to resume")
+
+            run.finish()
+
+        record = ledger.execution(run.execution_id)
+        final = ledger.final_checkpoint(run.execution_id)
+        assert final is not None
+        print(
+            f"finished in {len(record.attempts)} attempt(s); "
+            f"the trained model is checkpoint {final.release_id}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Copy it into an empty directory and run it there twice; it writes `ledger/` and its
+training data to the current directory. The first run stops after epoch 3, as a crash
+would:
+
+```console
+$ python quickstart.py --stop-after 3
+started execution c884d339d23045eba813a36fc3c8a4f4
+epoch 1: loss 2.5691, checkpoint e9a27c13c3214110bfaeddbd915270c6
+epoch 2: loss 0.6124, checkpoint a3815ec25912442db76445f5f64c1525
+epoch 3: loss 0.1102, checkpoint 9dbdbd474e404a6e8bf7c2dda8b0649f
+stopped after epoch 3; run again to resume
+$ python quickstart.py
+resumed execution c884d339d23045eba813a36fc3c8a4f4 after epoch 3
+epoch 4: loss 0.0508, checkpoint ff164f82e62e4ef6ae9f2aac5798e55c
+epoch 5: loss 0.0305, checkpoint 251b4ec1893f47f5baf35cb2471d6482
+epoch 6: loss 0.0244, checkpoint 671fe1c8680046b39ad637d830c1a905
+finished in 2 attempt(s); the trained model is checkpoint 671fe1c8680046b39ad637d830c1a905
+```
+
+The resumed run ends on the loss a run that never stopped ends on, because the
+checkpoint holds everything the loop needs to go on: the model, the optimizer, the
+shuffling generator and the epoch. Ctrl+C in place of `--stop-after` works the same
+way; the epoch it interrupts is trained again.
+
+### What each call does
+
+**`Ledger("ledger")`** opens the ledger in the directory `ledger/`, creating it on
+first use: a SQLite database for the record and the checkpoint files beside it. There
+is nothing else to set up. [Where the ledger lives](#where-the-ledger-lives) moves it
+to Postgres and an object store.
+
+**`ledger.run(...)`** decides which run this process is. It does not train, call the
+loss or touch the weights. It first works out the *computation*: the model (its class
+and every weight's shape and dtype, under the `version` you name), the program (the loss, the
+optimizer's class and settings, and `config`) and the inputs (the training file, by
+the digest of its bytes). Your code is not part of it: when you change what the loop
+does, change `version`. Then it looks the computation up in the ledger:
+
+| The ledger holds, for this computation | `ledger.run` | `run.restores_from` |
+| --- | --- | --- |
+| nothing | starts a new execution | None |
+| an unfinished execution: its process stopped or crashed, or was killed over `lease_seconds` ago | resumes it in a new attempt, from its latest checkpoint | that checkpoint's release id |
+| only finished executions | starts a new execution | None |
+| an unfinished execution whose lease is live: its process is still running, or was killed under `lease_seconds` ago | raises `ValueError` | |
+
+While the block runs, the run holds the execution with a lease that a background
+thread renews, so no other process can save to it. That is why the same script trains
+from scratch the first time and carries on after a crash. It is also why a change to
+the data, the batch size or the model's shape starts fresh: that is another
+computation. [What goes in `inputs` and `config`](#what-goes-in-inputs-and-config)
+says what belongs in it.
+
+**`run.restore(state)`** gives the loop its starting point. `state` holds the objects
+to load and a default for every other value. On a fresh start it returns `state` as
+given. On a resume it loads each module, optimizer or scheduler in place from the
+checkpoint, and replaces each other value (`epoch`, the generator state) with the
+saved one. Either way the loop starts at `state["epoch"] + 1`. Only the keys you pass
+are read, so a fine-tune can restore `{"model": model}` alone; a key the checkpoint
+never saved raises `FileNotFoundError`.
+
+**`train_one_epoch`** is ordinary PyTorch. vestigo has no part in it: no hooks and no
+wrapped modules. `loss=criterion` only records which loss the program uses; vestigo
+never calls it.
+
+**`run.save(epoch, state)`** writes a checkpoint: each module, optimizer or scheduler
+by its `state_dict`, each other value as it is. Save everything the loop needs to go
+on exactly; without the generator state, a resumed run would shuffle differently. It
+returns the checkpoint as an accepted release, and `release.release_id` is how you
+load it, branch from it or name it later. A save from a process that has lost the
+execution (another process resumed it) raises `ReleaseRejected`.
+
+**Leaving the block without `run.finish()`** (an exception, `SystemExit`, Ctrl+C)
+closes the run. It waits for the save in flight, keeps every checkpoint and drops the
+lease, so the next start resumes at once. A process killed outright cannot drop its
+lease, and the next start waits until it lapses, 60 seconds by default ([Resume after
+a crash](#resume-after-a-crash)).
+
+**`run.finish()`** ends the execution: nothing resumes it, and the checkpoint it ended
+on stays. Run the script a third time and it trains from scratch as a new execution;
+the finished one stays in the ledger.
+
+**`ledger.execution(...)` and `ledger.final_checkpoint(...)`** read back what the
+ledger recorded: here two attempts of one execution, and the checkpoint it finished on.
+[Lineage](#lineage) has the rest of the record.
+
+### Use the trained model
+
+Load a checkpoint into a new model, in another script and with no run:
+
+```python
+model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 1))
+with Ledger("ledger") as ledger:
+    ledger.load(release_id, {"model": model})
+```
+
+`release_id` is one that `run.save` returned. To find a checkpoint by a name of your
+own instead, point a head at it in the loop, `run.set_head("quickstart/best",
+release.release_id)`, and read it back with `ledger.releases.reference(
+"quickstart/best")`, which returns `(release_id, revision)` ([Heads](#heads)).
+
+[`train.py`](../examples/torch/train.py) is the same loop with the rest of this guide
+added: a best-epoch head, keeping only the latest checkpoints, an exported forward
+pass, derived evaluation metrics and signing. `branch.py`, `distributed.py` and
+`evaluate.py` start from what it leaves.
+
+## How it fits together
+
+The terms the quick start uses, and what each one is:
 
 | Term | What it is | How you get it |
 | --- | --- | --- |
@@ -142,48 +373,13 @@ overwritten data without warning; pass it as a `Remote`.
 The role names are yours. Renaming one changes the key, and the next run starts
 fresh.
 
-## Train and checkpoint
+## Explicit steps
 
-```python
-from vestigo.torch import Ledger
-
-with Ledger("ledger") as ledger:
-    with ledger.run(
-        model,
-        optimizer,
-        loss=nn.MSELoss(),
-        version="regression-v1",
-        inputs={"train": Path("data/regression.pt")},
-        config={"batch": 32},
-    ) as run:
-        state = run.restore({"model": model, "optim": optimizer, "epoch": 0})
-        for epoch in range(state["epoch"] + 1, epochs + 1):
-            train_one_epoch()
-            run.save(epoch, {"model": model, "optim": optimizer, "epoch": epoch})
-        run.finish()
-```
-
-`ledger.run` defines the model and program nodes, then resumes this computation's
-unfinished execution if there is one, and starts a new one if not. The same script
-therefore trains from scratch the first time and carries on after a crash.
-
-`run.save(step, state)` saves each module, optimizer or scheduler in `state` by its
-`state_dict`, and anything else as it is. A synchronous save returns the accepted
-release. `run.restore(state)` is its mirror. Each object is loaded in place and
-returned as itself, and each other value is a default that the saved one replaces. On
-a fresh start it returns `state` as given. Only the keys you pass are read, so a
-fine-tune can restore `{"model": model}` alone; a key the checkpoint never saved
-raises `FileNotFoundError`.
-
-Use the run as a context manager. Leaving the block closes it: it waits for the save
-in flight, then drops its lease. `finish()` also waits for that save, then ends the
-execution. A block left without `finish()` (an exception, `SystemExit`, a `break` on
-preemption) keeps the execution resumable.
-
-For explicit control, `ledger.define_model` and `ledger.define_program` return the
-nodes. `ledger.find(program, inputs)`, `ledger.start(program, inputs)` and
-`ledger.resume(execution, inputs=inputs)` are the three steps `run` takes. An execution
-with a `Path` input resumes only with its inputs, which must be its own.
+`ledger.run` is three steps, which you can take yourself: `ledger.define_model` and
+`ledger.define_program` return the nodes, then `ledger.find(program, inputs)` finds the
+unfinished execution, `ledger.start(program, inputs)` starts one, and
+`ledger.resume(execution, inputs=inputs)` resumes one. An execution with a `Path`
+input resumes only with its inputs, which must be its own.
 
 ## Resume after a crash
 
