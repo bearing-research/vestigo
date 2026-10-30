@@ -5,6 +5,12 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `docs/torch.md` opens with a quick start: `examples/torch/quickstart.py`, a
+  complete training script run twice (stopped, then resumed), and what each call
+  does; the suite checks the guide's copy is the script (#PR).
+
 ### Changed
 
 - `vestigo.torch` records a loss module's public attributes and the digest of

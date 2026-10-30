@@ -148,7 +148,8 @@ The package exports nothing at its top level; a consumer imports each module.
   `HostedRun(host)` saves and restores for a trainer whose run another system
   holds (a Strata cell): the host publishes each checkpoint's files in the
   layout `Ledger.load` reads.
-  [`docs/torch.md`](docs/torch.md) is the guide; [`examples/torch/`](examples/torch/)
+  [`docs/torch.md`](docs/torch.md) is the guide, opening with a quick start
+  (`examples/torch/quickstart.py`); [`examples/torch/`](examples/torch/) also
   trains, resumes after a crash, branches, runs on two ranks under `torchrun`,
   and gates a signed checkpoint before it ships (with a tamper drill).
 
