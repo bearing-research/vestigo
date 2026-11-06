@@ -1017,6 +1017,40 @@ class TestAzureBackendOverAFakeClient:
         assert store.blob_exists("artifact-1", 1) is False
         assert store.delete_blob("artifact-1", 1) is False
 
+    def test_a_directory_of_a_hierarchical_namespace_is_no_object(self, tmp_path: Path):
+        """ADLS Gen2 lists a directory as a zero-length blob marked in its metadata."""
+
+        def props(name: str, size: int, metadata: dict[str, str] | None):
+            return SimpleNamespace(
+                name=name,
+                size=size,
+                etag='"e"',
+                metadata=metadata,
+                content_settings=SimpleNamespace(content_md5=None),
+            )
+
+        stored = [
+            ("data/dir", 0, {"hdi_isfolder": "true"}),
+            ("data/dir/file.bin", 4, {}),
+            ("data/empty.bin", 0, {}),
+        ]
+
+        def list_blobs(name_starts_with: str, include=()):
+            # As the SDK: metadata only when asked for.
+            return [
+                props(name, size, metadata if "metadata" in include else None)
+                for name, size, metadata in stored
+                if name.startswith(name_starts_with)
+            ]
+
+        store = self._store(tmp_path)
+        store._client.list_blobs = list_blobs
+
+        assert store.objects("data/") == [
+            ("data/dir/file.bin", 4, "etag:e"),
+            ("data/empty.bin", 0, "etag:e"),
+        ]
+
     def test_a_failed_writer_uploads_nothing(self, tmp_path: Path):
         store = self._store(tmp_path)
 

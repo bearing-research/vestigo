@@ -215,6 +215,27 @@ class TestArtifactCRUD:
         assert v2 == 2
         assert v3 == 3
 
+    @pytest.mark.parametrize(
+        ("artifact_id", "refusal"),
+        [
+            ("a/b", "cannot name a path"),
+            ("a\\b", "cannot name a path"),
+            ("..", "cannot name a path"),
+            # "x"'s build attempt writes its bytes under this id.
+            ("x~" + "0" * 32, "an attempt id"),
+            ("x@v=1", "'@v='"),
+            ("", "is required"),
+        ],
+    )
+    def test_an_id_no_blob_key_can_hold_is_refused_before_a_row(self, store, artifact_id, refusal):
+        with pytest.raises(ValueError, match=refusal):
+            store.create_artifact(artifact_id, "hash1")
+        assert store.list_artifacts() == []
+
+    def test_an_id_with_a_tilde_short_of_an_attempt_is_an_id(self, store):
+        for artifact_id in ("x~" + "0" * 15, "x~" + "A" * 32, "x~" + "0" * 32 + "y"):
+            assert store.create_artifact(artifact_id, f"hash-{artifact_id}") == 1
+
     def test_create_with_transform_spec(self, store):
         spec = TransformSpec(
             executor="local://duckdb_sql@v1",
@@ -646,6 +667,53 @@ class TestExcludeIdPrefix:
             "b_y",
             "100x",
         }
+
+    def test_every_prefix_filter_is_exact_about_case(self, store):
+        # SQLite's LIKE folds ASCII case; Postgres's does not.
+        for artifact_id in ("run_a", "Run_b", "RUN_c", "keep"):
+            store.set_name(f"shelf/{artifact_id}", artifact_id, self._ready(store, artifact_id))
+        store.set_name("Shelf/other", "keep", 1)
+
+        assert {v.id for v in store.list_artifacts(exclude_id_prefix="run_")} == {
+            "Run_b",
+            "RUN_c",
+            "keep",
+        }
+        assert store.stats(exclude_id_prefix="run_")["total_versions"] == 3
+        assert [v.id for v in store.list_latest_by_id_prefix("run_")] == ["run_a"]
+        assert [v.id for v in store.list_versions_by_id_prefix("Run_")] == ["Run_b"]
+        assert {v.id for v in store.list_artifacts(name_prefix="shelf/")} == {
+            "run_a",
+            "Run_b",
+            "RUN_c",
+            "keep",
+        }
+        assert [v.id for v in store.list_artifacts(name_prefix="Shelf/")] == ["keep"]
+
+    def test_an_empty_prefix_excludes_nothing_and_lists_nothing(self, store):
+        self._ready(store, "keep")
+
+        assert [v.id for v in store.list_artifacts(exclude_id_prefix="")] == ["keep"]
+        assert store.stats(exclude_id_prefix="")["total_versions"] == 1
+        for listing in (store.list_versions_by_id_prefix, store.list_latest_by_id_prefix):
+            with pytest.raises(ValueError, match="prefix is required"):
+                listing("")
+
+    def test_the_bytes_an_included_copy_reads_from_an_excluded_one_are_counted(self, store):
+        for artifact_id in ("book_holder", "copy", "other_copy"):
+            version = store.create_artifact(artifact_id, "same-hash")
+            store.finalize_artifact(artifact_id, version, "{}", 1, 100)
+        assert store.get_artifact("copy", 1).state == "superseded"
+
+        assert store.stats(exclude_id_prefix="book_")["total_bytes"] == 100
+        assert store.stats(exclude_id_prefix="copy")["total_bytes"] == 100
+        assert store.stats(tenant="t", exclude_id_prefix="book_")["total_bytes"] == 100
+        assert (
+            store.stats(tenant="t", include_tenantless=False, exclude_id_prefix="book_")[
+                "total_bytes"
+            ]
+            == 0
+        )
 
     def test_a_name_filter_leaves_them_out_too(self, store):
         for artifact_id in ("result", "book_1"):
@@ -1221,6 +1289,31 @@ class TestZombieSweep:
         swept = store.sweep_zombie_builds(max_age_seconds=0)
         assert swept == 0
         assert store.get_artifact("done", 1).state == "ready"
+
+    def test_a_build_with_a_live_lease_keeps_its_rows(self, store):
+        """A run outlasts the cutoff: its target, staged outputs and reports are its own."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        build_id, key = "b1", "computation-1"
+        target = store.create_artifact("run", "prov-run", computation_key=key)
+        builds.create_build(build_id, "run", target, executor_ref="x", computation_key=key)
+        assert builds.open_attempt(
+            build_id,
+            "a1",
+            writable_until=time.time() + 3600,
+            lease_owner="me",
+            lease_duration_seconds=600,
+        )
+        release = releases.prepare(build_id, "a1", "checkpoint")
+        store.create_artifact("staged", "prov-staged", release_id=release.release_id)
+        store.create_artifact("report", "prov-report", computation_key=key)
+        store.create_artifact("stray", "prov-stray")
+
+        assert store.sweep_zombie_builds(max_age_seconds=0) == 1
+        assert {v.id for v in store.list_artifacts(state="building")} == {"run", "staged", "report"}
+
+        assert builds.lapse_lease(build_id, "me")
+        assert store.sweep_zombie_builds(max_age_seconds=0) == 3
 
 
 class TestVerifyArtifacts:
@@ -2517,6 +2610,22 @@ class TestWholeStoreReads:
         assert {d.id for d, _ in store.find_dependents("up", 1)} == {"mine", "theirs"}
         assert [d.id for d, _ in store.find_dependents("up", 1, tenant=None)] == ["mine"]
         assert [d.id for d, _ in store.find_dependents("up", 1, tenant="acme")] == ["theirs"]
+
+    def test_find_dependents_is_exact_about_case(self, backend_store):
+        # SQLite's LIKE folds ASCII case; Postgres's does not.
+        for artifact_id in ("up", "UP"):
+            _make_ready_artifact(backend_store, artifact_id, f"prov-{artifact_id}")
+        for artifact_id, read in (("reads-up", "up@v=1"), ("reads-UP", "UP@v=1")):
+            version = backend_store.create_artifact(
+                artifact_id, f"prov-{artifact_id}", input_versions={f"in-{read}": read}
+            )
+            backend_store.finalize_artifact(artifact_id, version, "{}", 1, 10)
+
+        for upstream in ("up", "UP"):
+            dependents = backend_store.find_dependents(upstream, 1)
+            assert [(d.id, used) for d, used in dependents] == [
+                (f"reads-{upstream}", f"{upstream}@v=1")
+            ]
 
     def test_list_name_reads(self, store):
         self._seed(store)

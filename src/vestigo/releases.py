@@ -469,8 +469,9 @@ class ReleaseStore:
 
         Raises:
             ValueError: the build is not pending or building, another attempt's lease
-                on it is still live, or ``from_release`` is not an accepted release
-                of it.
+                on it is still live, *attempt* is one whose lease lapsed or that was
+                taken over (a resume needs a new attempt id), or ``from_release`` is
+                not an accepted release of it.
         """
         conn = self._connect()
         try:
@@ -500,7 +501,8 @@ class ReleaseStore:
             ):
                 conn.rollback()
                 raise ValueError(
-                    f"build {build_id} is not active, or another attempt's lease on it is live"
+                    f"build {build_id} is not active, another attempt's lease on it is live, "
+                    f"or attempt {attempt} lapsed or was taken over: resume in a new attempt"
                 )
             conn.commit()
             return int(unsettled)

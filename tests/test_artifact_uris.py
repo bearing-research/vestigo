@@ -86,7 +86,7 @@ class TestUriScheme:
 
     @pytest.mark.parametrize(
         "artifact_id",
-        ["abc", "nb_42_cell_x-1", "team/report.v2", "a@b", "@", "x@iter=3", "x@variant=a"],
+        ["abc", "nb_42_cell_x-1", "team/report.v2", "a@b", "@", "x@iter=3", "x@variant=a", "a\nb"],
     )
     def test_a_written_uri_reads_back(self, artifact_id):
         assert parse_artifact_uri(uris.artifact_uri(artifact_id, 7)) == (artifact_id, 7)
@@ -97,6 +97,13 @@ class TestUriScheme:
 
     def test_an_unpinned_uri_holding_a_bad_version_is_no_artifact(self):
         assert parse_artifact_uri("vestigo://artifact/x@v=abc") is None
+
+    def test_a_trailing_newline_is_no_part_of_any_uri(self):
+        # ``$`` matches before a final newline.
+        assert parse_artifact_uri("vestigo://artifact/x@v=1\n") is None
+        assert parse_name_uri("vestigo://name/x\n") == "x\n"
+        with pytest.raises(ValueError, match="not a URI scheme"):
+            uris.set_uri_scheme("strata\n")
 
     def test_the_default_is_vestigo(self):
         assert uris.uri_scheme() == "vestigo"

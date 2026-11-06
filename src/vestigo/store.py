@@ -9,6 +9,7 @@ deduplicate by provenance hash: at most one ready row per
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import logging
 import re
@@ -90,18 +91,22 @@ def _reject_unaddressable_id(artifact_id: str) -> None:
 
 
 def reject_unsafe_artifact_id(artifact_id: str) -> None:
-    """Refuse an id from another store that would name a path, or that no reference can name.
+    """Refuse an id that would name a path or another id's blob, or that no reference can name.
 
     An id becomes a blob key, so a separator or ``..`` segment would write outside
-    the blob store. Ids this store generates never contain either; imported ids
-    (snapshot bundles, ``POST /v1/artifacts/import``) must be checked.
+    the blob store, and a ``~<attempt>`` ending is the key :func:`attempt_blob_id`
+    gives another id's build attempt. :meth:`ArtifactStore.create_artifact` and every
+    import check it.
     """
     _reject_unaddressable_id(artifact_id)
     if "/" in artifact_id or "\\" in artifact_id or ".." in Path(artifact_id).parts:
         raise ValueError(f"an artifact id cannot name a path: {artifact_id!r}")
+    if _ATTEMPT_SUFFIX.search(artifact_id):
+        raise ValueError(f"an artifact id cannot end in '~' and an attempt id: {artifact_id!r}")
 
 
 _ATTEMPT_PATTERN = re.compile(r"[0-9a-f]{16,64}")
+_ATTEMPT_SUFFIX = re.compile(r"~[0-9a-f]{16,64}\Z")
 
 
 def attempt_blob_id(artifact_id: str, attempt: str) -> str:
@@ -165,6 +170,58 @@ def _split_ref(ref: str) -> tuple[str, int]:
     return artifact_id, int(version)
 
 
+def _deletion_order(
+    chosen: Mapping[tuple[str, int], Any],
+    edges: Collection[tuple[tuple[str, int], tuple[str, int]]],
+) -> list[Any]:
+    """*chosen*'s rows, each after every chosen row the sweep's claim needs gone first.
+
+    A pointer before its canonical, a requirer before what it requires (*edges*, from
+    requirer to required), an id's lower versions before its higher ones; so a chain of
+    any depth goes in one sweep. Ties go by requirement, pointer, version. A cycle, which
+    no claim can take, comes last.
+    """
+    required = {to for _, to in edges}
+
+    def rank(key: tuple[str, int]) -> tuple[bool, bool, int, str]:
+        return (key in required, chosen[key]["superseded_by"] is None, key[1], key[0])
+
+    before: dict[tuple[str, int], set[tuple[str, int]]] = {key: set() for key in chosen}
+    for requirer, needed in edges:
+        if requirer in before and needed in before and requirer != needed:
+            before[needed].add(requirer)
+    versions: dict[str, list[int]] = {}
+    for artifact_id, version in chosen:
+        versions.setdefault(artifact_id, []).append(version)
+    for artifact_id, numbers in versions.items():
+        numbers.sort()
+        for lower, higher in zip(numbers, numbers[1:], strict=False):
+            before[(artifact_id, higher)].add((artifact_id, lower))
+    for key, row in chosen.items():
+        if row["superseded_by"]:
+            canonical = _split_ref(row["superseded_by"])
+            if canonical in before and canonical != key:
+                before[canonical].add(key)
+
+    after: dict[tuple[str, int], list[tuple[str, int]]] = {key: [] for key in chosen}
+    for key, firsts in before.items():
+        for first in firsts:
+            after[first].append(key)
+    waiting = {key: len(firsts) for key, firsts in before.items()}
+    ready = [(rank(key), key) for key, count in waiting.items() if count == 0]
+    heapq.heapify(ready)
+    ordered: list[tuple[str, int]] = []
+    while ready:
+        _, key = heapq.heappop(ready)
+        ordered.append(key)
+        for later in after[key]:
+            waiting[later] -= 1
+            if waiting[later] == 0:
+                heapq.heappush(ready, (rank(later), later))
+    ordered += sorted((key for key, count in waiting.items() if count), key=rank)
+    return [chosen[key] for key in ordered]
+
+
 def _declared_content_type(transform_spec: str | None) -> str:
     """The ``content_type`` a version's transform params declare, or ``""`` for none."""
     spec = parse_transform_spec(transform_spec)
@@ -179,6 +236,14 @@ _RESULT_STATES = ("ready", "superseded")
 def _like_literal(text: str) -> str:
     """``text`` escaped for ``LIKE ... ESCAPE '\\'``: its ``_`` and ``%`` match only themselves."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _starts_with(column: str) -> str:
+    """SQL true when *column* starts with the next two parameters, both the prefix.
+
+    Exact and case-sensitive on both backends, where SQLite's ``LIKE`` ignores ASCII case.
+    """
+    return f"substr({column}, 1, length(?)) = ?"
 
 
 @dataclass(frozen=True)
@@ -1405,9 +1470,10 @@ class ArtifactStore:
 
         Raises:
             ArtifactIdTaken: If a version of ``artifact_id`` belongs to another tenant.
-            ValueError: If ``artifact_id`` is empty or contains ``@``.
+            ValueError: If ``artifact_id`` is empty, holds ``@v=``, ``/`` or ``\\``, is
+                ``..``, or ends as an attempt's blob id does (:func:`reject_unsafe_artifact_id`).
         """
-        _reject_unaddressable_id(artifact_id)
+        reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
             # Serialize writers so the MAX(version)+1 read can't race a concurrent create for the
@@ -1565,8 +1631,8 @@ class ArtifactStore:
             params: tuple[str, ...] = ()
             if executor is not None:
                 prefix = json.dumps({"executor": executor})[:-1] + ","
-                sql += " AND transform_spec LIKE ? ESCAPE '\\'"
-                params = (_like_literal(prefix) + "%",)
+                sql += f" AND {_starts_with('transform_spec')}"
+                params = (prefix, prefix)
             rows = conn.execute(sql + " ORDER BY created_at, id, version", params).fetchall()
         finally:
             conn.close()
@@ -2856,20 +2922,23 @@ class ArtifactStore:
             conn.close()
 
     def list_versions_by_id_prefix(self, prefix: str) -> list[ArtifactVersion]:
-        """Every version, in any state, of each artifact whose id starts with ``prefix``."""
+        """Every version, in any state, of each artifact whose id starts with ``prefix``.
+
+        Raises:
+            ValueError: If ``prefix`` is empty, which would list the whole store.
+        """
         if not prefix:
-            return []
-        like_pattern = _like_literal(prefix) + "%"
+            raise ValueError("an id prefix is required")
         conn = self._get_connection()
         try:
             rows = conn.execute(
                 f"""
                 SELECT {_VERSION_COLUMNS}
                 FROM artifact_versions
-                WHERE id LIKE ? ESCAPE '\\'
+                WHERE {_starts_with("id")}
                 ORDER BY id, version
                 """,
-                (like_pattern,),
+                (prefix, prefix),
             ).fetchall()
         finally:
             conn.close()
@@ -2880,22 +2949,23 @@ class ArtifactStore:
 
         Current as in :meth:`get_latest_version`. Sorted by id, so callers can parse a
         numeric suffix such as a loop cell's ``@iter=<k>`` in order.
+
+        Raises:
+            ValueError: If ``prefix`` is empty, which would list the whole store.
         """
         if not prefix:
-            return []
-
-        like_pattern = _like_literal(prefix) + "%"
+            raise ValueError("an id prefix is required")
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT id, MAX(version) AS max_version
                 FROM artifact_versions
-                WHERE id LIKE ? ESCAPE '\\' AND state IN ('ready', 'superseded')
+                WHERE {_starts_with("id")} AND state IN ('ready', 'superseded')
                 GROUP BY id
                 ORDER BY id
                 """,
-                (like_pattern,),
+                (prefix, prefix),
             )
             rows = cursor.fetchall()
             results: list[ArtifactVersion] = []
@@ -4494,8 +4564,8 @@ class ArtifactStore:
         callers pass the caller's tenant (``None`` for the default tenant).
         """
         # Inputs are recorded as "artifact_id@v=N" or as the full URI.
-        search_pattern = _like_literal(f'"{artifact_id}@v={version}"')
-        uri_pattern = _like_literal(f'"{uris.artifact_uri(artifact_id, version)}"')
+        quoted = (f'"{artifact_id}@v={version}"', f'"{uris.artifact_uri(artifact_id, version)}"')
+        search_pattern, uri_pattern = (_like_literal(text) for text in quoted)
 
         conn = self._get_connection()
         try:
@@ -4529,6 +4599,9 @@ class ArtifactStore:
 
             results = []
             for row in cursor.fetchall():
+                # LIKE folds ASCII case on SQLite: "A@v=1" is no input of "a@v=1".
+                if not any(text in row["input_versions"] for text in quoted):
+                    continue
                 artifact = _version_from_row(row)
 
                 input_version_used = f"{artifact_id}@v={version}"
@@ -4627,7 +4700,8 @@ class ArtifactStore:
         by name. ``since`` is an epoch timestamp. ``sort`` is ``created_at``,
         ``byte_size`` or ``row_count`` (anything else means ``created_at``).
         ``exclude_id_prefix`` leaves out every version whose id starts with it, such as
-        a consumer's bookkeeping rows, before the page is cut.
+        a consumer's bookkeeping rows, before the page is cut; ``""`` leaves out nothing.
+        Both prefixes compare exactly, case included, on every backend.
         """
         sort_col = self._SORT_COLUMNS.get(sort, "created_at")
         order_sql = "ASC" if str(order).lower() == "asc" else "DESC"
@@ -4639,9 +4713,9 @@ class ArtifactStore:
                     FROM artifact_versions av
                     INNER JOIN artifact_names an
                         ON av.id = an.artifact_id AND av.version = an.version
-                    WHERE an.name LIKE ? ESCAPE '\\'
+                    WHERE {_starts_with("an.name")}
                 """
-                params: list = [_like_literal(name_prefix) + "%"]
+                params: list = [name_prefix, name_prefix]
 
                 if tenant is not None:
                     query += " AND (av.tenant = ? OR av.tenant = '' OR av.tenant IS NULL)"
@@ -4657,9 +4731,9 @@ class ArtifactStore:
                     query += " AND av.created_at >= ?"
                     params.append(since)
 
-                if exclude_id_prefix is not None:
-                    query += " AND av.id NOT LIKE ? ESCAPE '\\'"
-                    params.append(_like_literal(exclude_id_prefix) + "%")
+                if exclude_id_prefix:
+                    query += f" AND NOT {_starts_with('av.id')}"
+                    params.extend([exclude_id_prefix, exclude_id_prefix])
 
                 query += f" ORDER BY av.{sort_col} {order_sql} LIMIT ? OFFSET ?"
                 params.extend([limit, offset])
@@ -4680,9 +4754,9 @@ class ArtifactStore:
                 if since is not None:
                     conditions.append("created_at >= ?")
                     params.append(since)
-                if exclude_id_prefix is not None:
-                    conditions.append("id NOT LIKE ? ESCAPE '\\'")
-                    params.append(_like_literal(exclude_id_prefix) + "%")
+                if exclude_id_prefix:
+                    conditions.append(f"NOT {_starts_with('id')}")
+                    params.extend([exclude_id_prefix, exclude_id_prefix])
 
                 if conditions:
                     query += " WHERE " + " AND ".join(conditions)
@@ -5390,18 +5464,17 @@ class ArtifactStore:
             # folder files after their manifests, so a file goes only once its folders did;
             # an id's lower versions before its top, which goes only once they did. A failed
             # file is in no folder, but the claim below still sees its manifest's edge.
-            required = {
-                (row["to_artifact_id"], row["to_version"])
-                for row in conn.execute("SELECT to_artifact_id, to_version FROM retention_edges")
-            }
-            ordered = sorted(
-                chosen.values(),
-                key=lambda r: (
-                    (r["id"], r["version"]) in required,
-                    r["superseded_by"] is None,
-                    r["version"],
-                ),
-            )
+            edges = [
+                (
+                    (row["from_artifact_id"], row["from_version"]),
+                    (row["to_artifact_id"], row["to_version"]),
+                )
+                for row in conn.execute(
+                    "SELECT from_artifact_id, from_version, to_artifact_id, to_version "
+                    "FROM retention_edges"
+                )
+            ]
+            ordered = _deletion_order(chosen, edges)
             stayed: set[tuple[str, int]] = set()
             for position, row in enumerate(ordered):
                 # Committed in batches: one transaction over a large sweep holds SQLite's write
@@ -5758,20 +5831,37 @@ class ArtifactStore:
     def sweep_zombie_builds(self, max_age_seconds: float = 3600) -> int:
         """Mark ``building`` artifacts older than ``max_age_seconds`` as failed; return the count.
 
-        It demotes every old enough ``building`` row unconditionally, which is safe
-        only where no live writer holds one that long: a server before its build
-        runner accepts work, or a notebook's own store.
+        A row a build with a live lease may still write is spared: the build's target,
+        its releases' outputs, and every row of its computation (``computation_key``).
+        Any other old enough ``building`` row is demoted, which is safe only where no
+        writer without a lease holds one that long: a server before its build runner
+        accepts work, or a notebook's own store.
         """
         conn = self._get_connection()
         try:
-            cutoff = time.time() - max_age_seconds
-            cursor = conn.execute(
+            now = time.time()
+            spared = ""
+            params: list[float] = [now - max_age_seconds]
+            # A long run's placeholder and staged files are older than any cutoff.
+            if self._dialect.column_exists(conn, "artifact_builds", "computation_key"):
+                spared = """
+                  AND NOT EXISTS (
+                      SELECT 1 FROM artifact_builds b
+                      WHERE b.state = 'building' AND b.lease_expires_at >= ?
+                        AND ((b.artifact_id = artifact_versions.id
+                              AND b.version = artifact_versions.version)
+                             OR b.computation_key = artifact_versions.computation_key
+                             OR b.build_id IN (SELECT r.build_id FROM build_releases r
+                                               WHERE r.release_id = artifact_versions.release_id)))
                 """
+                params.append(now)
+            cursor = conn.execute(
+                f"""
                 UPDATE artifact_versions
                 SET state = 'failed'
-                WHERE state = 'building' AND created_at < ?
+                WHERE state = 'building' AND created_at < ?{spared}
                 """,
-                (cutoff,),
+                params,
             )
             conn.commit()
             return cursor.rowcount
@@ -5959,8 +6049,10 @@ class ArtifactStore:
     ) -> dict:
         """Get artifact store statistics; ``include_tenantless`` as for :meth:`get_usage`.
 
-        ``exclude_id_prefix`` leaves versions out of the version and byte totals as
-        :meth:`list_artifacts` does; ``name_count`` still counts every name.
+        ``exclude_id_prefix`` leaves versions out of the version totals as
+        :meth:`list_artifacts` does; ``total_bytes`` still counts an excluded
+        version's bytes when an included one reads them (``superseded_by``), once.
+        ``name_count`` still counts every name.
         """
         conn = self._get_connection()
         try:
@@ -5977,23 +6069,48 @@ class ArtifactStore:
                     COALESCE(SUM(CASE WHEN state = 'ready' THEN row_count END), 0) as total_rows
                 FROM artifact_versions
             """
+
+            def in_tenant(alias: str) -> str:
+                column = f"{alias}tenant"
+                if include_tenantless:
+                    return f"({column} = ? OR {column} = '' OR {column} IS NULL)"
+                return f"{column} = ?"
+
             stats_params: list[str] = []
             conditions: list[str] = []
             if tenant is not None:
-                conditions.append(
-                    "(tenant = ? OR tenant = '' OR tenant IS NULL)"
-                    if include_tenantless
-                    else "tenant = ?"
-                )
+                conditions.append(in_tenant(""))
                 stats_params.append(tenant)
-            if exclude_id_prefix is not None:
-                conditions.append("id NOT LIKE ? ESCAPE '\\'")
-                stats_params.append(_like_literal(exclude_id_prefix) + "%")
+            if exclude_id_prefix:
+                conditions.append(f"NOT {_starts_with('id')}")
+                stats_params.extend([exclude_id_prefix, exclude_id_prefix])
             if conditions:
                 stats_query += " WHERE " + " AND ".join(conditions)
 
             cursor = conn.execute(stats_query, stats_params)
             row = cursor.fetchone()
+            total_bytes = row["total_bytes"]
+            if exclude_id_prefix:
+                # An included pointer reads its canonical's bytes, which may be excluded.
+                scoped = tenant is not None
+                held = conn.execute(
+                    f"""
+                    SELECT COALESCE(SUM(c.byte_size), 0) AS held
+                    FROM artifact_versions c
+                    WHERE c.state IN ('ready', 'superseded') AND c.superseded_by IS NULL
+                      AND {_starts_with("c.id")}{f" AND {in_tenant('c.')}" if scoped else ""}
+                      AND EXISTS (SELECT 1 FROM artifact_versions p
+                                  WHERE p.superseded_by = c.id || '@v=' || c.version
+                                    AND p.state IN ('ready', 'superseded')
+                                    AND NOT {_starts_with("p.id")}
+                                    {f"AND {in_tenant('p.')}" if scoped else ""})
+                    """,
+                    [exclude_id_prefix] * 2
+                    + ([tenant] if scoped else [])
+                    + [exclude_id_prefix] * 2
+                    + ([tenant] if scoped else []),
+                ).fetchone()
+                total_bytes += held["held"]
 
             if tenant is not None:
                 cursor = conn.execute(
@@ -6014,7 +6131,7 @@ class ArtifactStore:
                 # int(): SUM over a BIGINT column is numeric in Postgres and
                 # arrives as Decimal, which breaks arithmetic like
                 # total_bytes / 1024**3 for in-process callers.
-                "total_bytes": int(row["total_bytes"]),
+                "total_bytes": int(total_bytes),
                 "total_rows": int(row["total_rows"]),
                 "name_count": names_count,
             }

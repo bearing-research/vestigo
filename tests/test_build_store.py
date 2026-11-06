@@ -596,6 +596,25 @@ class TestLeases:
         assert [b.build_id for b in build_store.list_expired_leases()] == [build_id]
         assert build_store.reclaim_expired_build(build_id, "runner-b")
 
+    def test_a_lapsed_lease_is_over_within_the_same_clock_reading(self, build_store, clock):
+        build_id = str(uuid.uuid4())
+        build_store.create_build(
+            build_id=build_id, artifact_id="art-123", version=1, executor_ref="duckdb_sql@v1"
+        )
+        assert build_store.open_attempt(
+            build_id,
+            "a1",
+            writable_until=clock() + 3600,
+            lease_owner="me",
+            lease_duration_seconds=600.0,
+        )
+        assert build_store.lapse_lease(build_id, "me")
+
+        # A live lease's deadline is inclusive; a lapse at now must already be past.
+        assert build_store.get_build(build_id).lease_expires_at < clock()
+        assert not build_store.open_attempt(build_id, "a1", writable_until=clock() + 3600)
+        assert build_store.reclaim_expired_build(build_id, "runner-b")
+
     def test_a_live_lease_is_not_reclaimed(self, build_store, clock):
         build_id = self._building(build_store)
         assert not build_store.reclaim_expired_build(build_id, "runner-b")
@@ -763,6 +782,26 @@ class TestAttempts:
         build = build_store.get_build(build_id)
         assert (build.state, build.version, build.completed_at) == ("ready", 3, clock())
         assert not build_store.open_attempt(build_id, "a3", writable_until=clock() + 3600)
+
+    def test_an_attempt_taken_over_stays_fenced_once_its_successor_lapses(self, build_store, clock):
+        build_id = self._pending(build_store)
+        assert build_store.open_attempt(build_id, "a1", writable_until=clock() + 3600)
+        clock.now += 61
+        assert build_store.open_attempt(build_id, "a2", writable_until=clock() + 3600)
+        clock.now += 61
+        assert not build_store.open_attempt(build_id, "a1", writable_until=clock() + 3600)
+
+        clock.now += 1000
+        assert build_store.reclaim_expired_build(build_id, "runner-b", 10.0)
+        clock.now += 61
+        # Nor does the reclaim's own lapse bring back the attempt it took the build from.
+        assert not build_store.open_attempt(build_id, "a2", writable_until=clock() + 3600)
+        assert build_store.open_attempt(build_id, "a3", writable_until=clock() + 3600)
+        assert [a.attempt for a in build_store.attempts_of(build_id)] == ["a1", "a2", "a3"]
+        # A recorded attempt that never was the build's is no more fenced than before.
+        build_store.record_attempt(build_id, "art-123", 1, "a4", writable_until=clock() + 10)
+        clock.now += 61
+        assert build_store.open_attempt(build_id, "a4", writable_until=clock() + 3600)
 
     def test_an_attempt_records_who_runs_it(self, build_store, clock):
         """A resume by another principal is their attempt; the build keeps its initiator."""
@@ -933,6 +972,22 @@ class TestAttempts:
         assert reopened.get_attempt(build_id, "a1").opened_at == clock()
         with closing(reopened._get_connection()) as conn:
             assert _indexes(conn) >= LINEAGE_INDEXES
+
+    def test_an_older_database_gains_the_attempt_fence(self, tmp_path, clock):
+        seed_build_targets(tmp_path)
+        store = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+        build_id = self._pending(store)
+        with closing(store._get_connection()) as conn:
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN fenced_at")
+            conn.commit()
+
+        reopened = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+
+        assert reopened.open_attempt(build_id, "a1", writable_until=clock() + 3600)
+        clock.now += 61
+        assert reopened.open_attempt(build_id, "a2", writable_until=clock() + 3600)
+        clock.now += 61
+        assert not reopened.open_attempt(build_id, "a1", writable_until=clock() + 3600)
 
     def test_builds_of_an_executor_are_its_own_oldest_first(self, build_store, clock):
         # Ids that sort against the order they were created in.

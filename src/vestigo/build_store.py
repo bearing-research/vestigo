@@ -10,6 +10,7 @@ Every writer of a build's state, owner or attempt runs under the build's write k
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS build_attempts (
     resumed_from TEXT,  -- The accepted release this attempt continues from, if any
     principal TEXT,  -- Who runs this attempt (a resume may be another's than the build's)
     opened_at REAL,  -- When the attempt was first recorded
+    fenced_at REAL,  -- When another attempt or a reclaim took the build from it
     PRIMARY KEY (build_id, attempt)
 );
 """
@@ -222,6 +224,15 @@ _BUILD_FIELDS = (
 _BUILD_COLUMNS = ", ".join(_BUILD_FIELDS)
 
 
+def _fence(conn: StoreConnection, build_id: str, attempt: str, now: float) -> None:
+    """Mark *attempt* as taken over, so it never becomes the build's attempt again."""
+    conn.execute(
+        "UPDATE build_attempts SET fenced_at = ? "
+        "WHERE build_id = ? AND attempt = ? AND fenced_at IS NULL",
+        (now, build_id, attempt),
+    )
+
+
 def _row_to_build_state(row: Any) -> BuildState:
     """A ``BuildState`` from a row holding ``_BUILD_FIELDS``, by name."""
     values = {field: row[field] for field in _BUILD_FIELDS}
@@ -357,6 +368,7 @@ class BuildStore:
             ("build_attempts", "principal"): "TEXT",
             # REAL is single precision on Postgres: seconds would round to minutes.
             ("build_attempts", "opened_at"): self._dialect.float_type,
+            ("build_attempts", "fenced_at"): self._dialect.float_type,
         }
         if all(self._dialect.column_exists(conn, table, column) for table, column in columns):
             return
@@ -488,9 +500,10 @@ class BuildStore:
         opening its first, keeps the owner when none is given and the later of the
         two deadlines; a re-opened attempt takes ``resumed_from`` when one is given.
         Returns False when the build is not active, its lease is live under another
-        attempt, or *attempt* is the build's and its lease has lapsed (it continues
-        only in a new attempt); a claim's live lease (no attempt yet) lets only its
-        own ``lease_owner`` through.
+        attempt, *attempt* is the build's and its lease has lapsed, or another attempt
+        or a reclaim took the build from *attempt* (either way it continues only in a
+        new attempt); a claim's live lease (no attempt yet) lets only its own
+        ``lease_owner`` through.
         """
         conn = self._get_connection()
         try:
@@ -543,6 +556,16 @@ class BuildStore:
         # A lapsed attempt was fenced, so a release it sent meanwhile was rejected.
         if row["attempt"] == attempt and not live:
             return False
+        # So was one another attempt or a reclaim took over, however that one ended.
+        fenced = conn.execute(
+            "SELECT 1 FROM build_attempts "
+            "WHERE build_id = ? AND attempt = ? AND fenced_at IS NOT NULL",
+            (build_id, attempt),
+        ).fetchone()
+        if fenced is not None:
+            return False
+        if row["attempt"] is not None and row["attempt"] != attempt:
+            _fence(conn, build_id, row["attempt"], now)
         if continuing:
             if lease_owner is None:
                 lease_owner = row["lease_owner"]
@@ -816,18 +839,24 @@ class BuildStore:
         """End ``lease_owner``'s lease now, for good, from any thread or process.
 
         Unlike a renewal to zero seconds, a renewal that read the clock first cannot
-        revive it: the lease has no owner left to renew. Returns False unless
-        ``lease_owner`` holds it and the build is building.
+        revive it: the lease has no owner left to renew. Under the build's key, so it
+        waits for an acceptance or an attempt opening that already holds the lease, and
+        either fences what follows. Returns False unless ``lease_owner`` holds it and
+        the build is building.
         """
         conn = self._get_connection()
         try:
+            self._dialect.begin_write(conn, build_id)
+            # Strictly past: a lease is live through its deadline, so one ending at now
+            # would still let the attempt through within the same clock reading.
+            lapsed_at = math.nextafter(self._clock(), -math.inf)
             cursor = conn.execute(
                 """
                 UPDATE artifact_builds
                 SET lease_owner = NULL, lease_expires_at = ?
                 WHERE build_id = ? AND state = 'building' AND lease_owner = ?
                 """,
-                (self._clock(), build_id, lease_owner),
+                (lapsed_at, build_id, lease_owner),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -844,7 +873,7 @@ class BuildStore:
     ) -> bool:
         """Take over a building build whose lease has expired (a dead runner's orphan).
 
-        The lapsed attempt is fenced: the build has none until ``open_attempt`` with
+        The lapsed attempt is fenced for good: the build has none until ``open_attempt`` with
         ``new_lease_owner``, so a release the old runner still sends is rejected.
         Only a build of ``dispatch`` is taken (None: any), so a runner's orphan
         recovery leaves alone the builds a consumer runs itself. Returns False if
@@ -859,6 +888,9 @@ class BuildStore:
             self._dialect.begin_write(conn, build_id)
             now = self._clock()
             lease_expires_at = now + lease_duration_seconds
+            row = conn.execute(
+                "SELECT attempt FROM artifact_builds WHERE build_id = ?", (build_id,)
+            ).fetchone()
             cursor = conn.execute(
                 f"""
                 UPDATE artifact_builds
@@ -872,8 +904,11 @@ class BuildStore:
                 """,
                 (new_lease_owner, lease_expires_at, now, build_id, now, *dispatch_params),
             )
+            reclaimed = cursor.rowcount > 0
+            if reclaimed and row["attempt"] is not None:
+                _fence(conn, build_id, row["attempt"], now)
             conn.commit()
-            return cursor.rowcount > 0
+            return reclaimed
         finally:
             conn.close()
 

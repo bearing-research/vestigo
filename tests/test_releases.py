@@ -611,6 +611,9 @@ class TestAttemptsAndFences:
         assert not ledger.builds.open_attempt(
             build_id, "a1", writable_until=writable_until, lease_owner="runner-1"
         )
+        # No other attempt's lease is live: the refusal says the attempt itself is spent.
+        with pytest.raises(ValueError, match="attempt a1 lapsed or was taken over"):
+            ledger.releases.resume(build_id, "a1", writable_until=writable_until)
         with pytest.raises(ReleaseRejected):
             ledger.releases.prepare(build_id, "a1", "checkpoint")
         assert ledger.releases.get(pending.release_id).state == "rejected"
@@ -724,6 +727,27 @@ class TestAttemptsAndFences:
         assert isinstance(bundle, ReleaseBundle) and bundle.release.state == "accepted"
         assert failed is False
         assert ledger.builds.get_build(build_id).state == "ready"
+
+    def test_a_lapse_waits_for_an_acceptance_in_flight_and_fences_what_follows(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        staged = [_stage(ledger, release, "model", b"w")]
+
+        bundle, lapsed, locked = _interleave(
+            ledger,
+            lambda ledger_: ledger_.releases.accept(release.release_id, staged),
+            lambda other: other.builds.lapse_lease(build_id, "runner-1"),
+            after=AFTER_FENCE,
+        )
+
+        assert locked, "lapse_lease ran inside the acceptance's transaction"
+        assert isinstance(bundle, ReleaseBundle) and bundle.release.state == "accepted"
+        assert lapsed is True
+        # At the lapse's own clock reading, not a tick later.
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.prepare(build_id, "a1", "checkpoint")
 
     def test_a_runner_checkpoints_under_the_attempt_its_claim_opens(self, ledger: Ledger):
         build_id = _build(ledger, None)

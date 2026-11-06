@@ -265,7 +265,7 @@ The terms the quick start uses, and what each one is:
 | Term | What it is | How you get it |
 | --- | --- | --- |
 | model | a node: the module's class and `state_dict` schema (every key's shape and dtype) under a version you name | `ledger.run(model, ..., version=...)` |
-| program | a node over the model: its loss and settings, optimizer class and defaults, and the config you declare | `ledger.run(..., optimizer, loss=..., config=...)` |
+| program | a node over the model: its loss and settings, optimizer class, defaults and param groups, and the config you declare | `ledger.run(..., optimizer, loss=..., config=...)` |
 | execution | one run of a program on concrete inputs (a build), found again by its computation key | `ledger.run(...)` starts one, or resumes the unfinished one |
 | attempt | one process's hold on an execution, with a lease a thread renews | each `ledger.run` |
 | checkpoint | one step's files from every rank, accepted together as one release | `run.save(step, state)` |
@@ -290,17 +290,31 @@ trained weights and nothing else.
   augmentation, gradient clipping and accumulation, precision: whatever comes from the
   command line, an environment variable or a config file. A constant written in the
   script is code, which is not hashed: change it and bump `version`.
-- **Recorded for you.** The optimizer's class and `defaults` (`lr`, `weight_decay`,
-  `betas`, ...). The loss: a module by its class, its public attributes and the digest
-  of each tensor in its `state_dict`, so `nn.HuberLoss(delta=2.0)` and
-  `nn.CrossEntropyLoss(weight=...)` are recorded with their arguments; a function or a
-  class by its qualified name; a `functools.partial` with its arguments. A lambda has
-  no name and is refused. A loss module with an attribute that is not JSON raises
-  `TypeError`: register a tensor as a buffer, or pass the loss's name as a `str` and
-  its settings in `config`. Anything the optimizer and loss do not hold, such as a
-  scheduler, goes in `config`.
+- **Recorded for you.** The optimizer's class, its `defaults` (`lr`, `weight_decay`,
+  `betas`, ...) and each param group's own settings (a per-layer `lr`), as they stand
+  when the run starts; a scheduler changes a group's `lr`, so a program looked up
+  later is defined from an optimizer as the script builds it. The loss: a module by every module in it (its own and each
+  submodule's class and public attributes) and the digest of each tensor in its
+  `state_dict`, so `nn.HuberLoss(delta=2.0)`, `nn.CrossEntropyLoss(weight=...)` and a
+  loss built around `nn.CrossEntropyLoss(label_smoothing=0.1)` are recorded with their
+  arguments; a module-level function or a class by its qualified name; a bound method
+  by its name and its object, recorded as a loss object is, a module's without its
+  tensors (a model's own `compute_loss` is not its weights); a `functools.partial` with
+  its arguments; a `torch.compile`d loss as what it compiles. A lambda, a function
+  defined in another function, and one that captures values (a decorator's wrapper)
+  are refused with `ValueError`, since what they captured has no name: pass a loss
+  module, a `functools.partial`, or the loss's name as a `str`. A loss with an
+  attribute that is not JSON, a `config` with a NaN or an infinity, or a loss tensor
+  on the meta device raises `TypeError`: register a tensor as a buffer, or pass the
+  loss's name as a `str` and its settings in `config`. Anything the optimizer and
+  loss do not hold, such as a scheduler, goes in `config`.
 - **Left out.** What does not change the weights: logging and checkpoint intervals,
   `num_workers`, output paths, progress bars.
+
+Classes are recorded by their module path, and the optimizer's `defaults` as the
+installed torch fills them. Moving a loss class to another module, or upgrading to a
+torch that adds an optimizer default, makes every program a new one: a run after it
+starts fresh rather than resume a checkpoint from before.
 
 When unsure, put it in. A setting left out that changes the weights fails silently:
 change it and rerun after a crash, and the run resumes a checkpoint trained under the
@@ -331,16 +345,20 @@ path. So:
 - data changed between a crash and the rerun is another computation, so the run
   starts fresh instead of resuming a checkpoint on different data;
 - before each checkpoint is accepted, and before `finish`, the files are checked
-  against those bytes. A changed, added or removed file raises `InputChanged`
-  (from `run.save`, or from its future for an asynchronous save), releases nothing,
-  and gives up the lease. Put the bytes back and the same script resumes from the
-  last checkpoint taken before the change.
+  against those bytes. A changed, added or removed file, or the input itself removed
+  or emptied, raises `InputChanged` (from `run.save`, or from its future for an
+  asynchronous save), releases nothing, and gives up the lease. Put the bytes back
+  and the same script resumes from the last checkpoint taken before the change. A
+  file that cannot be read for another reason (an I/O error on a shared mount)
+  raises `InputChanged` too, but fails only that step: the lease stays.
 
 The check is a `stat` per file. A file whose stat changed with its bytes the same (a
 `chmod`, a `touch`, a hardlink, an attribute a file browser adds) is hashed again and
 passes. So the record says every checkpoint was accepted while exactly those bytes
 sat at those paths; an edit undone between two checkpoints goes unseen. Nor can it
-prove the training code read them: read the paths you passed.
+prove the training code read them: read the paths you passed. A change to every
+file's stat (a `chmod -R`, a `touch`, a copy that resets times) has each file hashed
+again at the next check: on a large tree that check takes as long as the first.
 
 A directory takes every file in it, hidden ones too, except what an operating system
 writes into a folder it shows: `.DS_Store`, `Thumbs.db`, `desktop.ini` and `._`
@@ -348,9 +366,10 @@ AppleDouble files. It refuses a link out of the tree or to a directory, a link l
 a special file such as a pipe, and a directory with no files; a link to a file inside
 the tree counts as that file. A relaunch costs a `stat` per file, not a read: digests
 are cached per machine in `$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, else
-`~/.cache/vestigo` (with none usable, every file is hashed). A file whose mtime or
-ctime is within the last two seconds is hashed again each time, since a write in the
-same timestamp tick could leave its stat unchanged.
+`~/.cache/vestigo` (with none usable, every file is hashed), readable by its owner
+only. A file whose mtime or ctime was within two seconds of a scan is hashed again
+at each check until a scan finds it older, since a write in the same timestamp tick
+could leave its stat unchanged.
 
 **A `Remote` is verified through its object store.** `Remote("s3://bucket/key")` names
 one object and `Remote("gs://bucket/prefix/")` (ending in `/`) every object under it;
@@ -359,18 +378,23 @@ and pins each by what its store says names its bytes, and every check lists them
 
 | Store | Names the bytes | Same bytes uploaded again |
 | --- | --- | --- |
-| S3 | ETag | same name |
+| S3 | ETag | same name; a new one under SSE-KMS or SSE-C, or in parts of another size |
 | GCS | MD5; a composite object's generation | same name; a new generation |
-| Azure | Content-MD5 when the upload set one, else ETag | same name; a new ETag |
+| Azure | ETag | a new ETag |
+
+A new name for the same bytes reads as other bytes: the next save raises
+`InputChanged`, and a relaunch starts fresh. Azure's Content-MD5 is not used, as an
+upload in blocks stores whatever MD5 the uploader sends.
 
 The URI is part of the pin, unlike a local path: it names the same objects on every
-machine, and the same objects in another bucket are another input. Other names, or an
-object added or removed under a prefix, fail the next save as for a `Path`; a store
-that does not answer fails only that step. Credentials and endpoint come from
-`Remote(uri, settings=BlobSettings(...))`, as for the ledger's own `RemoteBlobs`, else
-the provider's defaults. Every rank lists the objects with them, and they travel from
-rank 0 to every rank. The store's names say the objects were not replaced;
-like a `Path`, they cannot say what the code read, so read the URI you passed.
+machine, and the same objects in another bucket are another input. Other names, an
+object added or removed under a prefix, or every object gone, fail the next save as
+for a `Path`; a store that does not answer fails only that step. Credentials and
+endpoint come from `Remote(uri, settings=BlobSettings(...))`, as for the ledger's own
+`RemoteBlobs`, else the provider's defaults. Every rank lists the objects with them,
+and they travel from rank 0 to every rank. The store's names say the objects were not
+replaced; like a `Path`, they cannot say what the code read, so read the URI you
+passed.
 
 **A `str` is a label.** Nothing reads it. It must change whenever the data does, so
 pin a version: a table snapshot, a dataset revision, a vestigo artifact URI with its
@@ -385,8 +409,8 @@ fresh.
 `ledger.run` is three steps, which you can take yourself: `ledger.define_model` and
 `ledger.define_program` return the nodes, then `ledger.find(program, inputs)` finds the
 unfinished execution, `ledger.start(program, inputs)` starts one, and
-`ledger.resume(execution, inputs=inputs)` resumes one. An execution with a `Path`
-input resumes only with its inputs, which must be its own.
+`ledger.resume(execution, inputs=inputs)` resumes one. An execution with a `Path` or
+`Remote` input resumes only with its inputs, which must be its own.
 
 ## Resume after a crash
 
@@ -394,7 +418,7 @@ Run the same script again. `ledger.run` finds the unfinished execution and resum
 in a new attempt, from its latest accepted checkpoint. `run.restores_from` is that
 release, or None for a fresh start. `ledger.resume(execution, from_release=...,
 inputs=...)` resumes from an older checkpoint (`inputs` as the run had them, needed
-when one is a `Path`).
+when one is a `Path` or a `Remote`).
 
 How the old process ended decides when you can resume:
 
@@ -668,13 +692,18 @@ At each save every rank checks its own copy. Each other rank's report (signed, w
 signing key) records the path and bytes it found after its write; rank 0 checks its own
 after the barrier and records that in the manifest. The step is accepted only when
 every copy has the bytes the run pinned. Otherwise every rank's save raises
-`InputChanged` naming the rank and path: other bytes lapse the lease, and a copy that
-cannot be read (say, a transient error on a shared mount) fails only that step. No rank
-raises before the barrier, so a bad copy never holds the others up. `finish` checks
-every rank's copy once more, and rank 0 lists the `Remote` inputs once for all.
+`InputChanged` naming the rank and path: other bytes, or a copy removed or emptied,
+lapse the lease, and a copy that cannot be read (say, a transient error on a shared
+mount) fails only that step. No rank raises before the barrier, so a bad copy never
+holds the others up. `finish` checks every rank's copy once more, and rank 0 lists the
+`Remote` inputs once for all.
 
 Every rank walks its copy at every save, a `stat` per file, before the barrier: on a
-large tree, save less often rather than check less.
+large tree, save less often rather than check less. A file whose stat changed is
+hashed again there, so a change to every file's stat (a `chmod -R`, a `touch`) has
+every rank hash its whole copy before the barrier, which can outlast the barrier's
+timeout and fail that step; leave the files' stats alone during a run, or raise
+`checkpoint_write_barrier_timeout_sec`.
 
 `ledger.start`, `ledger.branch` and `ledger.resume` are collective in the same way.
 Under a launcher that sets `WORLD_SIZE` above 1, a run without a process group raises

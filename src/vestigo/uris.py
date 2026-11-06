@@ -21,7 +21,7 @@ import re
 DEFAULT_URI_SCHEME = "vestigo"
 
 # RFC 3986 scheme: a letter, then letters, digits, "+", "-" or ".".
-_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*$")
+_SCHEME = re.compile(r"[a-z][a-z0-9+.\-]*")
 
 # Sentinel for "latest": callers must resolve the concrete version in the store.
 LATEST_VERSION = -1
@@ -30,10 +30,11 @@ LATEST_VERSION = -1
 def _patterns(scheme: str) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
     prefix = re.escape(scheme) + "://"
     # An id may hold ``@`` (``x@iter=3``) but never ``@v=``, so the last ``@v=`` ends it.
+    # Matched whole and across newlines: ``$`` alone lets a trailing newline through.
     return (
-        re.compile(rf"^{prefix}artifact/(.+)@v=(\d+)$"),
-        re.compile(rf"^{prefix}artifact/((?:(?!@v=).)+)$"),
-        re.compile(rf"^{prefix}name/(.+)$"),
+        re.compile(rf"{prefix}artifact/(.+)@v=(\d+)", re.DOTALL),
+        re.compile(rf"{prefix}artifact/((?:(?!@v=).)+)", re.DOTALL),
+        re.compile(rf"{prefix}name/(.+)", re.DOTALL),
     )
 
 
@@ -51,7 +52,7 @@ def set_uri_scheme(scheme: str) -> None:
     same one.
     """
     global _scheme, _ARTIFACT_PINNED, _ARTIFACT_LATEST, _NAME
-    if not _SCHEME.match(scheme):
+    if not _SCHEME.fullmatch(scheme):
         raise ValueError(f"not a URI scheme: {scheme!r}")
     _scheme = scheme
     _ARTIFACT_PINNED, _ARTIFACT_LATEST, _NAME = _patterns(scheme)
@@ -93,11 +94,11 @@ def parse_artifact_uri(uri: str) -> tuple[str, int] | None:
     ``version`` is ``LATEST_VERSION`` for the unpinned form; returns ``None`` when
     ``uri`` is not an artifact URI.
     """
-    match = _ARTIFACT_PINNED.match(uri)
+    match = _ARTIFACT_PINNED.fullmatch(uri)
     if match:
         return (match.group(1), int(match.group(2)))
 
-    match = _ARTIFACT_LATEST.match(uri)
+    match = _ARTIFACT_LATEST.fullmatch(uri)
     if match:
         return (match.group(1), LATEST_VERSION)
 
@@ -106,7 +107,7 @@ def parse_artifact_uri(uri: str) -> tuple[str, int] | None:
 
 def parse_name_uri(uri: str) -> str | None:
     """Return the name in ``{scheme}://name/{name}``, or ``None`` when ``uri`` is not one."""
-    match = _NAME.match(uri)
+    match = _NAME.fullmatch(uri)
     if match:
         return match.group(1)
     return None
