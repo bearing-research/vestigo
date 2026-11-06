@@ -4150,8 +4150,6 @@ def _example(
         launch = ["-m", "torch.distributed.run", f"--nproc-per-node={ranks}"]
         rendezvous = ["--master-addr=127.0.0.1", f"--master-port={port}"]
         command = [sys.executable, *launch, *rendezvous, *command[1:]]
-    # PyTorch's Windows wheels have no libuv, which torchrun's store asks for by default.
-    env = {**os.environ, "USE_LIBUV": "0"} if sys.platform == "win32" else None
     # Its own session, so a timeout kills torchrun's ranks with the launcher.
     with subprocess.Popen(
         command,
@@ -4159,7 +4157,6 @@ def _example(
         stderr=subprocess.PIPE,
         text=True,
         cwd=cwd,
-        env=env,
         start_new_session=True,
     ) as process:
         try:
@@ -4286,6 +4283,10 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
     assert "executions reading the data: 2" in branched.stdout
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="torch 2.14's torchrun --master-addr asks for libuv, which its Windows wheels lack",
+)
 def test_the_distributed_example_releases_every_ranks_files_and_resumes(tmp_path: Path):
     root = str(tmp_path / "ledger")
     stopped = _example("distributed.py", root, "--epochs=2", "--crash-at=1", ranks=2)

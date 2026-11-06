@@ -680,8 +680,9 @@ A rank that raises outside a save leaves the others waiting at the next `ledger.
 `finish` until the process group's timeout. A rank whose `finish` cannot wait for its
 save in flight raises that error on every rank. A launcher such as `torchrun` ends every
 rank when one fails.
-On Windows, run `torchrun` with `USE_LIBUV=0`: PyTorch's Windows wheels are built
-without libuv, which its store uses by default.
+On Windows, torch 2.14's `torchrun --master-addr` fails whatever `USE_LIBUV` says (its
+store asks for libuv, which the Windows wheels lack); ranks there start through
+`init_process_group` with a `file://` rendezvous, as the suite's two-rank tests do.
 
 ### Inputs on several ranks
 

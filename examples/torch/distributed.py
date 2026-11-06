@@ -5,8 +5,8 @@
     uv run torchrun --nproc-per-node 2 --master-addr 127.0.0.1 \
         examples/torch/distributed.py ledger
 
-On Windows, set ``USE_LIBUV=0`` first: PyTorch's Windows wheels are built without
-libuv, which torchrun's store uses by default.
+Not on Windows: there torch 2.14's ``torchrun --master-addr`` asks for libuv, which
+its Windows wheels lack, whatever ``USE_LIBUV`` says.
 
 Every rank runs the same code. ``ledger.run`` is collective, as
 ``DistributedDataParallel`` is: rank 0 starts or resumes the run and holds the lease,
