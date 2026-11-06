@@ -107,7 +107,8 @@ jobs:
       - if: runner.os == 'macOS'
         run: |
           echo "GLOO_SOCKET_IFNAME=lo0" >> "$GITHUB_ENV"
-          echo "127.0.0.1 $(hostname)" | sudo tee -a /etc/hosts
+          sudo scutil --set HostName localhost
+          python3 -c "import socket, time; t = time.time(); print(socket.gethostname(), socket.getfqdn(), f'{time.time() - t:.2f}s')"
       - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py
         env:
           VESTIGO_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
