@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -101,6 +102,23 @@ def _own_digest_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("VESTIGO_CACHE_DIR", str(tmp_path / "digest-cache"))
 
 
+def _connect_to_the_daemon() -> None:
+    """Connect to a Unix-socket daemon and hang up; raises OSError when nothing answers.
+
+    docker-py leaves the socket of a failed connect open (a ResourceWarning at the end of
+    a session with no daemon, as on a macOS runner), so it is asked only once one answers.
+    """
+    default = (
+        "npipe:////./pipe/docker_engine"
+        if sys.platform == "win32"
+        else "unix:///var/run/docker.sock"
+    )
+    host = os.environ.get("DOCKER_HOST", default)
+    if host.startswith("unix://"):
+        with socket.socket(socket.AF_UNIX) as probe:
+            probe.connect(host.removeprefix("unix://"))
+
+
 @pytest.fixture(scope="session")
 def docker_daemon() -> None:
     """Skip what needs a container when the Docker daemon is unreachable; fail where required.
@@ -110,9 +128,10 @@ def docker_daemon() -> None:
     """
     required = os.environ.get("VESTIGO_REQUIRE_DOCKER")
     try:
+        _connect_to_the_daemon()
         with closing(docker.from_env()) as client:
             os_type = client.info().get("OSType")
-    except docker.errors.DockerException:
+    except (OSError, docker.errors.DockerException):
         if required:
             raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
         pytest.skip("Docker daemon is not running")
