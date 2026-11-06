@@ -10,6 +10,11 @@ All notable changes to vestigo are recorded here. The format follows
 - `docs/torch.md` opens with a quick start: `examples/torch/quickstart.py`, a
   complete training script run twice (stopped, then resumed), and what each call
   does; the suite checks the guide's copy is the script (#58).
+- `ArtifactStore.list_artifacts` and `ArtifactStore.stats` take
+  `exclude_id_prefix`, which leaves out every version whose id starts with it,
+  in SQL, so a page is cut and the totals are summed without a consumer's
+  bookkeeping rows (a build's placeholder, say). The prefix is literal: `_`
+  and `%` match only themselves. `name_count` still counts every name.
 
 ### Changed
 

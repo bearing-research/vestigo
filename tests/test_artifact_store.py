@@ -605,6 +605,84 @@ def _ipc_bytes(num_rows: int) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
+class TestExcludeIdPrefix:
+    """A consumer's bookkeeping rows, left out by id prefix before a page or a total is cut."""
+
+    @pytest.fixture
+    def store(self, backend_store):
+        return backend_store
+
+    @staticmethod
+    def _ready(store, artifact_id, rows=10, size=100):
+        version = store.create_artifact(artifact_id, f"hash-{artifact_id}")
+        store.finalize_artifact(artifact_id, version, "{}", rows, size)
+        return version
+
+    def test_the_page_is_cut_after_the_excluded_rows_go(self, store):
+        for i in range(3):
+            self._ready(store, f"result-{i}")
+            self._ready(store, f"book_{i}")
+
+        pages = [
+            store.list_artifacts(limit=2, offset=offset, exclude_id_prefix="book_")
+            for offset in (0, 2)
+        ]
+
+        assert [len(page) for page in pages] == [2, 1]
+        assert sorted(v.id for page in pages for v in page) == ["result-0", "result-1", "result-2"]
+
+    def test_the_prefix_is_literal(self, store):
+        # As a LIKE pattern unescaped, "b_" would match "bx" and "%" every id.
+        for artifact_id in ("bx", "b_y", "100%", "100x"):
+            self._ready(store, artifact_id)
+
+        assert {v.id for v in store.list_artifacts(exclude_id_prefix="b_")} == {
+            "bx",
+            "100%",
+            "100x",
+        }
+        assert {v.id for v in store.list_artifacts(exclude_id_prefix="100%")} == {
+            "bx",
+            "b_y",
+            "100x",
+        }
+
+    def test_a_name_filter_leaves_them_out_too(self, store):
+        for artifact_id in ("result", "book_1"):
+            store.set_name(f"shelf/{artifact_id}", artifact_id, self._ready(store, artifact_id))
+
+        listed = store.list_artifacts(name_prefix="shelf/", exclude_id_prefix="book_")
+
+        assert [v.id for v in listed] == ["result"]
+
+    def test_the_totals_leave_them_out_and_count_every_name(self, store):
+        self._ready(store, "result")
+        self._ready(store, "book_1", rows=7, size=70)
+        store.fail_artifact("book_2", store.create_artifact("book_2", "hash-book_2"))
+        store.create_artifact("book_3", "hash-book_3")
+        store.set_name("named-book", "book_1", 1)
+
+        stats = store.stats(exclude_id_prefix="book_")
+
+        assert {key: stats[key] for key in stats if key.endswith("_versions")} == {
+            "total_versions": 1,
+            "ready_versions": 1,
+            "building_versions": 0,
+            "superseded_versions": 0,
+            "failed_versions": 0,
+        }
+        assert (stats["total_bytes"], stats["total_rows"], stats["name_count"]) == (100, 10, 1)
+
+    def test_a_tenant_and_a_prefix_apply_together(self, store):
+        for tenant, artifact_id in (("a", "result"), ("a", "book_1"), ("b", "other")):
+            version = store.create_artifact(artifact_id, f"hash-{artifact_id}", tenant=tenant)
+            store.finalize_artifact(artifact_id, version, "{}", 1, 1)
+
+        stats = store.stats(tenant="a", exclude_id_prefix="book_")
+
+        assert stats["total_versions"] == 1
+
+
 class TestForeignKeyEnforcement:
     """Declared foreign keys are enforced, and deletes clean up so enforcement does not break
     collection.
