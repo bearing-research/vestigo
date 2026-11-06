@@ -4167,11 +4167,12 @@ def _example(
         start_new_session=True,
     ) as process:
         try:
-            stdout, stderr = process.communicate(timeout=300)
+            # Inside pytest's own timeout, so a hang reports what the script said.
+            stdout, stderr = process.communicate(timeout=120)
         except subprocess.TimeoutExpired:
             _kill_tree(process.pid)
-            process.communicate()
-            raise
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"{script} hung:\n{stdout}{stderr}") from None
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
