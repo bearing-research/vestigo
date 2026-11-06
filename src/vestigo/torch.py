@@ -1071,7 +1071,7 @@ class Ledger:
 
     def __init__(
         self,
-        artifact_dir: Path,
+        artifact_dir: Path | str,
         *,
         dsn: str | None = None,
         blobs: RemoteBlobs | None = None,

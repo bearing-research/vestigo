@@ -109,7 +109,7 @@ def docker_daemon() -> None:
     """
     try:
         docker.from_env().ping()
-    except Exception:
+    except docker.errors.DockerException:
         if os.environ.get("VESTIGO_REQUIRE_DOCKER"):
             raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
         pytest.skip("Docker daemon is not running")

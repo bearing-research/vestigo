@@ -29,7 +29,7 @@ torch-checkpointing.
 from pathlib import Path
 from vestigo.build_store import BuildStore
 from vestigo.releases import ReleaseStore
-from vestigo.store import ArtifactStore
+from vestigo.store import ArtifactStore, StagedVersion
 
 store = ArtifactStore(Path("ledger"))  # SQLite and local bytes under ledger/
 builds = BuildStore(store.db_path, dialect=store.dialect)

@@ -32,6 +32,7 @@ import warnings
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import Future
+from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,6 +178,22 @@ def _outputs(ledger: Ledger, run: Run, step: int):
     return ledger.releases.bundle(release.release_id).outputs
 
 
+def test_without_torch_the_adapter_names_its_extra():
+    hidden = (
+        "import sys\n"
+        "sys.modules['torch'] = None\n"
+        "try:\n"
+        "    import vestigo.torch\n"
+        "except ImportError as exc:\n"
+        "    print(exc)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", hidden], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "vestigo.torch needs the torch extra: install vestigo[torch]\n"
+
+
 # --- The run API ---
 
 
@@ -222,6 +239,15 @@ def test_run_resumes_the_unfinished_execution_and_starts_after_a_finish(ledger: 
     with _run(ledger, Trainer(ledger)) as again:
         assert again.execution_id != first.execution_id
         assert again.restores_from is None
+
+
+def test_run_refuses_an_execution_whose_lease_is_live(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as first:
+        trainer.train(first, 1)
+        with pytest.raises(ValueError, match="another attempt's lease on it is live"):
+            _run(ledger, Trainer(ledger))
+        assert [a.attempt for a in ledger.execution(first.execution_id).attempts] == [first.attempt]
 
 
 def test_run_from_a_release_branches_and_resumes_the_branch(ledger: Ledger):
@@ -649,6 +675,24 @@ def test_a_sparse_loss_tensor_is_recorded_by_its_values(ledger: Ledger):
     assert program(sparse) == program(dense) != program(other)
 
 
+def test_a_loss_named_by_a_str_is_recorded_as_given_with_its_settings_in_config(
+    ledger: Ledger,
+):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+
+    def program(loss: str, config: dict) -> Definition:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        return ledger.define_program(definition, loss=loss, optimizer=optimizer, config=config)
+
+    scaled = program("scaled-mse", {"scale": 2.0})
+    payload = json.loads(scaled.spec.payload)
+    assert (payload["loss"], payload["config"]) == ("scaled-mse", {"scale": 2.0})
+    assert program("scaled-mse", {"scale": 2.0}).node_id == scaled.node_id
+    assert program("scaled-mse", {"scale": 3.0}).node_id != scaled.node_id
+    assert program("scaled-mae", {"scale": 2.0}).node_id != scaled.node_id
+
+
 def test_runs_on_two_inputs_share_the_program_and_differ_in_computation(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program, {"train": "data@v=1"}) as one:
@@ -683,16 +727,14 @@ def _key(ledger: Ledger, path: Path) -> str:
 
 def _counted(monkeypatch: pytest.MonkeyPatch, name: str) -> list:
     """Calls of ``vestigo.torch.<name>``, each one's first argument."""
-    import vestigo.torch as adapter
-
     calls = []
-    real = getattr(adapter, name)
+    real = getattr(vestigo.torch, name)
 
     def counted(*args, **kwargs):
         calls.append(args[0])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(adapter, name, counted)
+    monkeypatch.setattr(vestigo.torch, name, counted)
     return calls
 
 
@@ -1457,6 +1499,24 @@ def test_an_attempt_writes_only_its_own_checkpoints(ledger: Ledger):
             run._checkpoints(SimpleNamespace(path=other._checkpoints.checkpoint_id(1)))
 
 
+def test_the_storage_removes_and_renames_nothing(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+    checkpoint = Path(ledger.checkpoint_id(run.release_of(1).release_id))
+    storage = LedgerStorage(ledger.config)
+
+    with pytest.raises(PermissionError, match="not removed by the writer"):
+        storage.delete(checkpoint / "model_0.pt")
+    with pytest.raises(PermissionError, match="not removed by the writer"):
+        storage.rmdir(checkpoint)
+    with pytest.raises(OSError, match="write_to_temp_dir=False") as renamed:
+        storage.rename(checkpoint, checkpoint.with_name("step_9"), is_directory=True)
+    assert renamed.type is OSError
+    assert storage.exists(checkpoint / "model_0.pt")
+    assert ledger.load(run.release_of(1).release_id, {"step": None}) == {"step": 1}
+
+
 def test_a_checkpoint_not_accepted_does_not_load_though_its_bytes_are_written(
     ledger: Ledger, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2038,6 +2098,18 @@ def test_keys_are_checked_and_the_private_one_is_never_shown(tmp_path: Path):
         assert signing.hex() not in repr(ledger.config) and repr(signing) not in repr(ledger.config)
 
 
+def test_without_cryptography_a_key_names_the_sign_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    signing, verify = _keypair()
+    monkeypatch.setitem(sys.modules, "cryptography.hazmat.primitives.asymmetric", None)
+    for keys in ({"signing_key": signing}, {"verify_key": verify}):
+        with pytest.raises(
+            ImportError, match=r"signed checkpoints need the sign extra: install vestigo\[sign\]"
+        ):
+            Ledger(tmp_path / "ledger", **keys)
+
+
 def _load_only(ledger: Ledger, release_id: str) -> list[torch.Tensor]:
     model = _model()
     manager = ledger.configure(CheckpointManager.Config.with_sync_save()).build()
@@ -2237,6 +2309,15 @@ def test_a_signed_manifest_in_a_report_s_place_is_a_refusal(tmp_path: Path):
             assert run.release_of(2) is None
 
 
+def test_a_manifest_whose_bytes_are_gone_is_a_refusal(tmp_path: Path):
+    ledger, run, source, verify = _signed_run(tmp_path)
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        [manifest] = [v for v in _outputs(reader, run, 1) if v.params.get("manifest")]
+        assert reader.store.blob_store.delete_blob(manifest.id, manifest.version)
+        with pytest.raises(OSError, match="the manifest of step 1 of execution .* is missing"):
+            _load_only(reader, source)
+
+
 def test_a_second_manifest_row_is_a_refusal(tmp_path: Path):
     ledger, run, source, verify = _signed_run(tmp_path)
     with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
@@ -2331,9 +2412,12 @@ def test_a_write_that_fails_midway_commits_no_bytes(ledger: Ledger):
     with ledger.start(trainer.program) as run:
         manager = _manager(run._checkpoints)
         try:
-            with pytest.raises(Exception, match="pickle"):
+            # Python 3.14 made a local object's refusal a PicklingError.
+            refused = pickle.PicklingError if sys.version_info >= (3, 14) else AttributeError
+            with pytest.raises(refused, match="local object") as raised:
                 # torch.save writes its archive header before the lambda refuses to pickle.
                 manager.save(run._checkpoints.checkpoint_id(1), {"bad": {"f": lambda: 0}})
+            assert raised.type is refused
         finally:
             manager.close()
 
@@ -2521,6 +2605,21 @@ def test_finishing_is_not_reported_as_a_lost_lease(
                 trainer.train(run, 1)
                 run.finish()
     assert "lost execution" not in caplog.text
+
+
+def test_a_renewal_the_ledger_refuses_is_reported_as_a_lost_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    with Ledger(tmp_path / "ledger", lease_seconds=0.3) as ledger:
+        trainer = Trainer(ledger)
+        with caplog.at_level(logging.WARNING, logger="vestigo.torch"):
+            with ledger.start(trainer.program) as run, monkeypatch.context() as patch:
+                # Another attempt took the execution: the ledger refuses this one's renewal.
+                patch.setattr(BuildStore, "renew_lease", lambda *a, **k: False)
+                deadline = time.monotonic() + 10
+                while "lost execution" not in caplog.text and time.monotonic() < deadline:
+                    time.sleep(0.05)
+    assert f"Attempt {run.attempt} lost execution {run.execution_id}" in caplog.text
 
 
 def test_a_finished_execution_is_not_resumed(ledger: Ledger):
@@ -3117,15 +3216,20 @@ def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
     with ledger.start(trainer.program) as run:
         manager = _manager(run._checkpoints)
 
-        def save(step: int, patch: tuple[type, str, object] | None = None) -> None:
+        def save(
+            step: int,
+            patch: tuple[type, str, object] | None = None,
+            error: type[Exception] = OSError,
+        ) -> None:
             state = {"model": trainer.model.state_dict(), "step": step}
             if patch is None:
                 manager.save(run._checkpoints.checkpoint_id(step), state)
                 return
             with monkeypatch.context() as patched:
                 patched.setattr(*patch)
-                with pytest.raises((OSError, ReleaseRejected)):
+                with pytest.raises(error) as raised:
                     manager.save(run._checkpoints.checkpoint_id(step), state)
+                assert raised.type is error
 
         upload_fails = (LedgerStorage, "stream_write", second_fails)
         try:
@@ -3133,7 +3237,7 @@ def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
             # Nothing accepted yet: step 0 may still be saved again.
             assert ledger.collect(keep=1)["orphaned"] == 0
             save(1, (ReleaseStore, "accept", lambda *a, **k: _raise(OSError)))
-            save(2, (ReleaseStore, "accept", rejected))
+            save(2, (ReleaseStore, "accept", rejected), ReleaseRejected)
             save(3, upload_fails)
             save(3)
             save(4, upload_fails)
@@ -3276,24 +3380,30 @@ def remote(request) -> RemoteBlobs:
             azure_connection_string=container.get_connection_string(),
         )
     blobs = RemoteBlobs(request.param, bucket, "ledger", settings)
-    store = blobs.open()
-    if request.param == "s3":
-        store._client.create_bucket(Bucket=bucket)  # type: ignore[attr-defined]
-    elif request.param == "gcs":
-        store._client.create_bucket(bucket)  # type: ignore[attr-defined]
-    else:
-        store._client.create_container()  # type: ignore[attr-defined]
+    # The stores have no close of their own; each SDK client does.
+    with closing(blobs.open()._client) as client:  # type: ignore[attr-defined]
+        if request.param == "s3":
+            client.create_bucket(Bucket=bucket)
+        elif request.param == "gcs":
+            client.create_bucket(bucket)
+        else:
+            client.create_container()
     return blobs
 
 
 def _put(remote: RemoteBlobs, key: str, data: bytes) -> None:
-    client = remote.open()._client  # type: ignore[attr-defined]
-    if remote.backend == "s3":
-        client.put_object(Bucket=remote.bucket, Key=key, Body=data)
-    elif remote.backend == "gcs":
-        client.bucket(remote.bucket).blob(key).upload_from_string(data)
-    else:
-        client.upload_blob(key, data, overwrite=True)
+    with closing(remote.open()._client) as client:  # type: ignore[attr-defined]
+        if remote.backend == "s3":
+            client.put_object(Bucket=remote.bucket, Key=key, Body=data)
+        elif remote.backend == "gcs":
+            client.bucket(remote.bucket).blob(key).upload_from_string(data)
+        else:
+            client.upload_blob(key, data, overwrite=True)
+
+
+def test_remote_blobs_take_only_a_backend_the_ledger_has():
+    with pytest.raises(ValueError, match="backend must be s3, gcs or azure, not 'hdfs'"):
+        RemoteBlobs("hdfs", "bucket")
 
 
 @pytest.mark.integration
@@ -3656,7 +3766,7 @@ def test_a_rank_that_comes_to_the_barrier_late_hears_why_rank_0_gave_up(tmp_path
     zero, one = outcomes
     assert zero is not None and one is not None
     assert len(zero["saved"]) == 1 and len(one["saved"]) == 1
-    assert one["message"] == zero["message"] or zero["message"] in one["message"]
+    assert zero["message"] in one["message"]
     with Ledger(tmp_path / "ledger") as ledger:
         assert ledger.release_of(zero["execution"], 2) is None
 
@@ -4006,7 +4116,22 @@ def _example(
         launch = ["-m", "torch.distributed.run", f"--nproc-per-node={ranks}"]
         rendezvous = ["--master-addr=127.0.0.1", f"--master-port={port}"]
         command = [sys.executable, *launch, *rendezvous, *command[1:]]
-    return subprocess.run(command, capture_output=True, text=True, timeout=300, cwd=cwd)
+    # Its own session, so a timeout kills torchrun's ranks with the launcher.
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _said(result: subprocess.CompletedProcess[str], pattern: str) -> str:

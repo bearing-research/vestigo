@@ -579,7 +579,7 @@ class TestS3BlobStore:
             raise _client_error(500, "InternalError", "PutObject")
 
         s3_store._client.upload_fileobj = refused
-        with pytest.raises(Exception, match="InternalError"):
+        with pytest.raises(ClientError, match="InternalError"):
             s3_store.publish_blob_from_path("artifact-1", 1, source)
 
         assert s3_store.read_blob("artifact-1", 1) == b"the old bytes"
@@ -599,7 +599,7 @@ class TestS3BlobStore:
             raise _client_error(503, "SlowDown", "PutObject")
 
         s3_store._client.upload_fileobj = refused
-        with pytest.raises(Exception, match="SlowDown"):
+        with pytest.raises(ClientError, match="SlowDown"):
             with s3_store.open_blob_writer("artifact-1", 1) as writer:
                 writer.write(b"payload")
 
