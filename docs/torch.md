@@ -214,7 +214,9 @@ never calls it.
 by its `state_dict`, each other value as it is. Save everything the loop needs to go
 on exactly; without the generator state, a resumed run would shuffle differently. It
 returns the checkpoint as an accepted release, and `release.release_id` is how you
-load it, branch from it or name it later. A save from a process that has lost the
+load it, branch from it or name it later. Each save's step comes after the step of
+every checkpoint the attempt has saved: a step again, or an earlier one, raises
+`ValueError` before anything is written. A save from a process that has lost the
 execution (another process resumed it) raises `ReleaseRejected`.
 
 **Leaving the block without `run.finish()`** (an exception, `SystemExit`, Ctrl+C)
@@ -464,8 +466,9 @@ not an execution; `ledger.derived(release_id, name)` finds it.
 
 `run.set_head(name, release_id)` points a reference at an accepted release, and
 `ledger.releases.reference(name)` returns `(release_id, revision)`. Names are global to
-the ledger, so give each one a prefix (`regression/best`). A head keeps its release
-through every collection.
+the ledger, so give each one a prefix (`regression/best`). Names under `vestigo-torch/`
+are the ledger's own (each finished execution's final checkpoint is one) and raise
+`ValueError`. A head keeps its release through every collection.
 
 ## Derived releases
 
@@ -494,10 +497,17 @@ there and stores nothing. The outputs' ids are per execution and name
 (`torch_<execution>@derived=eval@output=metrics`), so a derivation from a later
 checkpoint becomes their current value, and the earlier versions stay readable until
 `garbage_collect(keep_superseded=)` trims them. Once a name is derived from a
-checkpoint, deriving it from an earlier one of the execution raises `ValueError`, since
-that would make the earlier checkpoint's outputs current again; this also holds when
-the earlier derivation was trimmed. Give such a derivation its own name. `train.py`
-derives an evaluation of the checkpoint it finished on.
+checkpoint, or while one is being derived, deriving it from an earlier one of the
+execution raises `ValueError`, since that would make the earlier checkpoint's outputs
+current again; this also holds when the earlier derivation was trimmed. Give such a
+derivation its own name. A derivation from a later checkpoint that is still uploading
+counts too. One whose process was killed mid-upload counts until its write window
+(`writable_seconds`, which its lease lasts) has passed; `collect` then abandons its
+release and fails its outputs and build, and the name is free again. A file output is
+hashed as it is stored, so a file still being written is recorded with the digest of
+the bytes the ledger holds. A derivation that fails leaves its rows and its build
+failed, for `collect`. `train.py` derives an evaluation of the checkpoint it finished
+on.
 
 ## Keep the latest checkpoints
 
@@ -517,20 +527,24 @@ ledger.collect(keep=2)
 - every release a head points at.
 
 Every other checkpoint's files, rank reports and manifest are deleted. So are the files
-a fenced or ended attempt staged but never released (a step that crashed mid-save), and
-those of a save that can no longer be released in an attempt still running: one whose
-acceptance failed, or one of a step at or before the newest the attempt accepted. The
-save the attempt is writing now stays, so you can collect while runs train. Failed
-rows go too (an observation that failed to store, a derivation that failed), except
-the placeholder a finished execution's build row still names, which stays with it.
-`examples/torch/train.py --keep 1` collects after every epoch.
+a fenced or ended attempt staged but never released (a step that crashed mid-save), an
+observation such an attempt never finished storing, the outputs of a derivation whose
+process died (once its write window has passed), and the files of a save that can
+no longer be released in an attempt still running: one whose acceptance failed, or one
+of a step at or before the newest the attempt accepted (saved through `run.manager`
+itself, which only refuses it at acceptance). The save the attempt is writing now
+stays, so you can collect while runs train. Failed rows go too (an observation that
+failed to store, a derivation that failed), except the placeholder a build row still
+names, which stays with it. `examples/torch/train.py --keep 1` collects after every
+epoch.
 
 `collect` returns the store's counts (`deleted_count`, `deleted_bytes`) plus `orphaned`,
-the staged files it failed. `dry_run=True` deletes nothing and lists
-what it would take under `collected`. Loading a checkpoint, or branching from it,
-counts as a use, and `min_idle_seconds=` spares whatever was used that recently. Pass
-it when branches may open while `collect` runs, since a branch opened after `collect`
-has read the executions is not yet among the ones it keeps.
+the staged files it failed; the counts take those files in too, by their bytes in the
+blob store. `dry_run=True` deletes and fails nothing, and lists what it would take
+under `collected`, the staged files among it. Loading a checkpoint, resuming from it or
+branching from it counts as a use, and `min_idle_seconds=` spares whatever was used
+that recently. Pass it when branches may open while `collect` runs, since a branch
+opened after `collect` has read the executions is not yet among the ones it keeps.
 
 ## Asynchronous saves
 
@@ -547,10 +561,19 @@ run.release_of(step)
 run copies it and sets the ledger's storage and callbacks on the copy; per-item
 settings (`items`, `default`) carry over. With async saves the writer runs in a
 subprocess, so the storage and callbacks are picklable descriptions of the ledger, and
-each one opens its own connection. `save` returns the write's future, and the step's
-release exists once it completes. The manager has one save in flight. `finish()` and
+there each call opens its own connection; in the training process they work through
+the run's ledger. The manager has one save in flight. `finish()` and
 leaving the block wait for it. `run.manager` is the run's manager, for anything the run
 does not wrap.
+
+What overlaps training is the write, not the copy. torch-checkpointing first stages
+the state, copying every tensor on a worker thread, then writes the copy in its
+subprocess. `save` returns once the copy is made, so the next optimizer step can update
+the weights in place without reaching the checkpoint, and you need no
+`run.manager.lock()` around it. The returned future is the write's: the step's release
+exists once it completes, and its error (a lost lease, an input that changed) is raised
+from it. The wait in `save` grows with the state's size in memory; the upload,
+the reports and the acceptance do not hold it.
 
 On macOS, torch-checkpointing 0.1.1's async stager fails whenever MPS is available,
 because it calls CUDA device functions. That is an upstream bug. Synchronous saves are
@@ -689,7 +712,11 @@ The host records each file as a version whose params name its path and step, plu
 manifest. That is the layout in `vestigo.checkpoint_files`, which imports no torch,
 and `LedgerStorage` writes its own checkpoints the same way. So `Ledger.load` reads a
 hosted checkpoint as it reads its own, and a hosted run can restore from a checkpoint
-`Ledger.run` wrote. Saves are synchronous and go to local disk first. A hosted run is
+`Ledger.run` wrote. Saves are synchronous and go to local disk first. As with `Run`,
+each save's step comes after every step the hosted run saved, or it raises
+`ValueError` before the host is called. A checkpoint whose attempt published its step
+again (a host that publishes twice) is shadowed: `checkpoint_id` and `load` of it raise
+`ValueError`, and the later one loads. A hosted run is
 one process. Its checkpoints are unsigned, so a ledger with a verify key refuses
 them.
 
@@ -843,7 +870,7 @@ Each refusal is an `OSError`, raised before any of the file is deserialized:
 | `... is not signed` | the training job ran without a signing key, the checkpoint predates signing, or someone stripped the signature from its manifest |
 | `the signature on ... does not verify` | it was signed with another key (a rotation, another team), or its manifest was rewritten |
 | `the manifest of ... is signed for another checkpoint` | another checkpoint's genuine manifest was copied into this one |
-| `... is missing`, `... is malformed`, `... has 2 manifests` | the manifest's bytes or rows were deleted, garbled or duplicated |
+| `... is missing`, `... is malformed`, `... has 2 manifests` | the manifest's bytes or rows were deleted, garbled or duplicated, or another signed document (a rank's report) was put in its place |
 | `... differs from the checkpoint the ledger accepted` | the bytes are not the ones that were signed |
 
 Since an unsigned manifest cannot be told from a stripped one, a gate that sees
@@ -878,7 +905,10 @@ takes any checkpoint nothing keeps. It cannot pick checkpoints out by key.
   (its step crashed, or its release was rejected) reads as missing.
 - A file whose bytes no longer match the digest the ledger accepted fails the load
   with `OSError`.
-- An attempt cannot write under another attempt's checkpoint id.
+- An attempt cannot write under another attempt's checkpoint id, and a step at or
+  below one it accepted is never released.
+- A file's path in a checkpoint is relative and POSIX, with no `.` or `..` part, no
+  backslash and no drive (`C:`), so a reader on any system writes it inside the folder.
 - `delete`, `rmdir` and `rename` raise. Old checkpoints go through `collect`.
 
 ## Limits
