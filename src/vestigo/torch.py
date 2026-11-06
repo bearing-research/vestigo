@@ -61,7 +61,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from types import BuiltinFunctionType, FunctionType, MethodType, TracebackType
 from typing import Any, Protocol, cast
 from urllib.parse import quote
@@ -1027,7 +1027,8 @@ class _Location:
 
     @classmethod
     def of(cls, path: Path | str) -> _Location:
-        parts = PurePosixPath(path).parts
+        # torch_checkpointing hands over a native path, or its str: on Windows, "\\" splits.
+        parts = (path if isinstance(path, PurePath) else PurePath(path)).parts
         match = _STEP_DIR.fullmatch(parts[3]) if len(parts) >= 4 else None
         if parts[:1] != (ROOT,) or match is None:
             raise FileNotFoundError(f"{path} is not a checkpoint id")
@@ -2734,7 +2735,7 @@ class LedgerStorage(Storage):
         return cast(io.RawIOBase, io.BytesIO(data))
 
     def remap_path(self, path: Path) -> str:
-        return str(path)
+        return PurePath(path).as_posix()
 
 
 # --- The trainer's side ---

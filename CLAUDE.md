@@ -47,9 +47,10 @@ signatures, imported only when a key is given. `[torch]` pins the torch and
 `torch-checkpointing` that `vestigo.torch` is built on (CPU wheels from the PyTorch index in development); importing the
 module without them raises one `ImportError` naming the extra. CI's matrix runs
 without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
-job installs it for ty, and a separate `torch` job runs `tests/test_torch.py` on 3.12 and 3.14
-on SQLite, Postgres, and MinIO, fake-gcs-server and Azurite, one rank and two,
-and runs the scripts in `examples/torch/` as subprocesses. `docs/torch.md` is the
+job installs it for ty, and a separate `torch` job runs `tests/test_torch.py` on Linux
+(3.12 and 3.14) on SQLite, Postgres, and MinIO, fake-gcs-server and Azurite, one rank
+and two, and on macOS and Windows (3.12) on SQLite and local disk, and runs the
+scripts in `examples/torch/` as subprocesses. `docs/torch.md` is the
 user guide; a change to the adapter's API updates both.
 
 ## Build & Development
@@ -64,8 +65,11 @@ uv build && uvx twine check dist/*                       # what release.yml buil
 ```
 
 Every check lives in `.pre-commit-config.yaml`; CI's pre-commit job runs the
-same file and a test matrix runs pytest on 3.12, 3.13 and 3.14 with the
-containers on the runner. ty checks `src` only.
+same file and a test matrix runs pytest on Linux (3.12, 3.13, 3.14, with the
+containers on the runner) and on macOS and Windows (3.12, 3.14), where no runner
+runs Linux containers, so the Postgres and object-store tests skip there. A
+release attests its wheel and sdist, smoke-tests the wheel on all three, publishes
+to PyPI and attaches the same files to a GitHub release. ty checks `src` only.
 
 ## Architecture
 
