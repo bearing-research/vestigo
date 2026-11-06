@@ -19,6 +19,7 @@ import multiprocessing
 import os
 import pickle
 import re
+import signal
 import socket
 import sqlite3
 import stat
@@ -31,6 +32,7 @@ import warnings
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import Future
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,7 +42,9 @@ import torch.distributed as dist
 from botocore.exceptions import ClientError, EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from torch import nn
+from torch.distributed import distributed_c10d
 from torch_checkpointing.checkpoint_manager import CheckpointManager
+from torch_checkpointing.storage.filesystem import LocalFileSystemStorage
 
 import vestigo.torch
 from vestigo import checkpoint_files
@@ -50,6 +54,7 @@ from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
 from vestigo.torch import (
+    EXECUTOR,
     Attempt,
     Definition,
     Execution,
@@ -239,6 +244,42 @@ def test_run_from_a_release_branches_and_resumes_the_branch(ledger: Ledger):
         assert again.restores_from == branch.release_of(1).release_id
 
 
+def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    find = Ledger._find
+    both = threading.Barrier(2)
+
+    def found_together(self: Ledger, *args: object) -> str | None:
+        execution = find(self, *args)
+        both.wait(10)  # each looked before either opened
+        return execution
+
+    monkeypatch.setattr(Ledger, "_find", found_together)
+    outcomes: list[Run | ValueError] = []
+
+    def start(on: Ledger) -> None:
+        try:
+            outcomes.append(_run(on, Trainer(on)))
+        except ValueError as exc:
+            outcomes.append(exc)
+
+    with ledger.config.open() as other:
+        threads = [threading.Thread(target=start, args=(each,)) for each in (ledger, other)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        [run] = [each for each in outcomes if isinstance(each, Run)]
+        with run:
+            # The other found the first one's execution as it opened, and its lease live.
+            [refused] = [each for each in outcomes if isinstance(each, ValueError)]
+            assert "lease on it is live" in str(refused)
+            builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
+            assert builds.pop(run.execution_id) == "building"
+            assert list(builds.values()) == ["failed"]
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:
@@ -262,6 +303,7 @@ def test_a_run_shares_no_manager_config_with_another(ledger: Ledger):
             assert one.save(1, {"step": 1}).build_id == one.execution_id
             assert two.save(1, {"step": 1}).build_id == two.execution_id
     assert shared.storage_config is None
+    assert shared.save.writer_config.write_to_temp_dir is True
 
 
 def test_finish_and_close_wait_for_the_save_in_flight_while_the_lease_holds(
@@ -312,6 +354,42 @@ def test_a_failed_manager_close_still_drops_the_lease(
         run.close()
     with ledger.resume(run.execution_id) as resumed:  # no live lease in the way
         assert resumed.restores_from == run.release_of(1).release_id
+
+
+def test_a_failed_close_does_not_hide_why_the_block_was_left(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with pytest.raises(ValueError, match="the loss diverged"):
+        with _run(ledger, trainer) as run:
+            trainer.train(run, 1)
+            monkeypatch.setattr(run.manager, "close", lambda: _raise(OSError("the write failed")))
+            raise ValueError("the loss diverged")
+    with ledger.resume(run.execution_id) as resumed:  # closed all the same
+        assert resumed.restores_from == run.release_of(1).release_id
+
+
+def test_a_failed_asynchronous_save_is_reported_by_its_future_alone(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # torch_checkpointing 0.1.1 stages for CUDA whenever an accelerator exists: hide MPS.
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    tree = _tree(tmp_path / "tree")
+    trainer = Trainer(ledger)
+    asynchronous = CheckpointManager.Config.with_async_save()
+    with _run(ledger, trainer, {"train": tree}, checkpointing=asynchronous) as run:
+        trainer.train(run, 1)
+        # Unreadable, not gone (a gone input is other bytes and lapses the lease).
+        tree.chmod(0)
+        try:
+            with pytest.raises(InputChanged, match="cannot be read"):
+                trainer.train(run, 2)
+        finally:
+            tree.chmod(0o700)
+        # Handled, the step's error is not raised again: the run finishes.
+        run.finish()
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+    assert ledger.final_checkpoint(run.execution_id).release_id == run.release_of(1).release_id
 
 
 def test_load_reads_an_accepted_checkpoint_into_live_objects(
@@ -1792,6 +1870,26 @@ def test_a_verifying_ledger_refuses_a_hosted_checkpoint(tmp_path: Path):
             reader.load(host.released[0], {"model": _model()})
 
 
+def test_a_hosted_run_writes_only_in_the_folder_it_is_given(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    written: list[Path] = []
+    stream_write = LocalFileSystemStorage.stream_write
+
+    def recorded(self: LocalFileSystemStorage, path: Path) -> io.IOBase:
+        written.append(Path(path))
+        return stream_write(self, path)
+
+    monkeypatch.setattr(LocalFileSystemStorage, "stream_write", recorded)
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as held:
+        with HostedRun(_Host(ledger, held, tmp_path / "run")) as run:
+            trainer.train(run, 1)
+    # Not in a sibling renamed into place, which a crash would leave beside it.
+    folder = tmp_path / "run" / "checkpoints" / "1"
+    assert written and all(folder in path.parents for path in written)
+
+
 def test_a_hosted_run_is_one_process(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(vestigo.torch, "_group", lambda: (0, 2))
     with pytest.raises(RuntimeError, match="one process"):
@@ -2382,6 +2480,28 @@ def test_a_renewal_that_fails_once_keeps_the_lease(tmp_path: Path, monkeypatch: 
             assert run.release_of(1) is not None
 
 
+def test_a_closed_write_window_lapses_the_lease_and_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    with Ledger(tmp_path / "ledger", lease_seconds=0.6, writable_seconds=2.0) as ledger:
+        trainer = Trainer(ledger)
+        with caplog.at_level(logging.WARNING, logger="vestigo.torch"):
+            with _run(ledger, trainer) as run:
+                trainer.train(run, 1)
+                deadline = time.time() + 10
+                while ledger.builds.get_build(run.execution_id).lease_owner is not None:
+                    assert time.time() < deadline, "the lease outlived the write window"
+                    time.sleep(0.05)
+                with pytest.raises(ReleaseRejected, match="write window .* closed"):
+                    trainer.train(run, 2)
+                with pytest.raises(BuildLeaseLost, match="write window .* closed"):
+                    run.observe(_exported(trainer.model), scope="model_forward", coverage="all")
+                # The process lives on, and another resumes the execution meanwhile.
+                with _run(ledger, Trainer(ledger)) as resumed:
+                    assert resumed.restores_from == run.release_of(1).release_id
+    assert "write window" in caplog.text
+
+
 def test_finishing_is_not_reported_as_a_lost_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
@@ -2412,6 +2532,49 @@ def test_a_finished_execution_is_not_resumed(ledger: Ledger):
     assert ledger.find(trainer.program) is None
     with pytest.raises(ValueError, match="not active"):
         ledger.resume(run.execution_id)
+
+
+def test_a_final_release_that_fails_to_land_does_not_hold_up_the_retry(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    accept = ReleaseStore.accept
+    failed: list[str] = []
+
+    def locked_once(self: ReleaseStore, release_id: str, *args: object, **kwargs: object):
+        if not failed and self.get(release_id).kind == "final":
+            failed.append(release_id)
+            raise sqlite3.OperationalError("database is locked")
+        return accept(self, release_id, *args, **kwargs)
+
+    monkeypatch.setattr(ReleaseStore, "accept", locked_once)
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        trainer.train(run, 1)
+        with pytest.raises(sqlite3.OperationalError):
+            run.finish()
+        run.finish()
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+    finals = ledger.releases.releases_of(run.execution_id, "final")
+    assert [r.state for r in finals] == ["abandoned", "accepted"]
+
+
+def test_a_build_of_another_executor_is_not_resumed(ledger: Ledger):
+    ledger.store.create_artifact("foreign", "f" * 64, TransformSpec("other@v1", {}, []))
+    build_id = uuid.uuid4().hex
+    ledger.builds.create_build(
+        build_id,
+        "foreign",
+        1,
+        executor_ref="other@v1",
+        computation_key="c" * 64,
+        params={"x": 1},
+        dispatch="external",
+    )
+    with pytest.raises(ValueError, match="does not exist"):
+        ledger.resume(build_id)
+    # Refused before its lease was taken.
+    build = ledger.builds.get_build(build_id)
+    assert build.state == "pending" and build.attempt is None and build.lease_owner is None
 
 
 def test_a_run_that_ends_before_a_checkpoint_fails(ledger: Ledger):
@@ -3233,19 +3396,31 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     ``retry`` rank 1's copy cannot be read for one save of step 2, saved again. Rank 1
     has another config in ``mismatch``, one that is not JSON in ``nonjson``, async
     saves in ``modes``, another signing key in ``otherkey``, another ledger in
-    ``otherledger``, and a copy with other bytes in ``badcopy``.
+    ``otherledger``, a ledger that fails to answer in ``unreachable``, and a copy with
+    other bytes in ``badcopy``. In ``unread`` rank 0's copy cannot be read for step 2's
+    asynchronous acceptance, and in ``closefails`` rank 0's manager fails to close at
+    the finish. Under a 10 second group timeout, rank 1 never comes to the run in
+    ``stall``, and in ``lost`` dies as rank 0 sends it the opened run.
 
     Asynchronous, the group gets its rank directly and the environment names none, so
     the writer's subprocess has only what each rank configured.
     """
-    asynchronous = case == "async" or (case == "modes" and rank == 1)
+    os.setsid()  # killed with its writer subprocess if it hangs
+    asynchronous = case in ("async", "unread") or (case == "modes" and rank == 1)
     if case == "async":
         os.environ.pop("RANK", None)
         os.environ.pop("WORLD_SIZE", None)
     else:
         os.environ.update(RANK=str(rank), WORLD_SIZE=str(world))
+    if case == "unread":
+        # torch_checkpointing 0.1.1 stages for CUDA whenever an accelerator exists.
+        torch.accelerator.is_available = lambda: False
     dist.init_process_group(
-        "gloo", init_method=f"file://{root}/rendezvous", rank=rank, world_size=world
+        "gloo",
+        init_method=f"file://{root}/rendezvous",
+        rank=rank,
+        world_size=world,
+        timeout=timedelta(seconds=10) if case in ("stall", "lost") else None,
     )
     if rank == 0 and case == "mute":
         vestigo.torch._Ranks.post = lambda *args, **kwargs: None  # type: ignore[method-assign]
@@ -3253,6 +3428,24 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         signing_key = Ed25519PrivateKey.generate().private_bytes_raw()
     elsewhere = rank == 1 and case == "otherledger"
     ledger = Ledger(Path(root) / ("elsewhere" if elsewhere else "ledger"), signing_key=signing_key)
+    if rank == 1 and case == "unreachable":
+        ledger.builds.get_build = lambda build_id: _raise(RuntimeError("the ledger is down"))
+    if rank == 1 and case == "lost":
+        share = vestigo.torch._Ranks.from_rank_0
+        calls: list[object] = []
+
+        def dying(self: vestigo.torch._Ranks, work: object) -> object:
+            calls.append(work)
+            if len(calls) == 2:  # rank 0 sends the run it opened
+                os._exit(3)
+            return share(self, work)
+
+        vestigo.torch._Ranks.from_rank_0 = dying  # type: ignore[method-assign]
+    if rank == 1 and case == "stall":
+        # Never comes to the run, and lives on until rank 0 gave up.
+        while not Path(root, "outcome0.json").exists():
+            time.sleep(0.1)
+        os._exit(0)
     model = _model()
     copy = Path(root, f"rank{rank}", "train.bin")
     if case == "badcopy" and rank == 1:
@@ -3273,6 +3466,8 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     saved: list[int] = []
     returned: list[str] = []
     outcome: dict[str, object] = {"saved": saved, "returned": returned}
+    groups = len(distributed_c10d._world.pg_map)
+    started = time.monotonic()
     try:
         run = ledger.run(
             model,
@@ -3280,15 +3475,44 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
             loss=nn.MSELoss(),
             version="tiny-v1",
             inputs={"train": copy}
-            if case in ("copies", "drift", "late", "retry", "badcopy")
+            if case in ("copies", "drift", "late", "retry", "badcopy", "unread")
             else None,
             config=config,
             checkpointing=checkpointing,
         )
     except Exception as exc:
         outcome.update(error=type(exc).__name__, message=str(exc))
+        outcome["seconds"] = time.monotonic() - started
         run = None
-    if run is not None:
+    if run is not None and case in ("unread", "closefails"):
+        outcome["execution"] = run.execution_id
+        for step in (1, 2):
+            if rank == 0 and step == 2 and case == "unread":
+                copy.chmod(0)  # unreadable, not gone, so the lease stays
+            try:
+                pending = run.save(step, {"model": model})
+                if isinstance(pending, Future):
+                    pending.result()
+                saved.append(step)
+            except InputChanged as exc:
+                outcome.update(error=type(exc).__name__, message=str(exc))
+            finally:
+                copy.chmod(0o600)
+        if rank == 0 and case == "closefails":
+            close = run.manager.close
+
+            def fails_once() -> None:
+                run.manager.close = close  # type: ignore[method-assign]
+                raise OSError("the manager did not close")
+
+            run.manager.close = fails_once  # type: ignore[method-assign]
+        try:
+            run.finish()
+            outcome["finished"] = True
+        except (OSError, InputChanged) as exc:
+            outcome.update(error=type(exc).__name__, message=str(exc))
+        run.close()
+    elif run is not None:
         outcome["execution"] = run.execution_id
         retried = False
         for index, step in enumerate((1, 2, 2) if case == "retry" else (1, 2)):
@@ -3330,6 +3554,8 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
             # after this rank's future resolves.
             outcome["released"] = [run.release_of(step).release_id for step in saved]  # type: ignore[union-attr]
         run.close()
+    # Each run's own group is gone with it, opened or refused.
+    outcome["groups"] = len(distributed_c10d._world.pg_map) - groups
     Path(root, f"outcome{rank}.json").write_text(json.dumps(outcome))
     # A dead peer can hang the group's teardown; nothing below needs it.
     os._exit(0)
@@ -3358,8 +3584,15 @@ def _two_ranks(root: Path, case: str) -> tuple[list[int], list[dict], bytes]:
     ]
     for process in ranks:
         process.start()
+    # One deadline for both, inside the test's own timeout.
+    deadline = time.monotonic() + 120
     for process in ranks:
-        process.join(120)
+        process.join(max(0.0, deadline - time.monotonic()))
+    for process in ranks:
+        if process.is_alive():
+            # Hung (a peer waiting for one that never comes): its session, writer too.
+            os.killpg(process.pid, signal.SIGKILL)
+            process.join()
     outcomes = [
         json.loads(path.read_text()) if (path := root / f"outcome{r}.json").exists() else None
         for r in (0, 1)
@@ -3389,6 +3622,7 @@ def test_every_rank_runs_one_run_whose_releases_rank_zero_makes(tmp_path: Path, 
     assert zero is not None and one is not None
     # One execution, each save one release on both ranks, which both finished.
     assert zero["execution"] == one["execution"] and zero["released"] == one["released"]
+    assert zero["groups"] == one["groups"] == 0
     assert len(zero["released"]) == 2
     # A synchronous save returned it on every rank.
     if case == "sync":
@@ -3456,6 +3690,54 @@ def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
         assert release.sequence == 1
 
 
+def test_a_failed_asynchronous_save_does_not_stop_the_finish_on_any_rank(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "unread")
+
+    assert exits == [0, 0]
+    zero, one = outcomes
+    assert zero is not None and one is not None
+    # Rank 0's future said why step 2 was not released; rank 1's write was whole.
+    assert zero["saved"] == [1] and "cannot be read" in zero["message"]
+    assert one["saved"] == [1, 2]
+    assert zero.get("finished") and one.get("finished")
+    with Ledger(tmp_path / "ledger") as ledger:
+        assert ledger.builds.get_build(zero["execution"]).state == "ready"
+        assert ledger.release_of(zero["execution"], 2) is None
+
+
+def test_a_rank_that_cannot_wait_for_its_save_stops_every_rank_s_finish(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "closefails")
+
+    assert exits == [0, 0]
+    for each in outcomes:
+        assert each is not None and each["saved"] == [1, 2] and "finished" not in each
+        assert each["error"] == "OSError" and "the manager did not close" in each["message"]
+    with Ledger(tmp_path / "ledger") as ledger:
+        assert ledger.builds.get_build(outcomes[0]["execution"]).state == "building"
+
+
+def test_a_rank_that_never_comes_stops_rank_0_at_the_group_s_timeout(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "stall")
+
+    # At the 10 seconds the launcher gave, not the 30 minutes of a group's own default.
+    assert exits == [0, 0]
+    zero = outcomes[0]
+    assert zero is not None and "error" in zero and zero["seconds"] < 60
+    assert zero["groups"] == 0
+
+
+def test_a_rank_lost_as_the_run_opens_leaves_it_failed_not_held(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "lost")
+
+    assert exits == [0, 3]
+    zero = outcomes[0]
+    assert zero is not None and "error" in zero and zero["groups"] == 0
+    with Ledger(tmp_path / "ledger") as ledger:
+        [build] = [ledger.builds.get_build(each) for each in _builds(ledger)]
+        # Rank 0 closed the run it opened, which no rank holds.
+        assert build is not None and build.state == "failed"
+
+
 @pytest.mark.parametrize("case", ["copies", "drift", "late", "retry"])
 def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, case: str):
     exits, outcomes, _ = _two_ranks(tmp_path, case)
@@ -3512,6 +3794,7 @@ def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path,
         ("otherkey", "ValueError", "rank 1's verify_key differ"),
         ("badcopy", "InputChanged", "has other bytes on rank 1"),
         ("otherledger", "ValueError", "rank 1's ledger does not hold execution"),
+        ("unreachable", "RuntimeError", "the ledger is down"),
     ],
 )
 def test_a_rank_that_runs_something_else_stops_every_rank(
@@ -3522,9 +3805,10 @@ def test_a_rank_that_runs_something_else_stops_every_rank(
     assert exits == [0, 0]
     for each in outcomes:
         assert each is not None and each["error"] == error and message in each["message"]
+        assert each["groups"] == 0
     with Ledger(tmp_path / "ledger") as ledger:
         builds = _builds(ledger)
-        if case != "otherledger":
+        if case not in ("otherledger", "unreachable"):
             # Refused before rank 0 opened anything.
             assert builds == []
         else:
