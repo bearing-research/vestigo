@@ -1508,9 +1508,12 @@ def test_an_attempt_writes_only_its_own_checkpoints(ledger: Ledger):
 
 @pytest.mark.parametrize("native", [PurePosixPath, PureWindowsPath], ids=["posix", "windows"])
 def test_a_checkpoint_path_is_read_by_its_own_parts(native):
-    """torch_checkpointing hands the storage a native Path: on Windows it holds backslashes."""
-    at = _Location.of(native("vestigo-torch/e1/a1/step-3/model/0.pt"))
-    assert (at.execution_id, at.attempt, at.step, at.file) == ("e1", "a1", 3, "model/0.pt")
+    """torch_checkpointing hands the storage a native path or its str (a finalize callback's):
+    on Windows they hold backslashes."""
+    file = "vestigo-torch/e1/a1/step-3/model/0.pt"
+    for path in (native(file), str(Path(file))):
+        at = _Location.of(path)
+        assert (at.execution_id, at.attempt, at.step, at.file) == ("e1", "a1", 3, "model/0.pt")
     assert LedgerStorage.remap_path(None, native("vestigo-torch/e1/a1/step-3")) == (
         "vestigo-torch/e1/a1/step-3"
     )

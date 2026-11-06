@@ -1027,8 +1027,8 @@ class _Location:
 
     @classmethod
     def of(cls, path: Path | str) -> _Location:
-        # torch_checkpointing hands over a native Path: on Windows its parts split on "\\".
-        parts = path.parts if isinstance(path, PurePath) else PurePosixPath(path).parts
+        # torch_checkpointing hands over a native path, or its str: on Windows, "\\" splits.
+        parts = (path if isinstance(path, PurePath) else PurePath(path)).parts
         match = _STEP_DIR.fullmatch(parts[3]) if len(parts) >= 4 else None
         if parts[:1] != (ROOT,) or match is None:
             raise FileNotFoundError(f"{path} is not a checkpoint id")
