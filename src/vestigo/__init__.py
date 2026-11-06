@@ -10,5 +10,7 @@ and the one write discipline they share; ``blob_store`` the byte backends;
 ``provenance`` the transform spec, its hash and the per-output key derivation;
 ``uris`` the artifact and name URI grammar and the process's scheme;
 ``file_modes`` the private directory and file modes the stores create with;
-``tables`` the list of tables the ledger owns.
+``tables`` the list of tables the ledger owns; ``checkpoint_files`` the layout of a
+checkpoint made of files, which imports no torch; ``torch`` the PyTorch adapter (the
+``torch`` extra), each checkpoint a release.
 """

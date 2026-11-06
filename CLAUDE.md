@@ -47,7 +47,7 @@ signatures, imported only when a key is given. `[torch]` pins the torch and
 `torch-checkpointing` that `vestigo.torch` is built on (CPU wheels from the PyTorch index in development); importing the
 module without them raises one `ImportError` naming the extra. CI's matrix runs
 without it (`--no-extra torch`, `--ignore=tests/test_torch.py`); the pre-commit
-job installs it for ty, and a separate `torch` job runs `tests/test_torch.py`
+job installs it for ty, and a separate `torch` job runs `tests/test_torch.py` on 3.12 and 3.14
 on SQLite, Postgres, and MinIO, fake-gcs-server and Azurite, one rank and two,
 and runs the scripts in `examples/torch/` as subprocesses. `docs/torch.md` is the
 user guide; a change to the adapter's API updates both.
@@ -57,7 +57,7 @@ user guide; a change to the adapter's API updates both.
 ```bash
 uv sync --all-extras                                     # package, every extra, dev group
 uv run pytest                                            # the suite (Docker for Postgres and the emulators)
-VESTIGO_REQUIRE_DOCKER=1 uv run pytest -W error          # as CI, warnings fatal
+VESTIGO_REQUIRE_DOCKER=1 uv run pytest                   # as CI: no Docker skips
 uv run pre-commit run --all-files                        # ruff, ruff format, ty, uv lock --check
 uv run pre-commit run --hook-stage manual --all-files    # the above plus pytest
 uv build && uvx twine check dist/*                       # what release.yml builds
@@ -123,7 +123,7 @@ module gains an entry point.
   suite's validator, the session's Postgres container); a helper lives in the module that
   uses it, and imports sit at the top of the module.
 - Fixtures yield and close their stores; a test closes any connection or
-  response body it opens. The suite passes under `-W error`; keep it so.
+  response body it opens. Warnings are errors (`filterwarnings` in pyproject); keep it so.
 - Every new test is teeth-checked: it fails on the code it pins.
 - `docs/ledger.md` and `docs/torch.md` are the user guides; `examples/ledger/` and
   `examples/torch/` are their scripts, which `tests/test_examples.py` (matrix) and

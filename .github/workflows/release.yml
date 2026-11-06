@@ -70,7 +70,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           python-version: "3.12"
-          version: "latest"
+          version: "0.13.1"
       - run: uv sync --all-extras --locked
       - run: uv run pytest -q -p no:cacheprovider
         env:
@@ -79,7 +79,7 @@ jobs:
   build:
     name: Build and smoke-test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     needs: test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -88,7 +88,7 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
         with:
           python-version: "3.12"
-          version: "latest"
+          version: "0.13.1"
       - run: uv build --out-dir dist
       - name: Smoke-test the wheel
         run: |
@@ -97,11 +97,20 @@ jobs:
           uv venv /tmp/smoke
           VIRTUAL_ENV=/tmp/smoke uv pip install --index https://pypi.org/simple/ "${WHEEL}"
           /tmp/smoke/bin/python -c "
+          from vestigo import checkpoint_files
           from vestigo.build_store import BuildStore
           from vestigo.releases import ReleaseStore
           from vestigo.sql_backend import SqliteDialect
           from vestigo.store import ArtifactStore
           print('vestigo imports ok')
+          "
+          # The adapter with its extra; CPU torch first, which the extra's torch>= accepts.
+          uv venv /tmp/smoke-torch
+          VIRTUAL_ENV=/tmp/smoke-torch uv pip install --index-url https://download.pytorch.org/whl/cpu torch
+          VIRTUAL_ENV=/tmp/smoke-torch uv pip install --index https://pypi.org/simple/ "${WHEEL}[torch]"
+          /tmp/smoke-torch/bin/python -c "
+          import vestigo.torch
+          print('vestigo.torch imports ok')
           "
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
