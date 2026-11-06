@@ -847,7 +847,9 @@ def test_a_save_after_other_bytes_releases_nothing_and_lapses_the_lease(
         else:
             (tree / "sub" / "b.bin").unlink()
 
-        with pytest.raises(InputChanged, match=f"at {tree.absolute()} has other bytes"):
+        with pytest.raises(
+            InputChanged, match=f"at {re.escape(str(tree.absolute()))} has other bytes"
+        ):
             trainer.train(run, 2)
         assert run.release_of(2) is None
         assert ledger.builds.get_build(run.execution_id).lease_owner is None
@@ -869,7 +871,7 @@ def test_a_save_after_an_input_is_gone_releases_nothing_and_lapses_the_lease(
         else:
             for each in (tree / "a.bin", tree / "sub" / "b.bin"):
                 each.unlink()
-        with pytest.raises(InputChanged, match=f"at {data.absolute()} is gone"):
+        with pytest.raises(InputChanged, match=f"at {re.escape(str(data.absolute()))} is gone"):
             trainer.train(run, 2)
         assert run.release_of(2) is None
         assert ledger.builds.get_build(run.execution_id).lease_owner is None
@@ -941,7 +943,7 @@ def test_a_stat_that_hashed_to_the_pin_is_not_read_again(
     data = _file(tmp_path / "train.bin")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": data}) as run:
-        data.chmod(0o600)
+        os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns - 10**9))
         pins = _counted(monkeypatch, "_pin")
         trainer.train(run, 2)
         assert len(pins) == 1
@@ -4148,6 +4150,8 @@ def _example(
         launch = ["-m", "torch.distributed.run", f"--nproc-per-node={ranks}"]
         rendezvous = ["--master-addr=127.0.0.1", f"--master-port={port}"]
         command = [sys.executable, *launch, *rendezvous, *command[1:]]
+    # PyTorch's Windows wheels have no libuv, which torchrun's store asks for by default.
+    env = {**os.environ, "USE_LIBUV": "0"} if sys.platform == "win32" else None
     # Its own session, so a timeout kills torchrun's ranks with the launcher.
     with subprocess.Popen(
         command,
@@ -4155,6 +4159,7 @@ def _example(
         stderr=subprocess.PIPE,
         text=True,
         cwd=cwd,
+        env=env,
         start_new_session=True,
     ) as process:
         try:
