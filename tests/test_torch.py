@@ -372,10 +372,13 @@ def test_a_failed_asynchronous_save_is_reported_by_its_future_alone(
     asynchronous = CheckpointManager.Config.with_async_save()
     with _run(ledger, trainer, {"train": tree}, checkpointing=asynchronous) as run:
         trainer.train(run, 1)
-        aside = tree.rename(tmp_path / "aside")
-        with pytest.raises(InputChanged, match="cannot be read"):
-            trainer.train(run, 2)
-        aside.rename(tree)
+        # Unreadable, not gone (a gone input is other bytes and lapses the lease).
+        tree.chmod(0)
+        try:
+            with pytest.raises(InputChanged, match="cannot be read"):
+                trainer.train(run, 2)
+        finally:
+            tree.chmod(0o700)
         # Handled, the step's error is not raised again: the run finishes.
         run.finish()
     assert ledger.builds.get_build(run.execution_id).state == "ready"
@@ -3173,10 +3176,9 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         run = None
     if run is not None and case in ("unread", "closefails"):
         outcome["execution"] = run.execution_id
-        aside = copy.with_name("aside")
         for step in (1, 2):
             if rank == 0 and step == 2 and case == "unread":
-                copy.rename(aside)
+                copy.chmod(0)  # unreadable, not gone, so the lease stays
             try:
                 pending = run.save(step, {"model": model})
                 if isinstance(pending, Future):
@@ -3185,8 +3187,7 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
             except InputChanged as exc:
                 outcome.update(error=type(exc).__name__, message=str(exc))
             finally:
-                if aside.exists():
-                    aside.rename(copy)
+                copy.chmod(0o600)
         if rank == 0 and case == "closefails":
             close = run.manager.close
 
