@@ -258,6 +258,29 @@ class TestRequirements:
         assert store.get_artifact(*whole) is None
         assert _edges(store) == set()
 
+    def test_a_chain_of_requirements_goes_in_one_sweep_as_the_dry_run_said(self, store):
+        leaf = _ready(store, "leaf")
+        middle = _ready(store, "middle", requires=[leaf])
+        _ready(store, "top", requires=[middle])
+
+        assert (
+            store.garbage_collect(max_idle_days=30, collect_latest=True, dry_run=True)[
+                "deleted_count"
+            ]
+            == 3
+        )
+        assert _sweep(store) == 3
+        assert store.list_artifacts() == []
+
+    def test_a_required_lower_version_goes_before_the_top_of_its_id(self, store):
+        """The top waits for every lower version, which waits for its requirer."""
+        lower = _ready(store, "file")
+        _ready(store, "manifest", requires=[lower])
+        _ready(store, "file")
+
+        assert _sweep(store) == 3
+        assert store.list_artifacts() == []
+
     def test_failed_files_go_in_the_sweep_that_takes_their_failed_manifest(self, store):
         def failed(artifact_id: str, requires=()) -> tuple[str, int]:
             version = store.create_artifact(artifact_id, f"prov-{artifact_id}", requires=requires)

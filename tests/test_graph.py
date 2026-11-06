@@ -540,6 +540,18 @@ class TestDefinitions:
         assert store.definition_of("old", 2) == first
         assert store.versions_lacking_definition() == []
 
+    def test_the_executor_filter_is_exact_about_case(self, backend_store):
+        # SQLite's LIKE folds ASCII case; Postgres's does not.
+        for artifact_id, executor in (("lower", "x@v1"), ("upper", "X@v1")):
+            version = backend_store.create_artifact(
+                artifact_id, f"prov-{artifact_id}", TransformSpec(executor, {}, [])
+            )
+            backend_store.finalize_artifact(artifact_id, version, "{}", 1, 1)
+
+        for executor, artifact_id in (("x@v1", "lower"), ("X@v1", "upper")):
+            lacking = backend_store.versions_lacking_definition(executor=executor)
+            assert [v.id for v in lacking] == [artifact_id]
+
     def test_versions_lacking_a_definition_come_from_every_tenant(self, store):
         """The store-wide upgrade read: each row carries the tenant set_definitions needs."""
         spec = TransformSpec("x@v1", {}, [])

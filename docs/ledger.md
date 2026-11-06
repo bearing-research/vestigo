@@ -86,13 +86,19 @@ if hit is None:
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
   stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
-  `sweep_zombie_builds` fails every `building` row older than its cutoff, so run it only
-  where no live writer can hold a row that long.
+  `sweep_zombie_builds` fails every `building` row older than its cutoff, except the
+  rows of a build whose lease is live (its target, its releases' outputs, its
+  computation's rows), so run it only where no writer without a lease can hold a row
+  that long.
 - **When two ids finalize the same key,** the later one is marked `superseded`: it
   reads the first one's bytes and keeps its own id and version.
-- **Ids** may not contain `/` or `@v=`. An id you make up per computation (a
-  `uuid4`) should be created with `minted=True`, so retention may collect its current
-  value.
+- **Ids** may not contain `/`, `\` or `@v=`, be `..`, or end in `~` and 16 to 64
+  lowercase hex digits (the blob key of another id's build attempt): `create_artifact`
+  raises `ValueError`. Prefix filters (`list_versions_by_id_prefix`, `exclude_id_prefix`,
+  `name_prefix`) compare exactly, case included; an empty `exclude_id_prefix` excludes
+  nothing, and an empty prefix to `list_*_by_id_prefix` raises. An id you make up per
+  computation (a `uuid4`) should be created with `minted=True`, so retention may
+  collect its current value.
 
 `schema_json`, `row_count` and `byte_size` describe the bytes. vestigo stores them and
 does not parse the bytes. `register_validator(content_type, validate)` teaches
@@ -171,8 +177,11 @@ An attempt holds the build under a lease, which the worker renews with
 `builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
 lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
 and its releases are rejected, so the build goes on only in a new attempt (a resume)
-or a reclaim. `builds.lapse_lease(build_id, lease_owner)` ends a lease at once; it
-clears the owner, so a renewal racing it from another thread cannot revive it. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
+or a reclaim. An attempt a resume or a reclaim took the build from cannot be opened
+again either, even once its successor's lease lapses. `builds.lapse_lease(build_id,
+lease_owner)` ends a lease at once, under the build's write lock, so an acceptance
+already under way commits before it and nothing of the attempt after it; it clears the
+owner, so a renewal racing it from another thread cannot revive it. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
 build again after a crash.
 
 ## Releases

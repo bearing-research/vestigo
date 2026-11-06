@@ -1066,6 +1066,40 @@ class TestBuildStoreSharesTheBackend:
         finally:
             dialect.close()
 
+    def test_the_attempt_fence_reaches_an_older_database(self, postgres_dsn, tmp_path):
+        now = [1_700_000_000.0]
+        dialect = PostgresDialect(postgres_dsn)
+        try:
+            conn = dialect.connect()
+            _drop_ledger(conn)
+            conn.commit()
+            conn.close()
+
+            artifacts = ArtifactStore(tmp_path / "a", dialect=dialect)
+            BuildStore(tmp_path / "x.sqlite", dialect=dialect)
+            conn = dialect.connect()
+            conn.execute("ALTER TABLE build_attempts DROP COLUMN fenced_at")
+            conn.commit()
+            conn.close()
+            builds = BuildStore(tmp_path / "x.sqlite", dialect=dialect, clock=lambda: now[0])
+            version = artifacts.create_artifact("art", "prov-art", _spec())
+            builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+
+            assert builds.open_attempt("b", "a1", writable_until=now[0] + 3600)
+            now[0] += 61
+            assert builds.open_attempt("b", "a2", writable_until=now[0] + 3600)
+            now[0] += 61
+            assert not builds.open_attempt("b", "a1", writable_until=now[0] + 3600)
+            conn = dialect.connect()
+            [column] = conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'build_attempts' AND column_name = 'fenced_at'"
+            ).fetchall()
+            conn.close()
+            assert column["data_type"] == "double precision"
+        finally:
+            dialect.close()
+
     def test_a_fail_fenced_on_a_claim_needs_that_exact_claim(self, postgres_dsn, tmp_path):
         """The deadline read back from the row matches the one the fence sends."""
         dialect = PostgresDialect(postgres_dsn)
