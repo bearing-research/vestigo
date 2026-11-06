@@ -4619,12 +4619,15 @@ class ArtifactStore:
         since: float | None = None,
         sort: str = "created_at",
         order: str = "desc",
+        exclude_id_prefix: str | None = None,
     ) -> list[ArtifactVersion]:
         """List artifacts with optional filtering, paging and sorting.
 
         ``tenant`` also includes legacy tenantless artifacts. ``name_prefix`` filters
         by name. ``since`` is an epoch timestamp. ``sort`` is ``created_at``,
         ``byte_size`` or ``row_count`` (anything else means ``created_at``).
+        ``exclude_id_prefix`` leaves out every version whose id starts with it, such as
+        a consumer's bookkeeping rows, before the page is cut.
         """
         sort_col = self._SORT_COLUMNS.get(sort, "created_at")
         order_sql = "ASC" if str(order).lower() == "asc" else "DESC"
@@ -4654,6 +4657,10 @@ class ArtifactStore:
                     query += " AND av.created_at >= ?"
                     params.append(since)
 
+                if exclude_id_prefix is not None:
+                    query += " AND av.id NOT LIKE ? ESCAPE '\\'"
+                    params.append(_like_literal(exclude_id_prefix) + "%")
+
                 query += f" ORDER BY av.{sort_col} {order_sql} LIMIT ? OFFSET ?"
                 params.extend([limit, offset])
             else:
@@ -4673,6 +4680,9 @@ class ArtifactStore:
                 if since is not None:
                     conditions.append("created_at >= ?")
                     params.append(since)
+                if exclude_id_prefix is not None:
+                    conditions.append("id NOT LIKE ? ESCAPE '\\'")
+                    params.append(_like_literal(exclude_id_prefix) + "%")
 
                 if conditions:
                     query += " WHERE " + " AND ".join(conditions)
@@ -5940,8 +5950,18 @@ class ArtifactStore:
                 )
         return len(rows)
 
-    def stats(self, tenant: str | None = None, *, include_tenantless: bool = True) -> dict:
-        """Get artifact store statistics; ``include_tenantless`` as for :meth:`get_usage`."""
+    def stats(
+        self,
+        tenant: str | None = None,
+        *,
+        include_tenantless: bool = True,
+        exclude_id_prefix: str | None = None,
+    ) -> dict:
+        """Get artifact store statistics; ``include_tenantless`` as for :meth:`get_usage`.
+
+        ``exclude_id_prefix`` leaves versions out of the version and byte totals as
+        :meth:`list_artifacts` does; ``name_count`` still counts every name.
+        """
         conn = self._get_connection()
         try:
             stats_query = """
@@ -5958,13 +5978,19 @@ class ArtifactStore:
                 FROM artifact_versions
             """
             stats_params: list[str] = []
+            conditions: list[str] = []
             if tenant is not None:
-                stats_query += (
-                    " WHERE tenant = ? OR tenant = '' OR tenant IS NULL"
+                conditions.append(
+                    "(tenant = ? OR tenant = '' OR tenant IS NULL)"
                     if include_tenantless
-                    else " WHERE tenant = ?"
+                    else "tenant = ?"
                 )
                 stats_params.append(tenant)
+            if exclude_id_prefix is not None:
+                conditions.append("id NOT LIKE ? ESCAPE '\\'")
+                stats_params.append(_like_literal(exclude_id_prefix) + "%")
+            if conditions:
+                stats_query += " WHERE " + " AND ".join(conditions)
 
             cursor = conn.execute(stats_query, stats_params)
             row = cursor.fetchone()
