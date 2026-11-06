@@ -2929,6 +2929,7 @@ def test_a_derivation_that_fails_leaves_nothing_current(
     assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
 
 
+@SUBSECOND_LEASES
 def test_a_derivation_slower_than_its_lease_is_still_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
