@@ -157,6 +157,16 @@ def test_a_large_blob_round_trips_in_parts(store, tmp_path: Path):
         assert b"".join(chunks) == LARGE
 
 
+def test_the_root_lists_the_whole_bucket(store):
+    """``""`` is a remote at the bucket's root: a prefix every key has, not a key."""
+    artifact = f"root-{uuid.uuid4().hex[:8]}"
+    store.write_blob(artifact, 1, b"listed")
+
+    listed = {key: size for key, size, _ in store.objects("")}
+
+    assert listed[f"{store.prefix}/{artifact}@v=1.arrow"] == len(b"listed")
+
+
 def test_a_missing_bucket_is_an_error_where_the_service_tells_it_apart(backend):
     """S3 says ``NoSuchBucket`` on a GET and Azure ``ContainerNotFound`` on every call;
     neither reads as an absent blob. GCS answers the one ``NotFound`` for both, so a

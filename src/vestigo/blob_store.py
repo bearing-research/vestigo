@@ -579,7 +579,8 @@ class S3BlobStore(BlobStore):
 
         A backend error propagates.
         """
-        if not path.endswith("/"):
+        # "" names no key: it is the root, a prefix every object has.
+        if path and not path.endswith("/"):
             try:
                 with _object_store_call("head", _s3_absent):
                     head = self._client.head_object(Bucket=self.bucket, Key=path)
@@ -890,7 +891,8 @@ class GCSBlobStore(BlobStore):
             )
             return blob.name, int(blob.size), bytes_name
 
-        if not path.endswith("/"):
+        # "" names no key: it is the root, a prefix every object has.
+        if path and not path.endswith("/"):
             with _object_store_call("head"):
                 blob = self._client.bucket(self.bucket).get_blob(path)
             return [] if blob is None else [named(blob)]
@@ -1213,7 +1215,8 @@ class AzureBlobStore(BlobStore):
             etag = props.etag.strip('"')
             return props.name, int(props.size), f"etag:{etag}"
 
-        if not path.endswith("/"):
+        # "" names no key: it is the root, a prefix every object has.
+        if path and not path.endswith("/"):
             try:
                 with _object_store_call("head", _azure_absent):
                     props = self._client.get_blob_client(path).get_blob_properties()
@@ -1221,10 +1224,12 @@ class AzureBlobStore(BlobStore):
                 return []
             return [named(props)]
         with _object_store_call("list"):
+            # On a hierarchical namespace (ADLS Gen2) a directory lists as a zero-length blob.
             return [
                 named(props)
-                for props in self._client.list_blobs(name_starts_with=path)
+                for props in self._client.list_blobs(name_starts_with=path, include=["metadata"])
                 if not props.name.endswith("/")
+                and (props.metadata or {}).get("hdi_isfolder") != "true"
             ]
 
     def delete_blob(self, artifact_id: str, version: int) -> bool:
