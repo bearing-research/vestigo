@@ -11,7 +11,22 @@ from vestigo import checkpoint_files
 
 
 @pytest.mark.parametrize(
-    "path", ["", "/etc/passwd", "../up", "a/../../up", "a//b", "./a", "a/.", "a\x00b"]
+    "path",
+    [
+        "",
+        "/etc/passwd",
+        "../up",
+        "a/../../up",
+        "a//b",
+        "./a",
+        "a/.",
+        "a\x00b",
+        # Each leaves the folder on a Windows reader.
+        "..\\..\\up",
+        "C:\\up",
+        "C:up",
+        "\\\\server\\share\\x",
+    ],
 )
 def test_a_path_that_leaves_the_checkpoint_is_refused(path: str):
     with pytest.raises(ValueError, match="not a path inside a checkpoint"):

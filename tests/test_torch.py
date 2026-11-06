@@ -1318,6 +1318,36 @@ def test_a_checkpoint_is_one_release_of_its_files_under_a_manifest(ledger: Ledge
         assert required == {(v.id, v.version) for v in files.values()}
 
 
+def test_a_save_and_a_load_work_through_the_ledger_already_open(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    opened, read = [], []
+    init, files = Ledger.__init__, Ledger._files
+
+    def counted_init(self: Ledger, *args, **kwargs) -> None:
+        opened.append(args)
+        init(self, *args, **kwargs)
+
+    def counted_files(self: Ledger, at):
+        read.append(at)
+        return files(self, at)
+
+    monkeypatch.setattr(Ledger, "__init__", counted_init)
+    monkeypatch.setattr(Ledger, "_files", counted_files)
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        reader = Trainer(ledger)
+        ledger.load(source, {"model": reader.model, "optim": reader.optimizer, "step": None})
+
+    assert opened == [] and len(read) == 1
+    assert _same(reader.weights(), trainer.weights())
+    # A writer's subprocess gets no ledger with its config: it opens its own.
+    config = run._checkpoints.configure(CheckpointManager.Config(), opened=ledger)
+    assert pickle.loads(pickle.dumps(config.storage_config)).opened is None
+
+
 def _finalize(run: Run, step: int) -> None:
     """Call the finalize callback as the writer does, with a storage *run* configured."""
     config = run._checkpoints.configure(CheckpointManager.Config())
@@ -1701,6 +1731,25 @@ def test_a_hosted_checkpoint_is_one_release_the_ledger_loads(ledger: Ledger, tmp
     assert reader.optimizer.state_dict()["state"][0]["step"] == 2 * 4
 
 
+def test_a_step_is_released_once_per_attempt_through_a_host(ledger: Ledger, tmp_path: Path):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as held:
+        host = _Host(ledger, held, tmp_path / "run")
+        with HostedRun(host) as run:
+            run.save(1, {"step": 1})
+            with pytest.raises(ValueError, match="step 1 is not after step 1"):
+                run.save(1, {"step": 2})
+        assert len(host.released) == 1
+        # A host that publishes the step again anyway shadows the first: its id is refused.
+        with HostedRun(host) as again:
+            again.save(1, {"step": 3})
+    first, second = host.released
+
+    with pytest.raises(ValueError, match="accepted that step again"):
+        ledger.checkpoint_id(first)
+    assert ledger.load(second, {"step": None}) == {"step": 3}
+
+
 def test_a_hosted_run_resumes_and_branches_from_either_writer_s_checkpoints(
     ledger: Ledger, tmp_path: Path
 ):
@@ -2063,6 +2112,33 @@ def test_a_garbled_manifest_is_a_refusal(tmp_path: Path, content: bytes, refusal
             _load_only(reader, source)
 
 
+def test_a_signed_report_in_the_manifest_s_place_is_a_refusal(tmp_path: Path):
+    ledger, run, source, verify = _signed_run(tmp_path)
+    with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
+        [manifest] = [v for v in _outputs(reader, run, 1) if v.params.get("manifest")]
+        report = reader.store.read_blob(*_report_of(reader, run, 1))
+        # Genuinely signed, by the same key, but a rank's report and not a manifest.
+        reader.store.write_blob(manifest.id, manifest.version, report)
+        with pytest.raises(OSError, match="is malformed"):
+            _load_only(reader, source)
+
+
+def test_a_signed_manifest_in_a_report_s_place_is_a_refusal(tmp_path: Path):
+    with Ledger(tmp_path / "ledger", signing_key=_keypair()[0]) as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            _save_meddled(ledger, run, 1, lambda: None)
+
+            def swap() -> None:
+                [manifest] = [v for v in _outputs(ledger, run, 1) if v.params.get("manifest")]
+                data = ledger.store.read_blob(manifest.id, manifest.version)
+                ledger.store.write_blob(*_report_of(ledger, run, 2), data)
+
+            with pytest.raises(OSError, match="is malformed"):
+                _save_meddled(ledger, run, 2, swap)
+            assert run.release_of(2) is None
+
+
 def test_a_second_manifest_row_is_a_refusal(tmp_path: Path):
     ledger, run, source, verify = _signed_run(tmp_path)
     with Ledger(tmp_path / "ledger", verify_key=verify) as reader:
@@ -2231,6 +2307,31 @@ def test_a_step_saved_again_after_a_failed_write_is_released(
         assert sorted(files) == ["model_0.pt", "step_0.pt"]
 
 
+def test_a_step_at_or_before_one_the_attempt_accepted_is_refused_before_it_is_staged(
+    ledger: Ledger,
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+        first = run.release_of(1)
+        staged = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@")
+        for step in (2, 1):
+            with pytest.raises(ValueError, match=f"step {step} is not after step 2"):
+                run.save(step, {"model": trainer.model, "step": step})
+        assert ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@") == staged
+
+        # Saved through the manager itself, such a step is refused at acceptance.
+        manager = _manager(run._checkpoints)
+        try:
+            for step in (2, 1):
+                with pytest.raises(ValueError, match=f"step {step} is not after step 2"):
+                    manager.save(run._checkpoints.checkpoint_id(step), {"step": step})
+        finally:
+            manager.close()
+        assert run.release_of(1) == first
+        assert run.save(3, {"step": 3}) == run.release_of(3)
+
+
 def _raise(error: type[Exception]) -> None:
     raise error
 
@@ -2242,6 +2343,21 @@ def test_a_head_points_at_an_accepted_release(ledger: Ledger):
         run.set_head("tiny/best", run.release_of(1).release_id)
 
     assert ledger.releases.reference("tiny/best") == (run.release_of(1).release_id, 1)
+
+
+def test_a_head_is_not_set_under_the_ledger_s_own_names(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program, {"data": "a"}) as ended:
+        trainer.train(ended, 1)
+        ended.finish()
+    final = ledger.final_checkpoint(ended.execution_id)
+    with ledger.start(trainer.program, {"data": "b"}) as run:
+        Trainer(ledger).train(run, 1)
+        for name in (f"vestigo-torch/{ended.execution_id}", "vestigo-torch"):
+            with pytest.raises(ValueError, match="reserves"):
+                run.set_head(name, run.release_of(1).release_id)
+
+    assert ledger.final_checkpoint(ended.execution_id) == final
 
 
 def test_a_renewal_that_fails_once_keeps_the_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2303,7 +2419,9 @@ def test_a_run_that_ends_before_a_checkpoint_fails(ledger: Ledger):
     with ledger.start(trainer.program) as run:
         pass
 
-    assert ledger.builds.get_build(run.execution_id).state == "failed"
+    build = ledger.builds.get_build(run.execution_id)
+    assert build.state == "failed"
+    assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
     assert ledger.find(trainer.program) is None
 
 
@@ -2377,7 +2495,7 @@ def test_a_name_derived_from_a_later_checkpoint_is_derived_from_no_earlier_one(
         trainer.train(run, 3)
     one, two, three = (run.release_of(step).release_id for step in (1, 2, 3))
     with monkeypatch.context() as patch:
-        patch.setattr(ArtifactStore, "publish_blob_from_path", lambda *a, **k: _raise(OSError))
+        patch.setattr(ArtifactStore, "open_blob_writer", lambda *a, **k: _raise(OSError))
         with pytest.raises(OSError):
             ledger.derive(three, "eval-2", {"weights": _export(trainer, tmp_path)})
     [output] = ledger.derive(one, "eval", {"metrics": b"1"}).outputs
@@ -2391,6 +2509,75 @@ def test_a_name_derived_from_a_later_checkpoint_is_derived_from_no_earlier_one(
 
     assert ledger.store.get_latest_version(output.id).params["from"] == three
     assert ledger.derive(two, "eval-2", {"metrics": b"2"}).release.state == "accepted"
+
+
+@pytest.mark.parametrize("when", ["in flight", "accepted meanwhile"])
+def test_an_earlier_checkpoint_racing_a_later_one_s_derivation_is_refused(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch, when: str
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 3)
+    one, three = run.release_of(1).release_id, run.release_of(3).release_id
+    refused = []
+
+    def derive_one() -> None:
+        with pytest.raises(ValueError, match="later checkpoint"):
+            ledger.derive(one, "eval", {"metrics": b"1"})
+        refused.append(one)
+
+    if when == "in flight":
+        # Three's outputs exist, building, while one's derivation looks.
+        write = Ledger._write_small
+
+        def then_one(self: Ledger, *args):
+            if not refused:
+                derive_one()
+            return write(self, *args)
+
+        monkeypatch.setattr(Ledger, "_write_small", then_one)
+        ledger.derive(three, "eval", {"metrics": b"3"})
+    else:
+        # Three's derivation lands between one's first look and its outputs' rows.
+        look = Ledger._refuse_later
+
+        def three_first(self: Ledger, prefix, source, name, mine=()):
+            look(self, prefix, source, name, mine)
+            if source.release_id == one and not mine:
+                monkeypatch.setattr(Ledger, "_refuse_later", look)
+                ledger.derive(three, "eval", {"metrics": b"3"})
+
+        monkeypatch.setattr(Ledger, "_refuse_later", three_first)
+        derive_one()
+
+    assert refused == [one]
+    [current] = ledger.derived(three, "eval").outputs
+    assert ledger.store.get_latest_version(current.id) == current
+    assert ledger.store.read_blob(current.id, current.version) == b"3"
+
+
+def test_a_file_rewritten_as_it_is_derived_is_recorded_by_the_bytes_stored(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+    export = tmp_path / "export.bin"
+    export.write_bytes(b"A" * 64)
+
+    def rewritten(real):
+        def store(self, *args, **kwargs):
+            export.write_bytes(b"B" * 64)  # an exporter still writing, the same size
+            return real(self, *args, **kwargs)
+
+        return store
+
+    for name in ("open_blob_writer", "publish_blob_from_path"):
+        monkeypatch.setattr(ArtifactStore, name, rewritten(getattr(ArtifactStore, name)))
+    [output] = ledger.derive(run.release_of(1).release_id, "export", {"w": export}).outputs
+
+    stored = ledger.store.read_blob(output.id, output.version)
+    assert output.content_sha256 == hashlib.sha256(stored).hexdigest()
 
 
 def test_keeping_a_derived_release_does_not_keep_its_checkpoint(ledger: Ledger):
@@ -2438,13 +2625,17 @@ def test_a_derivation_that_fails_leaves_nothing_current(
     def full(*args: object, **kwargs: object) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(ArtifactStore, "publish_blob_from_path", full)
+    monkeypatch.setattr(ArtifactStore, "open_blob_writer", full)
     with pytest.raises(OSError):
         ledger.derive(source, "eval", {"metrics": b"1", "weights": _export(trainer, tmp_path)})
 
     assert ledger.derived(source, "eval") is None
     staged = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@derived=")
     assert staged and {v.state for v in staged} == {"failed"}
+    # Its build and the placeholder it targets: none is left building.
+    [build] = ledger.builds.builds_of(vestigo.torch.DERIVE_EXECUTOR)
+    assert build.state == "failed"
+    assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
 
 
 def test_a_derivation_slower_than_its_lease_is_still_accepted(
@@ -2454,18 +2645,65 @@ def test_a_derivation_slower_than_its_lease_is_still_accepted(
         trainer = Trainer(ledger)
         with ledger.start(trainer.program) as run:
             trainer.train(run, 1)
-        real = ArtifactStore.publish_blob_from_path
+        real = ArtifactStore.open_blob_writer
 
         def slow(self, *args, **kwargs):
             time.sleep(0.5)  # an upload outlasting the lease
             return real(self, *args, **kwargs)
 
-        monkeypatch.setattr(ArtifactStore, "publish_blob_from_path", slow)
+        monkeypatch.setattr(ArtifactStore, "open_blob_writer", slow)
         bundle = ledger.derive(
             run.release_of(1).release_id, "export", {"weights": _export(trainer, tmp_path)}
         )
 
         assert bundle.release.state == "accepted"
+
+
+def test_collect_reaps_a_derivation_whose_process_died_once_its_lease_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    with Ledger(tmp_path / "ledger") as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 3)
+        one, three = run.release_of(1).release_id, run.release_of(3).release_id
+        # A deriving job whose lease, its write window, is short.
+        with Ledger(tmp_path / "ledger", writable_seconds=1.0) as job:
+            with monkeypatch.context() as patch:
+                # Killed mid-upload: nothing it would clean up on an error runs.
+                patch.setattr(Ledger, "_write_small", lambda *a: _raise(_Crash))
+                patch.setattr(ReleaseStore, "abandon", lambda *a: _raise(_Crash))
+                with pytest.raises(_Crash):
+                    job.derive(three, "eval", {"metrics": b"3"})
+        [build] = ledger.builds.builds_of(vestigo.torch.DERIVE_EXECUTOR)
+        outputs = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@derived=")
+        assert [v.state for v in outputs] == ["building"]
+
+        # While its lease holds it may still be uploading: nothing is touched.
+        assert ledger.collect(keep=3)["orphaned"] == 0
+        assert ledger.builds.get_build(build.build_id).state == "building"
+        with pytest.raises(ValueError, match="later checkpoint"):
+            ledger.derive(one, "eval", {"metrics": b"1"})
+
+        time.sleep(1.1)
+        dry = ledger.collect(keep=3, dry_run=True)
+        assert {(c["artifact_id"], c["version"]) for c in dry["collected"]} >= {
+            (v.id, v.version) for v in outputs
+        }
+        assert ledger.builds.get_build(build.build_id).state == "building"
+
+        result = ledger.collect(keep=3)
+
+        assert result["orphaned"] == len(outputs)
+        assert all(ledger.store.get_artifact(v.id, v.version) is None for v in outputs)
+        assert ledger.builds.get_build(build.build_id).state == "failed"
+        assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
+        [release] = ledger.releases.releases_of(build.build_id, "final")
+        assert release.state == "abandoned"
+        # The name is free again, from an earlier checkpoint and then a later one.
+        assert ledger.derive(one, "eval", {"metrics": b"1"}).release.state == "accepted"
+        [current] = ledger.derive(three, "eval", {"metrics": b"3"}).outputs
+        assert ledger.store.get_latest_version(current.id) == current
 
 
 # --- Retention ---
@@ -2518,6 +2756,42 @@ def test_a_dry_run_collects_nothing(ledger: Ledger):
         collected = {(c["artifact_id"], c["version"]) for c in result["collected"]}
         assert collected == set(steps[1] + steps[2])
         assert _stored(ledger, steps) == [1, 2, 3]
+
+
+def test_collect_counts_the_staged_files_it_takes_and_a_dry_run_lists_them(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        with monkeypatch.context() as patch:
+            patch.setattr(ReleaseStore, "accept", lambda *a, **k: _raise(OSError))
+            with pytest.raises(OSError):
+                trainer.train(run, 1)
+        trainer.step = 0
+        trainer.train(run, 1)
+        prefix = f"torch_{run.execution_id}@attempt={run.attempt}@step=1"
+        staged = {
+            (v.id, v.version): ledger.store.blob_size(v.id, v.version)
+            for v in ledger.store.list_versions_by_id_prefix(prefix)
+            if v.state == "building"
+        }
+        assert staged and all(staged.values())
+
+        dry = ledger.collect(keep=1, dry_run=True)
+
+        listed = {(c["artifact_id"], c["version"]): c["byte_size"] for c in dry["collected"]}
+        assert listed == staged
+        assert (dry["deleted_count"], dry["deleted_bytes"]) == (len(staged), sum(staged.values()))
+        # An idle floor they are within spares them, in a dry run as in a real one.
+        assert ledger.collect(keep=1, min_idle_seconds=3600, dry_run=True)["collected"] == []
+
+        result = ledger.collect(keep=1)
+
+        assert (result["deleted_count"], result["deleted_bytes"]) == (
+            len(staged),
+            sum(staged.values()),
+        )
+        assert all(ledger.store.get_artifact(*v) is None for v in staged)
 
 
 def test_a_finished_run_keeps_the_checkpoint_it_ended_on(ledger: Ledger):
@@ -2585,6 +2859,31 @@ def test_a_branch_marks_its_source_used_before_it_loads(ledger: Ledger):
         try:
             rows = conn.execute(
                 "SELECT last_used_at FROM artifact_versions WHERE release_id = ?", (source,)
+            ).fetchall()
+        finally:
+            conn.close()
+
+    assert rows and all(row["last_used_at"] > 0 for row in rows)
+
+
+def test_a_resume_marks_the_checkpoint_it_restores_used(ledger: Ledger):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+    older = run.release_of(1).release_id
+    conn = ledger.store._get_connection()
+    try:
+        conn.execute("UPDATE artifact_versions SET last_used_at = 0 WHERE release_id = ?", (older,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Before the attempt opens: a collection reading the executions first would not keep it.
+    with ledger.resume(run.execution_id, from_release=older):
+        conn = ledger.store._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT last_used_at FROM artifact_versions WHERE release_id = ?", (older,)
             ).fetchall()
         finally:
             conn.close()
@@ -2754,6 +3053,41 @@ def test_asynchronous_saves_release_in_order_and_resume(tmp_path: Path):
         assert _same(trainer.weights(), expected)
 
 
+def test_an_asynchronous_save_returns_once_its_state_is_copied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The CPU stager, which macOS runs too once no accelerator shows (see above).
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+    saved = threading.Event()
+    with Ledger(tmp_path / "ledger") as ledger:
+        model = _model()
+        program = _program(ledger, model, torch.optim.SGD(model.parameters(), lr=0.1))
+        with ledger.start(program, checkpointing=ASYNC) as run:
+            # The first save starts the writer's subprocess, which save waits for.
+            run.save(1, {"model": model}).result()
+            stager = run.manager._saver.stager
+            stage = stager._stage_on_worker
+
+            def late(*args):
+                # Copies once save has returned, or after a second if save waits for it.
+                saved.wait(1)
+                return stage(*args)
+
+            monkeypatch.setattr(stager, "_stage_on_worker", late)
+            expected = [p.detach().clone() for p in model.parameters()]
+            pending = run.save(2, {"model": model})
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.add_(1.0)  # the next optimizer step, in place
+            saved.set()
+            pending.result()
+            run.finish()
+        loaded = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 1))
+        ledger.load(run.release_of(2).release_id, {"model": loaded})
+
+    assert _same(list(loaded.parameters()), expected)
+
+
 # --- Object store ---
 
 
@@ -2863,6 +3197,26 @@ def test_checkpoints_on_an_object_store_load_back(tmp_path: Path, remote: Remote
         [model] = [v for v in _outputs(ledger, first, 3) if v.params.get("file") == "model_0.pt"]
         assert remote.open().blob_exists(model.id, model.version)
         assert not (tmp_path / "ledger" / "blobs").exists()
+
+
+def test_a_write_to_an_object_store_stages_where_collect_sweeps(tmp_path: Path):
+    remote = RemoteBlobs(
+        "s3",
+        "ckpt",
+        settings=BlobSettings(s3_region="us-east-1", s3_access_key="a", s3_secret_key="b"),
+    )
+    with Ledger(tmp_path / "ledger", blobs=remote) as ledger:
+        staging = ledger.store.blob_store.staging_dir
+        assert staging == tmp_path / "ledger" / "staging"
+        # What a rank killed mid-upload leaves, an hour and more ago.
+        staging.mkdir()
+        left = staging / "vestigo_blob_killed.tmp"
+        left.write_bytes(b"partial")
+        os.utime(left, (time.time() - 7200,) * 2)
+
+        ledger.collect(keep=1)
+
+        assert not left.exists()
 
 
 # --- Two ranks ---
@@ -3315,6 +3669,29 @@ def test_an_observation_that_fails_to_store_is_failed_for_cleanup(
 
         [staged] = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@observed=")
         assert staged.state == "failed"
+
+
+def test_an_observation_an_ended_attempt_never_stored_is_collected(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    run = ledger.start(trainer.program)
+    trainer.train(run, 1)
+    with monkeypatch.context() as patch:
+        # The process dies mid-upload: nothing fails the row.
+        patch.setattr(ArtifactStore, "publish_blob_from_path", lambda *a, **k: _raise(_Crash))
+        with pytest.raises(_Crash):
+            run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+    [staged] = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@observed=")
+    assert staged.state == "building"
+    # While its attempt holds the execution, it may still be storing.
+    assert ledger.collect(keep=1)["orphaned"] == 0
+    run.close()
+
+    with ledger.resume(run.execution_id):
+        assert ledger.collect(keep=1)["orphaned"] == 1
+
+    assert ledger.store.get_artifact(staged.id, staged.version) is None
 
 
 def test_an_archive_without_torch_s_metadata_entries_reads_as_none(tmp_path: Path):

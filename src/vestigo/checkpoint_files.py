@@ -10,6 +10,7 @@ other wrote. Torch-free, for such a host.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -18,19 +19,22 @@ from vestigo.store import ArtifactVersion
 FILE = "file"
 MANIFEST = "manifest"
 STEP = "step"
+# A drive on Windows ("C:x" is relative to C:'s current directory, "C:\x" absolute).
+_DRIVE = re.compile(r"[A-Za-z]:")
 
 
 def checked_path(path: str) -> str:
     """*path* if it names a file inside a checkpoint: relative, POSIX, no ``.`` or ``..``.
 
-    A reader writes the files out under these paths, so none may leave the folder.
+    A reader writes the files out under these paths, so none may leave the folder: on
+    Windows either, so no backslash and no drive.
 
     Raises:
         ValueError: it does not.
     """
-    if not isinstance(path, str) or "\x00" in path or path.startswith("/"):
+    if not isinstance(path, str) or "\x00" in path or "\\" in path or path.startswith("/"):
         raise ValueError(f"{path!r} is not a path inside a checkpoint")
-    if any(part in ("", ".", "..") for part in path.split("/")):
+    if _DRIVE.match(path) or any(part in ("", ".", "..") for part in path.split("/")):
         raise ValueError(f"{path!r} is not a path inside a checkpoint")
     return path
 
