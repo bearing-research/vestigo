@@ -14,7 +14,7 @@ All notable changes to vestigo are recorded here. The format follows
   `exclude_id_prefix`, which leaves out every version whose id starts with it,
   in SQL, so a page is cut and the totals are summed without a consumer's
   bookkeeping rows (a build's placeholder, say). The prefix is literal: `_`
-  and `%` match only themselves. `name_count` still counts every name.
+  and `%` match only themselves. `name_count` still counts every name (#59).
 
 ### Changed
 
