@@ -69,7 +69,8 @@ from urllib.parse import quote
 try:
     import torch.distributed as dist
     import torch.export
-    from torch.distributed.distributed_c10d import _get_default_store
+    from torch.distributed import distributed_c10d
+    from torch.distributed.distributed_c10d import _get_default_group, _get_default_store
     from torch_checkpointing.checkpoint_manager import CheckpointManager
     from torch_checkpointing.config import SyncCheckpointSaverConfig
     from torch_checkpointing.storage.base_storage import ReadArgs, Storage, StorageConfig
@@ -598,7 +599,17 @@ class _Ranks:
     def joined(cls, rank: int, world: int, barrier_seconds: float) -> _Ranks:
         """Every rank's, together: each rank makes the group at the same point."""
         store = dist.PrefixStore(f"{ROOT}/", _get_default_store())
-        return cls(rank, world, dist.new_group(backend="gloo"), store, barrier_seconds)
+        default = _get_default_group()
+        # new_group's own default is 30 minutes, whatever the launcher chose.
+        timeout = default._get_backend(default._device_types[0]).options._timeout
+        group = dist.new_group(backend="gloo", timeout=timeout)
+        return cls(rank, world, group, store, barrier_seconds)
+
+    def leave(self) -> None:
+        """Destroy the group, this rank's alone: each run opens its own."""
+        # Not twice, nor once the default group's destruction took it with it.
+        if self.group is not None and self.group in distributed_c10d._world.pg_map:
+            dist.destroy_process_group(self.group)
 
     def share(self, result: Any = None, error: BaseException | None = None) -> Any:
         """Rank 0's *result* or *error*, sent by rank 0; returned or raised on the rest."""
@@ -916,7 +927,7 @@ class Ledger:
 
     ``lease_seconds`` is how long a run's lease outlives its last renewal (a thread
     renews it at a third of that); ``writable_seconds`` bounds an attempt's whole write
-    window, past which nothing it releases is accepted.
+    window, past which nothing it releases is accepted and the run lets its lease lapse.
 
     With ``signing_key`` (a raw Ed25519 private key) each rank signs its report and
     rank 0 every checkpoint it accepts, and the ledger verifies with the key's public
@@ -1122,8 +1133,10 @@ class Ledger:
             if execution is not None:
                 return self._resume(execution, None, resolved, checkpointing, ranks)
             if from_release is not None:
-                return self._branch(program, from_release, resolved, checkpointing, ranks)
-            return self._open(program, resolved, None, checkpointing, ranks)
+                return self._branch(
+                    program, from_release, resolved, checkpointing, ranks, alone=True
+                )
+            return self._open(program, resolved, None, checkpointing, ranks, alone=True)
 
         return self._collective(terms, inputs, opened, checkpointing)
 
@@ -1160,41 +1173,48 @@ class Ledger:
             _term_digests(agreed())
             return opened(_resolve(inputs), _Ranks())
         ranks = _Ranks.joined(rank, world, barrier)
-        ranks.agree(agreed)
-        resolved = ranks.from_rank_0(lambda: _resolve(inputs))
-        copies = resolved.held
-        error: BaseException | None = None
-        if rank:
-            try:
-                copies = _copies(inputs or {}, resolved.held, rank)
-            except (OSError, ValueError, InputChanged) as exc:
-                error = exc
-        ranks.raise_any(error)
-
-        def start() -> tuple[_Checkpoints, str | None]:
-            run = opened(resolved, ranks)
-            own.append(run)
-            return run._checkpoints, run.restores_from
-
         own: list[Run] = []
-        checkpoints, restores_from = ranks.from_rank_0(start)
-        if rank == 0:
-            run = own[0]
-        else:
-            # This rank writes through its own ledger, which must be rank 0's.
-            if self.builds.get_build(checkpoints.execution_id) is None:
-                error = ValueError(
-                    f"rank {rank}'s ledger does not hold execution {checkpoints.execution_id}:"
-                    " every rank must open rank 0's ledger"
-                )
-            writer = replace(checkpoints, ledger=self.config, inputs=copies)
-            run = Run(self, writer, restores_from, checkpointing, ranks)
         try:
+            ranks.agree(agreed)
+            resolved = ranks.from_rank_0(lambda: _resolve(inputs))
+            copies = resolved.held
+            error: BaseException | None = None
+            if rank:
+                try:
+                    copies = _copies(inputs or {}, resolved.held, rank)
+                except (OSError, ValueError, InputChanged) as exc:
+                    error = exc
+            ranks.raise_any(error)
+
+            def start() -> tuple[_Checkpoints, str | None]:
+                run = opened(resolved, ranks)
+                # Open from here, even if sending it to the others fails.
+                own.append(run)
+                return run._checkpoints, run.restores_from
+
+            checkpoints, restores_from = ranks.from_rank_0(start)
+            if rank:
+                try:
+                    # This rank writes through its own ledger, which must be rank 0's.
+                    if self.builds.get_build(checkpoints.execution_id) is None:
+                        error = ValueError(
+                            f"rank {rank}'s ledger does not hold execution"
+                            f" {checkpoints.execution_id}: every rank must open rank 0's ledger"
+                        )
+                except BaseException as exc:
+                    # Any error: rank 0 waits below for word of it.
+                    error = exc
+                writer = replace(checkpoints, ledger=self.config, inputs=copies)
+                own.append(Run(self, writer, restores_from, checkpointing, ranks))
             ranks.raise_any(error)
         except BaseException:
-            run.close()
+            # The run closes with its group; without a run, the group alone.
+            if own:
+                own[0].close()
+            else:
+                ranks.leave()
             raise
-        return run
+        return own[0]
 
     def start(
         self,
@@ -1245,10 +1265,12 @@ class Ledger:
         inputs: _Inputs,
         checkpointing: Any,
         ranks: _Ranks,
+        *,
+        alone: bool = False,
     ) -> Run:
         self.checkpoint_id(from_release)
         self._use(from_release)
-        return self._open(program, inputs, from_release, checkpointing, ranks)
+        return self._open(program, inputs, from_release, checkpointing, ranks, alone=alone)
 
     def _use(self, release_id: str) -> None:
         """A use now of the checkpoint's outputs, so a collection with min_idle_seconds
@@ -1265,7 +1287,12 @@ class Ledger:
         init: str | None,
         checkpointing: Any,
         ranks: _Ranks,
+        *,
+        alone: bool = False,
     ) -> Run:
+        """A new execution in its first attempt. With *alone*, only if no other execution
+        of the computation is unfinished as it opens: that one is resumed instead
+        (refused while its lease is live), and the new one is failed unopened."""
         spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
         build_id = uuid.uuid4().hex
@@ -1290,13 +1317,42 @@ class Ledger:
             dispatch="external",
         )
         attempt = uuid.uuid4().hex
-        self.builds.open_attempt(
-            build_id,
-            attempt,
-            writable_until=time.time() + self.config.writable_seconds,
-            lease_owner=attempt,
-            lease_duration_seconds=self.lease_seconds,
-        )
+        conn = self.store._get_connection()
+        try:
+            # Keyed on the computation, so of two runs that both found nothing to resume
+            # one opens and the other sees it.
+            self.store.dialect.begin_write(conn, f"{ROOT}/{key}")
+            # As find_open_build, on this transaction: Postgres lends no second
+            # connection while it holds the lock.
+            other = (
+                conn.execute(
+                    "SELECT build_id FROM artifact_builds"
+                    " WHERE computation_key = ? AND state = 'building'"
+                    " ORDER BY created_at DESC LIMIT 1",
+                    (key,),
+                ).fetchone()
+                if alone
+                else None
+            )
+            now = time.time()
+            opened = other is None and self.builds.open_attempt_within(
+                conn,
+                build_id,
+                attempt,
+                writable_until=now + self.config.writable_seconds,
+                lease_owner=attempt,
+                lease_expires_at=now + self.lease_seconds,
+                now=now,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if other is not None:
+            self.builds.fail_build(build_id, f"execution {other['build_id']} opened first")
+            self.store.fail_artifact(placeholder, version)
+            return self._resume(other["build_id"], None, inputs, checkpointing, ranks)
+        if not opened:
+            raise RuntimeError(f"execution {build_id} did not open its first attempt")
         checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )
@@ -1358,8 +1414,9 @@ class Ledger:
         checkpointing: Any,
         ranks: _Ranks,
     ) -> Run:
-        build = self.builds.get_build(execution_id)
-        if build is None or build.computation_key is None:
+        # Before the lease is taken: a build of another executor is no execution.
+        build = self._build(execution_id)
+        if build.computation_key is None:
             raise ValueError(f"execution {execution_id} does not exist")
         params = build.params or {}
         recorded = params.get("inputs", {})
@@ -1373,6 +1430,7 @@ class Ledger:
         if from_release is not None:
             self.checkpoint_id(from_release)
             self._use(from_release)
+        program = self._definition(params["program"])
         attempt = uuid.uuid4().hex
         self.releases.resume(
             execution_id,
@@ -1382,7 +1440,6 @@ class Ledger:
             lease_duration_seconds=self.lease_seconds,
             from_release=from_release,
         )
-        program = self._definition(params["program"])
         checkpoints = _Checkpoints(
             self.config,
             execution_id,
@@ -2004,6 +2061,17 @@ class Ledger:
             self.builds.lapse_lease(writer.execution_id, writer.attempt)
             raise InputChanged(f"input {each.role!r} at {path} has other bytes {where}")
 
+    def _closed(self, writer: _Checkpoints) -> str | None:
+        """Why the attempt's write window refuses it, or None while the window is open."""
+        attempt = self.builds.get_attempt(writer.execution_id, writer.attempt)
+        if attempt is None or attempt.writable_until > time.time():
+            return None
+        return (
+            f"attempt {writer.attempt}'s write window on execution {writer.execution_id} "
+            f"closed {time.time() - attempt.writable_until:.0f}s ago (writable_seconds): "
+            "resume it in a new attempt"
+        )
+
     def _require_lease(self, writer: _Checkpoints) -> None:
         conn = self.store._get_connection()
         try:
@@ -2012,7 +2080,8 @@ class Ledger:
             conn.close()
         if not held:
             raise BuildLeaseLost(
-                f"attempt {writer.attempt} no longer holds execution {writer.execution_id}: "
+                self._closed(writer)
+                or f"attempt {writer.attempt} no longer holds execution {writer.execution_id}: "
                 "it finished, or another attempt took it over"
             )
 
@@ -2256,7 +2325,13 @@ class _Checkpoints:
         if storage.rank != 0:
             return
         with storage.opened() as ledger:
-            ledger._accept(self, at, storage.world, storage.known)
+            try:
+                ledger._accept(self, at, storage.world, storage.known)
+            except ReleaseRejected as exc:
+                closed = ledger._closed(self)
+                if closed is None:
+                    raise
+                raise ReleaseRejected(closed) from exc
 
     def _own(self, path: Path | str) -> _Location:
         at = _Location.of(path)
@@ -2548,6 +2623,8 @@ class Run:
     _ranks: _Ranks = field(default_factory=_Ranks, repr=False)
     finished: bool = False
     _manager: Any = field(default=None, repr=False)
+    # The last asynchronous save's future, which reports how that save went.
+    _pending: Future[Any] | None = field(default=None, repr=False)
     # Every rank's count of its synchronous saves, which names each one's outcome: a
     # save of a step again after a failed one must not read that one's.
     _saves: int = field(default=0, repr=False)
@@ -2586,15 +2663,23 @@ class Run:
 
     def _renew(self) -> None:
         every = self.ledger.lease_seconds / 3
+        builds = self.ledger.builds
         while not self._stop.wait(every):
             with self._renewing:
                 if self._stop.is_set():
                     return
                 try:
-                    renewed = self.ledger.builds.renew_lease(
+                    closed = self.ledger._closed(self._checkpoints)
+                    if closed is not None:
+                        # Nothing the attempt sends is accepted now: free the execution
+                        # for a resume rather than hold it while the process lives.
+                        builds.lapse_lease(self.execution_id, self.attempt)
+                        logger.warning("The %s; its lease has lapsed", closed)
+                        return
+                    renewed = builds.renew_lease(
                         self.execution_id, self.attempt, self.ledger.lease_seconds
                     )
-                except Exception:
+                except self.ledger.store.dialect.operational_error:
                     # A locked database, a dropped connection: the next tick retries.
                     logger.warning(
                         "Attempt %s could not renew its lease on execution %s",
@@ -2610,18 +2695,35 @@ class Run:
     def __enter__(self) -> Run:
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object
+    ) -> None:
+        if exc is None:
+            self.close()
+            return
+        try:
+            self.close()
+        except Exception:
+            # The block's own error is the one to raise; this one is only logged.
+            logger.warning(
+                "Attempt %s did not close cleanly on execution %s",
+                self.attempt,
+                self.execution_id,
+                exc_info=True,
+            )
 
     @property
     def manager(self) -> CheckpointManager:
         """The run's ``CheckpointManager``, built on first use; the run closes it."""
         if self._manager is None:
-            # A copy: configure sets the storage and callbacks on it, which are this run's.
-            config = self._checkpoints.configure(
-                copy.copy(self._config), self.rank, self.world, self.ledger
-            )
-            self._manager = config.build()
+            # A copy down to the writer's config, all configure sets: the caller's
+            # config stays as it was, and each run's storage and callbacks its own.
+            config = copy.copy(self._config)
+            config.save = copy.copy(config.save)
+            config.save.writer_config = copy.copy(config.save.writer_config)
+            self._manager = self._checkpoints.configure(
+                config, self.rank, self.world, self.ledger
+            ).build()
         return self._manager
 
     @property
@@ -2642,7 +2744,8 @@ class Run:
 
         Raises:
             ValueError: *step* is not after every step this attempt has accepted.
-            ReleaseRejected: this attempt no longer holds the execution.
+            ReleaseRejected: this attempt no longer holds the execution, or its write
+                window closed.
             InputChanged: a ``Path`` input's bytes changed since the run resolved
                 it, on any rank (from rank 0's future, for an asynchronous save);
                 nothing is released, and the attempt gives up its lease.
@@ -2656,6 +2759,7 @@ class Run:
         if not self._synchronous:
             pending = self.manager.save(checkpoint_id, _saved(state))
             assert pending is not None
+            self._pending = pending
             # The stager copies the state on a thread, holding the staging lock for write
             # until it has; taking it for read waits for the copy, not the write.
             with self.manager.lock():
@@ -2714,7 +2818,7 @@ class Run:
 
         Raises:
             BuildLeaseLost: this attempt no longer holds the execution (it finished,
-                or another attempt took it over).
+                another attempt took it over, or its write window closed).
         """
         # On disk, not in memory: an archive carries the weights.
         with tempfile.TemporaryDirectory() as scratch:
@@ -2748,16 +2852,22 @@ class Run:
         stays, under the reference ``vestigo-torch/<execution>``;
         :meth:`Ledger.final_checkpoint` names it.
 
-        Waits first for the save in flight, which lands as a release before the final one.
-        In a process group every rank calls it, and rank 0 releases.
+        Waits first for the save in flight, which lands as a release before the final one;
+        if it failed, its future reported why, and the run ends on its last accepted
+        checkpoint. In a process group every rank calls it, and rank 0 releases.
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
             InputChanged: a ``Path`` input's bytes changed since the run resolved
                 it, on any rank; the attempt gives up its lease.
         """
-        if self._manager is not None:
-            self._manager.close()
+        error: Exception | None = None
+        try:
+            self._drain()
+        except Exception as exc:
+            # Every rank meets at the gather below: one that cannot wait says so first.
+            error = exc
+        self._ranks.raise_any(error)
         # A remote input names the same objects on every rank: rank 0 lists them.
         held = self._checkpoints.inputs if self.rank == 0 else self._local
         seen = _seen(held, {})
@@ -2789,20 +2899,46 @@ class Run:
         )
         operations = [AdvanceReference(f"{ROOT}/{self.execution_id}", ended_on)] if ended_on else []
         release = self.ledger.releases.prepare(self.execution_id, self.attempt, "final")
-        with self._renewing:
-            self.ledger.releases.accept(release.release_id, [], operations)
-            self.finished = True
-            self._stop.set()
+        try:
+            with self._renewing:
+                self.ledger.releases.accept(release.release_id, [], operations)
+                self.finished = True
+                self._stop.set()
+        except ReleaseRejected:
+            raise
+        except Exception:
+            # Left preparing, it would refuse every later final release as out of order.
+            self.ledger.releases.abandon(release.release_id, self.attempt)
+            raise
+
+    def _drain(self) -> None:
+        """Wait for the save in flight and close the manager.
+
+        A failed asynchronous save's error is its future's to report: the caller had it
+        there, so it is not raised again here.
+        """
+        if self._manager is None:
+            return
+        try:
+            self._manager.close()
+        except Exception as exc:
+            # Whatever the save raised, of any type; anything else goes on up.
+            pending = self._pending
+            if pending is None or not pending.done() or pending.exception() is not exc:
+                raise
+            logger.info("Attempt %s's last save failed: %s", self.attempt, exc)
 
     def close(self) -> None:
         """Wait for the save in flight and stop renewing. An unfinished execution with a
         checkpoint stays resumable, its lease dropped so a resume need not wait; one
         without fails. Each rank closes its own; only rank 0's touches the lease."""
         try:
-            if self._manager is not None:
-                self._manager.close()
+            self._drain()
         finally:
-            self._close()
+            try:
+                self._close()
+            finally:
+                self._ranks.leave()
 
     def _close(self) -> None:
         self._stop.set()
@@ -2861,6 +2997,9 @@ class HostedRun:
         # torch-checkpointing 0.1.1 writes unaligned buffers, which O_DIRECT refuses on
         # flush (EINVAL on Linux); macOS has no O_DIRECT.
         config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+        # Into the host's folder itself: a temporary sibling, renamed into place, would
+        # be left beside it by a crash.
+        config.save.writer_config.write_to_temp_dir = False
         self.manager = config.build()
 
     def save(self, step: int, state: Mapping[str, Any]) -> int:

@@ -191,6 +191,9 @@ does, change `version`. Then it looks the computation up in the ledger:
 | only finished executions | starts a new execution | None |
 | an unfinished execution whose lease is live: its process is still running, or was killed under `lease_seconds` ago | raises `ValueError` | |
 
+Two processes that start the same computation at once open one execution between them:
+the second finds the first's as it opens, and raises `ValueError` as its lease is live.
+
 While the block runs, the run holds the execution with a lease that a background
 thread renews, so no other process can save to it. That is why the same script trains
 from scratch the first time and carries on after a crash. It is also why a change to
@@ -217,11 +220,13 @@ returns the checkpoint as an accepted release, and `release.release_id` is how y
 load it, branch from it or name it later. Each save's step comes after the step of
 every checkpoint the attempt has saved: a step again, or an earlier one, raises
 `ValueError` before anything is written. A save from a process that has lost the
-execution (another process resumed it) raises `ReleaseRejected`.
+execution (another process resumed it, or its write window closed) raises
+`ReleaseRejected`.
 
 **Leaving the block without `run.finish()`** (an exception, `SystemExit`, Ctrl+C)
 closes the run. It waits for the save in flight, keeps every checkpoint and drops the
-lease, so the next start resumes at once. A process killed outright cannot drop its
+lease, so the next start resumes at once. If closing fails too, the error is logged and
+the block's own exception is the one raised. A process killed outright cannot drop its
 lease, and the next start waits until it lapses, 60 seconds by default ([Resume after
 a crash](#resume-after-a-crash)).
 
@@ -408,6 +413,12 @@ past `lease_seconds` without renewing (a long pause, a database locked throughou
 fenced the same way, even if nothing took over: a lapsed lease is never renewed, so
 resume the execution in a new process.
 
+An attempt may write for `writable_seconds` (7 days by default) after it opens. Past
+that its saves raise `ReleaseRejected` and its `observe` raises `BuildLeaseLost`, both
+saying the write window closed, and the run lets its lease lapse, logging a warning, so
+another process can resume the execution at once while this one lives on. Resume it in
+a new attempt to go on, or pass `Ledger(..., writable_seconds=...)` for a longer window.
+
 `finish()` completes the execution, and nothing resumes it after that. The same
 computation run again after a finish is a new execution. The checkpoint the run ended
 on (its attempt's last, or the one it restored if it saved none) stays under the
@@ -563,7 +574,10 @@ settings (`items`, `default`) carry over. With async saves the writer runs in a
 subprocess, so the storage and callbacks are picklable descriptions of the ledger, and
 there each call opens its own connection; in the training process they work through
 the run's ledger. The manager has one save in flight. `finish()` and
-leaving the block wait for it. `run.manager` is the run's manager, for anything the run
+leaving the block wait for it. A save that failed reports its error through its future
+alone: `finish()` and `close()` do not raise it again, so a run whose last save failed
+(an input that could not be read for a moment) still finishes on its earlier
+checkpoint. `run.manager` is the run's manager, for anything the run
 does not wrap.
 
 What overlaps training is the write, not the copy. torch-checkpointing first stages
@@ -622,7 +636,10 @@ rank 0's: a rank whose ledger does not hold the run raises on every rank, and ra
 closes it.
 
 These exchanges go over a gloo group of their own, so they need no GPU whatever the
-training backend.
+training backend. The group waits as long as the process group's timeout (the
+`timeout` given to `init_process_group`), and each run destroys its own when it closes.
+A rank lost while the run opens stops the others there at that timeout, and rank 0
+closes the run it opened, so its lease is not held for a run no rank trains.
 
 A synchronous `save` and `finish` are collective too. Every rank gets rank 0's outcome:
 `save` returns the step's release on every rank, and an error rank 0 hit accepting the
@@ -636,7 +653,8 @@ raised. An asynchronous `save` returns each rank's own write future. `close` is 
 rank's own; only rank 0's touches the lease.
 
 A rank that raises outside a save leaves the others waiting at the next `ledger.run` or
-`finish` until the process group's timeout. A launcher such as `torchrun` ends every
+`finish` until the process group's timeout. A rank whose `finish` cannot wait for its
+save in flight raises that error on every rank. A launcher such as `torchrun` ends every
 rank when one fails.
 
 ### Inputs on several ranks
@@ -712,11 +730,12 @@ The host records each file as a version whose params name its path and step, plu
 manifest. That is the layout in `vestigo.checkpoint_files`, which imports no torch,
 and `LedgerStorage` writes its own checkpoints the same way. So `Ledger.load` reads a
 hosted checkpoint as it reads its own, and a hosted run can restore from a checkpoint
-`Ledger.run` wrote. Saves are synchronous and go to local disk first. As with `Run`,
-each save's step comes after every step the hosted run saved, or it raises
-`ValueError` before the host is called. A checkpoint whose attempt published its step
-again (a host that publishes twice) is shadowed: `checkpoint_id` and `load` of it raise
-`ValueError`, and the later one loads. A hosted run is
+`Ledger.run` wrote. Saves are synchronous and go to local disk first, straight into the
+folder the host gives, so a crash leaves nothing beside it. As with `Run`, each save's
+step comes after every step the hosted run saved, or it raises `ValueError` before the
+host is called. A checkpoint whose attempt published its step again (a host that
+publishes twice) is shadowed: `checkpoint_id` and `load` of it raise `ValueError`, and
+the later one loads. A hosted run is
 one process. Its checkpoints are unsigned, so a ledger with a verify key refuses
 them.
 
