@@ -8,7 +8,9 @@ asynchronously, on one rank and on two (gloo, one process each).
 
 from __future__ import annotations
 
+import errno
 import functools
+import gc
 import hashlib
 import io
 import json
@@ -19,11 +21,13 @@ import pickle
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import warnings
 import zipfile
 from collections.abc import Iterator
 from concurrent.futures import Future
@@ -33,6 +37,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from botocore.exceptions import ClientError, EndpointConnectionError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from torch import nn
 from torch_checkpointing.checkpoint_manager import CheckpointManager
@@ -60,9 +65,11 @@ from vestigo.torch import (
     _Checkpoints,
     _copies,
     _file_digest,
+    _Held,
     _kinds,
     _portable,
     _report_written,
+    _seen,
 )
 
 STEPS = 6
@@ -350,6 +357,24 @@ def test_a_model_is_its_class_and_state_dict_schema_under_a_version(ledger: Ledg
     assert ledger.define_model(_model(hidden=16), version="v1").node_id != first.node_id
 
 
+class _Calibrated(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(2, 2)
+
+    def get_extra_state(self) -> dict[str, bool]:
+        return {"calibrated": True}
+
+    def set_extra_state(self, state: object) -> None:
+        pass
+
+
+def test_a_model_s_extra_state_is_in_its_schema_by_its_type(ledger: Ledger):
+    model = ledger.define_model(_Calibrated(), version="v1")
+    schema = json.loads(model.spec.payload)["state_dict"]
+    assert ["_extra_state", None, "builtins.dict"] in schema
+
+
 def test_a_program_is_its_loss_and_update_over_the_model(ledger: Ledger):
     model = _model()
     definition = ledger.define_model(model, version="v1")
@@ -367,10 +392,81 @@ def test_a_program_is_its_loss_and_update_over_the_model(ledger: Ledger):
     assert (impl.role, impl.target_node_id) == ("impl", definition.node_id)
 
 
+def test_a_param_group_s_own_settings_are_part_of_the_program(ledger: Ledger):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+    first, last = model[0], model[2]
+
+    def program(lr: float) -> str:
+        groups = [{"params": first.parameters(), "lr": lr}, {"params": last.parameters()}]
+        optimizer = torch.optim.SGD(groups, lr=1e-3)
+        return ledger.define_program(definition, loss="mse", optimizer=optimizer).node_id
+
+    assert program(1e-5) == program(1e-5)
+    assert program(1e-5) != program(1e-1)
+
+
 class _Scaled(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.scale = torch.tensor(2.0)  # an attribute, not a buffer
+
+
+class _Combined(nn.Module):
+    """A loss around a stock one, as a composite loss is."""
+
+    def __init__(self, inner: nn.Module, alpha: float = 0.5) -> None:
+        super().__init__()
+        self.inner = inner
+        self.alpha = alpha
+
+
+class _Margin:
+    def __init__(self, margin: float) -> None:
+        self.margin = margin
+
+    def loss(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (output - target + self.margin).clamp(min=0).mean()
+
+
+class _Scored(nn.Module):
+    """A model whose own method is the loss."""
+
+    def __init__(self, margin: float) -> None:
+        super().__init__()
+        self.margin = margin
+        self.layer = nn.Linear(4, 3)
+
+    def compute_loss(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (output - target + self.margin).clamp(min=0).mean()
+
+
+class _Slotted:
+    __slots__ = ("margin",)
+
+    def __init__(self, margin: float) -> None:
+        self.margin = margin
+
+    def __call__(self, output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (output - target + self.margin).clamp(min=0).mean()
+
+
+def _focal(gamma: float):
+    def loss(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (output - target).abs().pow(gamma).mean()
+
+    return loss
+
+
+def _wrapped(function):
+    @functools.wraps(function)
+    def wrapper(*args):
+        return function(*args)
+
+    return wrapper
+
+
+_decorated_mse = _wrapped(nn.functional.mse_loss)
 
 
 def test_a_program_records_its_loss_s_settings_and_tensors(ledger: Ledger):
@@ -403,6 +499,76 @@ def test_a_program_records_its_loss_s_settings_and_tensors(ledger: Ledger):
         program(lambda output, target: f.mse_loss(output, target))
     with pytest.raises(TypeError, match="JSON"):
         program(_Scaled())
+
+
+def test_a_loss_s_submodules_and_the_objects_its_methods_hold_are_part_of_the_program(
+    ledger: Ledger,
+):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+
+    def program(loss: object) -> str:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        return ledger.define_program(definition, loss=loss, optimizer=optimizer).node_id
+
+    smoothed = program(_Combined(nn.CrossEntropyLoss(label_smoothing=0.1)))
+    assert program(_Combined(nn.CrossEntropyLoss(label_smoothing=0.1))) == smoothed
+    assert program(_Combined(nn.CrossEntropyLoss(label_smoothing=0.3))) != smoothed
+    assert program(_Combined(nn.MSELoss())) != program(_Combined(nn.L1Loss()))
+    triplet = nn.TripletMarginWithDistanceLoss
+    assert program(triplet(distance_function=nn.PairwiseDistance(p=1))) != program(
+        triplet(distance_function=nn.CosineSimilarity())
+    )
+    assert program(_Margin(1.0).loss) == program(_Margin(1.0).loss)
+    assert program(_Margin(1.0).loss) != program(_Margin(9.0).loss)
+    # A module's method records its settings, not its weights: two inits are one program.
+    torch.manual_seed(1)
+    first = _Scored(1.0)
+    torch.manual_seed(2)
+    assert program(first.compute_loss) == program(_Scored(1.0).compute_loss)
+    assert program(first.compute_loss) != program(_Scored(9.0).compute_loss)
+    assert program(_Slotted(1.0)) != program(_Slotted(9.0))
+    assert program(torch.compile(nn.HuberLoss(delta=2.0))) == program(nn.HuberLoss(delta=2.0))
+
+    # What a nested function or a wrapper captured has no name: refused, not recorded.
+    with pytest.raises(ValueError, match="defined in a function"):
+        program(_focal(2.0))
+    with pytest.raises(ValueError, match="captures values"):
+        program(_decorated_mse)
+
+
+@pytest.mark.parametrize(
+    ("loss", "message"),
+    [
+        (nn.CrossEntropyLoss(weight=torch.empty(3, device="meta")), "meta device"),
+        (nn.HuberLoss(delta=float("nan")), "not JSON"),
+    ],
+    ids=["meta tensor", "nan"],
+)
+def test_a_loss_that_cannot_be_recorded_raises_type_error(ledger: Ledger, loss, message: str):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    with pytest.raises(TypeError, match=message):
+        ledger.define_program(definition, loss=loss, optimizer=optimizer)
+
+
+def test_a_sparse_loss_tensor_is_recorded_by_its_values(ledger: Ledger):
+    model = _model()
+    definition = ledger.define_model(model, version="v1")
+
+    def program(loss: object) -> str:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        return ledger.define_program(definition, loss=loss, optimizer=optimizer).node_id
+
+    weight = torch.tensor([1.0, 0.0, 2.0])
+    sparse = _Combined(nn.MSELoss())
+    sparse.register_buffer("weight", weight.to_sparse())
+    dense = _Combined(nn.MSELoss())
+    dense.register_buffer("weight", weight)
+    other = _Combined(nn.MSELoss())
+    other.register_buffer("weight", torch.tensor([1.0, 0.0, 3.0]).to_sparse())
+    assert program(sparse) == program(dense) != program(other)
 
 
 def test_runs_on_two_inputs_share_the_program_and_differ_in_computation(ledger: Ledger):
@@ -562,17 +728,46 @@ def test_a_save_after_other_bytes_releases_nothing_and_lapses_the_lease(
         assert ledger.builds.get_build(run.execution_id).lease_owner is None
 
 
-def test_a_save_while_an_input_cannot_be_read_fails_that_step_only(ledger: Ledger, tmp_path: Path):
+@pytest.mark.parametrize("change", ["file removed", "directory removed", "directory emptied"])
+def test_a_save_after_an_input_is_gone_releases_nothing_and_lapses_the_lease(
+    ledger: Ledger, tmp_path: Path, change: str
+):
+    tree = _tree(tmp_path / "tree")
+    data = tree / "a.bin" if change == "file removed" else tree
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, {"train": data}) as run:
+        trainer.train(run, 1)
+        if change == "file removed":
+            data.unlink()
+        elif change == "directory removed":
+            tree.rename(tmp_path / "aside")
+        else:
+            for each in (tree / "a.bin", tree / "sub" / "b.bin"):
+                each.unlink()
+        with pytest.raises(InputChanged, match=f"at {data.absolute()} is gone"):
+            trainer.train(run, 2)
+        assert run.release_of(2) is None
+        assert ledger.builds.get_build(run.execution_id).lease_owner is None
+
+
+def test_a_save_while_an_input_cannot_be_read_fails_that_step_only(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     tree = _tree(tmp_path / "tree")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": tree}) as run:
         trainer.train(run, 1)
-        aside = tree.rename(tmp_path / "aside")
+        scan = vestigo.torch._scan
+
+        def failing(path: Path) -> list:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+
+        monkeypatch.setattr(vestigo.torch, "_scan", failing)
         with pytest.raises(InputChanged, match="cannot be read"):
             trainer.train(run, 2)
         # Perhaps a moment's error on a shared mount: the lease stays, the next save holds.
         assert ledger.builds.get_build(run.execution_id).lease_owner == run.attempt
-        aside.rename(tree)
+        monkeypatch.setattr(vestigo.torch, "_scan", scan)
         trainer.train(run, 3)
         assert run.release_of(2) is None and run.release_of(3) is not None
 
@@ -598,9 +793,26 @@ def test_a_change_after_rank_zero_s_report_fails_the_step(ledger: Ledger, tmp_pa
         assert run.release_of(1) is None
 
 
+def test_a_file_too_fresh_to_trust_its_stat_is_read_at_each_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A rewrite within the stat's timestamp tick leaves it as it was, as on a coarse
+    # clock: the mtime set back, and the first write's ctime kept.
+    data = _file(tmp_path / "train.bin", b"AAAA")
+    first = os.stat(data)
+    [held] = vestigo.torch._resolve({"train": data}).held
+    data.write_bytes(b"BBBB")
+    os.utime(data, ns=(first.st_atime_ns, first.st_mtime_ns))
+    real = vestigo.torch._stat_key
+    monkeypatch.setattr(vestigo.torch, "_stat_key", lambda st: (*real(st)[:4], first.st_ctime_ns))
+    assert vestigo.torch._seen([held], {})["train"]["pin"] != held.pinned
+
+
 def test_a_stat_that_hashed_to_the_pin_is_not_read_again(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    # Older than a scan's timestamp tick, so the stat that hashed to the pin is trusted.
+    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
     data = _file(tmp_path / "train.bin")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": data}) as run:
@@ -680,18 +892,23 @@ def test_a_save_scans_its_inputs_once_reads_none_and_ships_no_listing(
     large = _tree(tmp_path / "large")
     for i in range(300):
         _file(large / "shards" / f"{i:04}.bin", b"%d" % i)
+    # Files older than a scan's timestamp tick, whose stat a check trusts.
+    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
     sizes = []
     scans = _counted(monkeypatch, "_scan")
+    pins = _counted(monkeypatch, "_pin")
     reads = _counted(monkeypatch, "_file_digest")
     for tree in (small, large):
         trainer = Trainer(ledger)
         with _run(ledger, trainer, {"train": tree}) as run:
             sizes.append(len(pickle.dumps(run._checkpoints)))
             scans.clear()
+            pins.clear()
             reads.clear()
             trainer.train(run, 1)
             assert scans == [Path(str(tree.absolute()))]
-            # Fresh files the cache does not keep, yet an unchanged stat reads none.
+            # An unchanged stat reads none, not even the digest cache.
+            assert not pins
             assert not [r for r in reads if Path(r).is_relative_to(tree.resolve())]
     # Rank 0's file list stays on rank 0: every rank and writer gets a fingerprint.
     assert abs(sizes[1] - sizes[0]) < 64
@@ -717,6 +934,8 @@ def test_a_rank_s_copies_must_be_the_bytes_rank_0_pinned(
 ):
     objects = _bucket(monkeypatch)
     objects["s3://lake/eval.bin"] = (1, "etag:e")
+    # Files older than a scan's timestamp tick, whose stat a check trusts.
+    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
     data = _file(tmp_path / "rank0" / "train.bin")
     copy = _file(tmp_path / "rank1" / "train.bin")
     other = _file(tmp_path / "other" / "train.bin", b"rowz")
@@ -753,7 +972,10 @@ def test_ranks_agree_on_labels_and_uris_but_not_where_their_copies_are(tmp_path:
     assert terms != _kinds({"label": "data@v=1", "eval": remote, "train": str(tmp_path)})
 
 
-def test_a_term_that_is_not_json_fails_before_any_input_is_read(ledger: Ledger, tmp_path: Path):
+@pytest.mark.parametrize("seed", [torch.tensor(1), float("nan"), float("inf")])
+def test_a_term_that_is_not_json_fails_before_any_input_is_read(
+    ledger: Ledger, tmp_path: Path, seed: object
+):
     trainer = Trainer(ledger)
     with pytest.raises(TypeError, match="JSON"):
         ledger.run(
@@ -762,7 +984,7 @@ def test_a_term_that_is_not_json_fails_before_any_input_is_read(ledger: Ledger, 
             loss=nn.MSELoss(),
             version="tiny-v1",
             inputs={"train": tmp_path / "missing"},
-            config={"seed": torch.tensor(1)},
+            config={"seed": seed},
         )
 
 
@@ -832,6 +1054,47 @@ def test_a_file_changed_in_the_last_two_seconds_is_read_each_time(
     _key(ledger, data)
     _key(ledger, data)
     assert len(reads) == 2
+
+
+def test_a_digest_is_cached_only_for_a_file_settled_before_its_read_began(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A long pass: the clock is ten seconds on once the file is read.
+    now = [time.time_ns()]
+    hashed = vestigo.torch._hash
+
+    def slow(scanned: object) -> str:
+        now[0] += 10 * 10**9
+        return hashed(scanned)
+
+    monkeypatch.setattr("vestigo.torch.time.time_ns", lambda: now[0])
+    monkeypatch.setattr("vestigo.torch._hash", slow)
+    data = _file(tmp_path / "train.bin")
+    reads = _counted(monkeypatch, "_file_digest")
+    _key(ledger, data)
+    _key(ledger, data)
+    assert len(reads) == 2
+
+
+def test_the_digest_cache_is_its_owner_s_alone(ledger: Ledger, tmp_path: Path):
+    _key(ledger, _file(tmp_path / "train.bin"))
+    cache = Path(os.environ["VESTIGO_CACHE_DIR"])
+    assert stat.S_IMODE(cache.stat().st_mode) == 0o700
+    assert stat.S_IMODE((cache / "digests.sqlite").stat().st_mode) == 0o600
+
+
+def test_a_corrupt_digest_cache_closes_its_connection(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The warning's record would hold the failed frame, and the connection, alive.
+    monkeypatch.setattr(logging.getLogger("vestigo.torch"), "disabled", True)
+    cache = Path(os.environ["VESTIGO_CACHE_DIR"])
+    _file(cache / "digests.sqlite", b"not a database, " * 64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _key(ledger, _file(tmp_path / "train.bin"))
+        gc.collect()
+    assert not [w for w in caught if issubclass(w.category, ResourceWarning)]
 
 
 def test_a_file_written_while_it_is_hashed_is_refused(
@@ -946,16 +1209,22 @@ def test_a_remote_input_is_pinned_to_its_store_s_names_with_its_uri(
     assert "secret" not in repr(Remote("s3://lake/", BlobSettings(s3_secret_key="secret")))
 
 
+@pytest.mark.parametrize(
+    ("change", "message"), [("replaced", "has other bytes"), ("removed", "is gone")]
+)
 def test_a_remote_input_with_other_objects_fails_the_save_and_lapses_the_lease(
-    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch, change: str, message: str
 ):
     objects = _bucket(monkeypatch)
     objects["s3://lake/data/a.bin"] = (1, "etag:a")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": Remote("s3://lake/data/")}) as run:
         trainer.train(run, 1)
-        objects["s3://lake/data/a.bin"] = (1, "etag:A")
-        with pytest.raises(InputChanged, match="at s3://lake/data/ has other bytes"):
+        if change == "replaced":
+            objects["s3://lake/data/a.bin"] = (1, "etag:A")
+        else:
+            del objects["s3://lake/data/a.bin"]
+        with pytest.raises(InputChanged, match=f"at s3://lake/data/ {message}"):
             trainer.train(run, 2)
         assert run.release_of(2) is None
         assert ledger.builds.get_build(run.execution_id).lease_owner is None
@@ -978,6 +1247,45 @@ def test_a_store_that_does_not_answer_fails_that_step_only(
         monkeypatch.setattr(Remote, "objects", lambda remote: [("a.bin", 1, "etag:a")])
         trainer.train(run, 3)
         assert run.release_of(3) is not None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ClientError({"Error": {"Code": "AccessDenied", "Message": "denied"}}, "HeadObject"),
+        EndpointConnectionError(endpoint_url="http://lake"),
+        ConnectionResetError("reset"),
+    ],
+    ids=["refused", "unreachable", "dropped"],
+)
+def test_only_the_store_s_own_errors_read_as_unreadable(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+):
+    remote = Remote("s3://lake/a.bin")
+    held = _Held(
+        "train", remote.uri, "", {"uri": remote.uri, "size": 1, "object": "etag:a"}, remote
+    )
+    monkeypatch.setattr(Remote, "objects", lambda remote: _raise(error))
+    assert "unreadable" in _seen([held], {})["train"]
+    # Anything else is no outage but a fault, and propagates.
+    monkeypatch.setattr(Remote, "objects", lambda remote: _raise(KeyError("bug")))
+    with pytest.raises(KeyError, match="bug"):
+        _seen([held], {})
+
+
+def test_an_execution_with_a_remote_input_resumes_only_with_its_inputs(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    objects = _bucket(monkeypatch)
+    objects["s3://lake/a.bin"] = (1, "etag:a")
+    inputs = {"train": Remote("s3://lake/a.bin")}
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer, inputs) as run:
+        trainer.train(run, 1)
+    with pytest.raises(ValueError, match=r"verified inputs \(a Path or a Remote\)"):
+        ledger.resume(run.execution_id)
+    with ledger.resume(run.execution_id, inputs=inputs) as resumed:
+        assert resumed.restores_from == run.release_of(1).release_id
 
 
 # --- Checkpoints ---
@@ -2511,9 +2819,11 @@ def test_a_store_names_each_object_s_bytes(remote: RemoteBlobs):
     }
     assert listed("data/a.bin") == {"data/a.bin": under["data/a.bin"]}
     assert listed("data/none.bin") == {}
-    # The same bytes again keep their name; other bytes change it.
+    # The same bytes again keep their name, but on Azure, whose ETag each write changes;
+    # other bytes change it.
     _put(remote, "data/a.bin", b"a")
-    assert listed("data/a.bin") == {"data/a.bin": under["data/a.bin"]}
+    again = listed("data/a.bin")
+    assert (again == {"data/a.bin": under["data/a.bin"]}) == (remote.backend != "azure")
     _put(remote, "data/a.bin", b"A")
     assert listed("data/a.bin")["data/a.bin"] != under["data/a.bin"]
 
@@ -2951,6 +3261,20 @@ def test_observations_are_the_execution_s_own(ledger: Ledger):
 
         assert one.computation_key == two.computation_key
         assert ledger.observations(two.execution_id) == []
+
+
+def test_observations_read_the_execution_s_own_ids_not_every_output_of_its_key(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 2)
+        recorded = run.observe(_exported(trainer.model), scope="model_forward", coverage="complete")
+        # The key's outputs are every checkpoint file the computation has stored.
+        monkeypatch.setattr(
+            ledger.store, "versions_of_computation", lambda *a: _raise(AssertionError)
+        )
+        assert ledger.observations(run.execution_id) == [recorded]
 
 
 def test_a_stale_attempt_cannot_record_an_observation(ledger: Ledger):

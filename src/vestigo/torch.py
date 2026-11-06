@@ -85,6 +85,7 @@ from vestigo.blob_store import (
     S3BlobStore,
 )
 from vestigo.build_store import AttemptState, BuildState, BuildStore
+from vestigo.file_modes import private_dir, private_file
 from vestigo.graph import Edge, NodeId, NodeSpec, Traversal
 from vestigo.operations import AdvanceReference
 from vestigo.provenance import (
@@ -122,6 +123,19 @@ _CHUNK = 8 * 1024 * 1024
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _json(value: Any) -> bytes:
+    """*value* canonical, as a definition's payload or a term the ranks agree on.
+
+    Raises:
+        TypeError: it is not JSON (NaN and the infinities are not either).
+    """
+    try:
+        return _canonical(value)
+    except ValueError as exc:
+        # What json raises for NaN, an infinity, or a value that contains itself.
+        raise TypeError(f"{exc}: not JSON") from exc
 
 
 def _fqn(obj: object) -> str:
@@ -264,7 +278,7 @@ def _scan(path: Path) -> list[tuple[str, _Scanned]]:
                 raise ValueError(f"{entry} links outside {root}")
             files.append((entry.relative_to(root).as_posix(), _regular(real)))
     if not files:
-        raise ValueError(f"{path} holds no file")
+        raise _Empty(f"{path} holds no file")
     return sorted(files)
 
 
@@ -279,6 +293,19 @@ def _fingerprint(files: Sequence[tuple[str, _Scanned]]) -> str:
     return hashlib.sha256(
         _canonical([[name, real, list(key)] for name, (real, key) in files])
     ).hexdigest()
+
+
+def _trusted(files: Sequence[tuple[str, _Scanned]], scanned_at: int) -> str:
+    """*files*' fingerprint, which a later check takes as the same bytes; "" while a
+    file was written within ``_RACY_NS`` of the scan, as the digest cache judges it."""
+    settled = scanned_at - _RACY_NS
+    if all(max(key[3], key[4]) < settled for _, (_, key) in files):
+        return _fingerprint(files)
+    return ""
+
+
+class _Empty(ValueError):
+    """A directory holds no file: refused as an input, and gone from one that held some."""
 
 
 def _cache_path() -> Path:
@@ -297,12 +324,17 @@ def _hash(scanned: _Scanned) -> str:
 
 
 def _cache(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cache = sqlite3.connect(path, timeout=30)
-    cache.execute(
-        "CREATE TABLE IF NOT EXISTS digests "
-        "(path TEXT PRIMARY KEY, stat TEXT NOT NULL, sha256 TEXT NOT NULL)"
-    )
+    # Owner-only: its rows name every file each run on the machine read.
+    private_dir(path.parent)
+    cache = sqlite3.connect(private_file(path), timeout=30)
+    try:
+        cache.execute(
+            "CREATE TABLE IF NOT EXISTS digests "
+            "(path TEXT PRIMARY KEY, stat TEXT NOT NULL, sha256 TEXT NOT NULL)"
+        )
+    except sqlite3.Error:
+        cache.close()
+        raise
     return cache
 
 
@@ -325,6 +357,9 @@ def _digests(files: Sequence[_Scanned]) -> list[str]:
         found = [None] * len(files)
         path = None
     missing = [i for i, digest in enumerate(found) if digest is None]
+    # Before any file is read: a write after its stat was last taken shows in the stat
+    # only if that write's timestamp tick is later than the one the stat holds.
+    settled = time.time_ns() - _RACY_NS
     pool = ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1))
     try:
         pending = {pool.submit(_hash, files[i]): i for i in missing}
@@ -333,7 +368,6 @@ def _digests(files: Sequence[_Scanned]) -> list[str]:
     finally:
         # On the first failure, the files not yet started are not read at all.
         pool.shutdown(cancel_futures=True)
-    settled = time.time_ns() - _RACY_NS
     rows = [
         (files[i][0], str(files[i][1]), found[i])
         for i in missing
@@ -367,9 +401,9 @@ class Remote:
     every rank needs them, and they travel from rank 0 to every rank.
 
     Nothing is downloaded. Each object is pinned by what its store says names its bytes:
-    S3's ETag; GCS's MD5, or a composite object's generation; Azure's Content-MD5 when
-    the uploader set one, else its ETag, which a metadata write changes too. The URI is
-    part of the pin: unlike a local path, it names the same objects everywhere.
+    S3's ETag; GCS's MD5, or a composite object's generation; Azure's ETag, which a
+    metadata write changes too. The URI is part of the pin: unlike a local path, it
+    names the same objects everywhere.
 
     Raises:
         ValueError: the URI has another scheme, or no bucket.
@@ -416,8 +450,9 @@ def _pin_remote(remote: Remote, objects: list[tuple[str, int, str]]) -> dict[str
 @dataclass(frozen=True)
 class _Held:
     """A verified input as its run resolved it: its scan's fingerprint (a few bytes to
-    every rank and writer, however many files) and the bytes it was pinned to; for a
-    remote one, the object store's, listed again at each check."""
+    every rank and writer, however many files; "" while a file was too fresh to trust
+    its stat) and the bytes it was pinned to; for a remote one, the object store's,
+    listed again at each check."""
 
     role: str
     path: str
@@ -449,9 +484,10 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
     held = []
     for role, value in (inputs or {}).items():
         if isinstance(value, Path):
+            scanned_at = time.time_ns()
             files = _scan(value)
             spec[role] = _pin(files)
-            held.append(_Held(role, str(value.absolute()), _fingerprint(files), spec[role]))
+            held.append(_Held(role, str(value.absolute()), _trusted(files, scanned_at), spec[role]))
         elif isinstance(value, Remote):
             spec[role] = _pin_remote(value, value.objects())
             held.append(_Held(role, value.uri, "", spec[role], value))
@@ -462,9 +498,27 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
     return _Inputs(spec, tuple(held))
 
 
+def _remote_errors(remote: Remote) -> tuple[type[Exception], ...]:
+    """What *remote*'s SDK raises when its store does not answer: an outage, a refusal,
+    no credentials. ``OSError`` is a dropped connection under any of them."""
+    scheme = remote.uri.partition("://")[0]
+    if scheme == "s3":
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        return OSError, BotoCoreError, ClientError
+    if scheme == "gs":
+        from google.api_core.exceptions import GoogleAPIError
+        from google.auth.exceptions import GoogleAuthError
+
+        return OSError, GoogleAPIError, GoogleAuthError
+    from azure.core.exceptions import AzureError
+
+    return OSError, AzureError
+
+
 def _seen(held: Sequence[_Held], known: dict[str, str]) -> dict[str, Any]:
     """Each verified input as this process finds it now: its path, and its bytes' pin
-    or why they cannot be read.
+    (None once they are gone) or why they cannot be read.
 
     An unchanged stat is the same bytes. A changed one (a chmod, a hardlink, an
     attribute a file browser adds) is read again, from the digest cache where it can
@@ -473,24 +527,30 @@ def _seen(held: Sequence[_Held], known: dict[str, str]) -> dict[str, Any]:
     seen: dict[str, Any] = {}
     for each in held:
         if each.remote is not None:
+            remote = each.remote
             try:
-                pin = _pin_remote(each.remote, each.remote.objects())
-            except Exception as exc:
-                # Any SDK's error, an outage among them: unreadable, so this step only.
+                objects = remote.objects()
+            except _remote_errors(remote) as exc:
+                # The store did not answer (an outage among them): this step only.
                 seen[each.role] = {"path": each.path, "unreadable": str(exc)}
             else:
+                pin = _pin_remote(remote, objects) if objects else None
                 seen[each.role] = {"path": each.path, "pin": pin}
             continue
         try:
+            scanned_at = time.time_ns()
             files = _scan(Path(each.path))
             scanned = _fingerprint(files)
             if scanned in (each.scanned, known.get(each.role)):
                 pin = each.pinned
             else:
                 pin = _pin(files)
-                if pin == each.pinned:
+                if pin == each.pinned and _trusted(files, scanned_at):
                     known[each.role] = scanned
             seen[each.role] = {"path": each.path, "pin": pin}
+        except (FileNotFoundError, _Empty):
+            # Removed, or emptied: other bytes, as a file removed from a tree is.
+            seen[each.role] = {"path": each.path, "pin": None}
         except (OSError, ValueError, InputChanged) as exc:
             seen[each.role] = {"path": each.path, "unreadable": str(exc)}
     return seen
@@ -557,7 +617,7 @@ class _Apart(RuntimeError):
 
 def _term_digests(terms: Mapping[str, Any]) -> dict[str, str]:
     """Raises TypeError: a term is not JSON (an optimizer default held as a tensor)."""
-    return {key: hashlib.sha256(_canonical(value)).hexdigest() for key, value in terms.items()}
+    return {key: hashlib.sha256(_json(value)).hexdigest() for key, value in terms.items()}
 
 
 @dataclass(frozen=True)
@@ -679,7 +739,8 @@ def _kinds(inputs: Mapping[str, Input] | None) -> dict[str, Any]:
 def _copies(inputs: Mapping[str, Input], held: Sequence[_Held], rank: int) -> tuple[_Held, ...]:
     """This rank's own copies of rank 0's verified inputs; a remote one is the same.
 
-    A copy is read only when its scan is not rank 0's (another machine's disk).
+    A copy is read only when its scan is not rank 0's (another machine's disk), or
+    rank 0's was too fresh to trust.
 
     Raises:
         InputChanged: a copy has other bytes than rank 0 pinned.
@@ -691,11 +752,13 @@ def _copies(inputs: Mapping[str, Input], held: Sequence[_Held], rank: int) -> tu
             copies.append(each)
             continue
         path = cast(Path, inputs[each.role])
+        scanned_at = time.time_ns()
         files = _scan(path)
-        scanned = _fingerprint(files)
-        if scanned != each.scanned and _pin(files) != each.pinned:
+        if _fingerprint(files) != each.scanned and _pin(files) != each.pinned:
             raise InputChanged(f"input {each.role!r} at {path} has other bytes on rank {rank}")
-        copies.append(_Held(each.role, str(path.absolute()), scanned, each.pinned))
+        copies.append(
+            _Held(each.role, str(path.absolute()), _trusted(files, scanned_at), each.pinned)
+        )
     return tuple(copies)
 
 
@@ -711,51 +774,115 @@ def _attempt(state: AttemptState) -> Attempt:
 def _model_payload(model: Any, version: str) -> dict[str, Any]:
     schema = [
         [key, list(value.shape), str(value.dtype)]
+        if isinstance(value, torch.Tensor)
+        # A module's get_extra_state: any object, keyed on by its type.
+        else [key, None, _fqn(value)]
         for key, value in sorted(model.state_dict().items())
     ]
     return {"class": _fqn(model), "state_dict": schema, "version": version}
 
 
-def _loss_payload(loss: Any) -> Any:
-    """*loss* as its program records it: a name as given, a class or function by its
-    qualified name, a ``partial`` with its arguments, and an object (a loss module) by
-    its class, public attributes and the digest of each tensor in its ``state_dict``.
+def _loss_payload(loss: Any, *, tensors: bool = True) -> Any:
+    """*loss* as its program records it: a name as given; a class or function by its
+    qualified name; a bound method by its function's and its object's, a module's
+    without its tensors (a model's ``compute_loss`` is not its weights); a ``partial``
+    with its arguments; a loss module by every module in it (its name there, class and
+    public attributes) and the digest of each tensor in its ``state_dict``; any other
+    object by its class and public attributes. A compiled loss is what it compiles.
 
     Raises:
-        TypeError: an attribute or argument is not JSON.
-        ValueError: the loss is a lambda, which has no name.
+        TypeError: an attribute or argument is not JSON, or a tensor has no values.
+        ValueError: the loss is a lambda, or a nested function, whose captured values
+            have no name.
     """
     if isinstance(loss, str):
         return loss
+    # torch.compile's wrapper computes what it wraps.
+    if isinstance(loss, torch.nn.Module):
+        loss = getattr(loss, "_orig_mod", loss)
+    elif isinstance(loss, FunctionType):
+        loss = getattr(loss, "_torchdynamo_orig_callable", loss)
     if isinstance(loss, functools.partial):
         return {
             "function": _loss_payload(loss.func),
             "args": list(loss.args),
             "keywords": dict(loss.keywords),
         }
-    if isinstance(loss, (type, FunctionType, BuiltinFunctionType, MethodType)):
-        if loss.__name__ == "<lambda>":
-            raise ValueError("a lambda loss has no name; pass a named function or a str")
-        return f"{loss.__module__}.{loss.__qualname__}"
-    settings = {key: value for key, value in vars(loss).items() if not key.startswith("_")}
-    tensors = {}
+    if isinstance(loss, MethodType):
+        return {"method": _named(loss), "self": _loss_payload(loss.__self__, tensors=False)}
+    if isinstance(loss, FunctionType) and loss.__closure__:
+        # A decorator's wrapper, or a function made by another: what it captured.
+        raise ValueError(f"{_named(loss)} captures values a loss's name does not record; {_PASS}")
+    if isinstance(loss, (type, FunctionType, BuiltinFunctionType)):
+        return _named(loss)
     if isinstance(loss, torch.nn.Module):
-        del settings["training"]
-        tensors = {key: _tensor_digest(value) for key, value in loss.state_dict().items()}
-    return {"class": _fqn(loss), "settings": settings, "tensors": tensors}
+        modules = [
+            [name, _fqn(module), _attributes(module)] for name, module in loss.named_modules()
+        ]
+        if not tensors:
+            return {"modules": modules}
+        return {
+            "modules": modules,
+            "tensors": {
+                key: _tensor_digest(key, value) if isinstance(value, torch.Tensor) else value
+                for key, value in loss.state_dict().items()
+            },
+        }
+    return {"class": _fqn(loss), "settings": _attributes(loss), "tensors": {}}
 
 
-def _tensor_digest(tensor: Any) -> list[Any]:
-    data = tensor.detach().cpu().contiguous()
+_PASS = "pass a loss module, a functools.partial, or the loss's name as a str"
+
+
+def _named(loss: Any) -> str:
+    """Raises ValueError: *loss* is a lambda or is defined in a function."""
+    if loss.__name__ == "<lambda>":
+        raise ValueError("a lambda loss has no name; pass a named function or a str")
+    if "<locals>" in loss.__qualname__:
+        raise ValueError(f"{loss.__qualname__} is defined in a function; {_PASS}")
+    return f"{loss.__module__}.{loss.__qualname__}"
+
+
+def _attributes(obj: object) -> dict[str, Any]:
+    """*obj*'s public attributes, in its ``__dict__`` or its ``__slots__``; a module's
+    ``training`` flag left out, and its submodules, which are not among them."""
+    found = dict(getattr(obj, "__dict__", {}))
+    for cls in type(obj).__mro__:
+        slots = cls.__dict__.get("__slots__", ())
+        for name in [slots] if isinstance(slots, str) else slots:
+            if hasattr(obj, name):
+                found[name] = getattr(obj, name)
+    if isinstance(obj, torch.nn.Module):
+        found.pop("training", None)
+    return {key: value for key, value in found.items() if not key.startswith("_")}
+
+
+def _tensor_digest(key: str, tensor: Any) -> list[Any]:
+    """Raises TypeError: the tensor is on the meta device, with no values to digest."""
+    if tensor.is_meta:
+        raise TypeError(f"tensor {key!r} is on the meta device and has no values to record")
+    data = tensor.detach().cpu()
+    if data.layout != torch.strided:
+        data = data.to_dense()  # a sparse tensor, by its values
+    data = data.contiguous()
     # Viewed as bytes, as numpy has no bfloat16.
     raw = data.reshape(-1).view(torch.uint8).numpy()
     return [list(data.shape), str(data.dtype), hashlib.sha256(raw).hexdigest()]
 
 
 def _program_payload(loss: Any, optimizer: Any, config: Mapping[str, Any] | None) -> dict[str, Any]:
+    # A group's own settings (a per-layer learning rate) are outside the defaults.
+    groups = [
+        {key: value for key, value in group.items() if key != "params"}
+        for group in optimizer.param_groups
+    ]
     return {
         "loss": _loss_payload(loss),
-        "optimizer": {"class": _fqn(optimizer), "defaults": dict(optimizer.defaults)},
+        "optimizer": {
+            "class": _fqn(optimizer),
+            "defaults": dict(optimizer.defaults),
+            "param_groups": groups,
+        },
         "config": dict(config or {}),
     }
 
@@ -983,7 +1110,7 @@ class Ledger:
         return self._model(_model_payload(model, version))
 
     def _model(self, payload: Mapping[str, Any]) -> Definition:
-        return self._put(NodeSpec(MODEL_DOMAIN, _canonical(payload)))
+        return self._put(NodeSpec(MODEL_DOMAIN, _json(payload)))
 
     def define_program(
         self,
@@ -995,22 +1122,25 @@ class Ledger:
     ) -> Definition:
         """The training program's node: the model it implements, its loss and update.
 
-        *loss* is a loss module (read as its class, settings and tensors), a class, a
-        function, a ``partial`` of one, or a name; *optimizer* an optimizer, read as
-        its class and ``defaults``; *config* every other setting that changes the
+        *loss* is a loss module (read as every module in it, with its settings, and its
+        tensors), a class, a module-level function, a bound method, a ``partial`` of
+        one, or a name; *optimizer* an optimizer, read as its class, ``defaults`` and
+        each param group's settings; *config* every other setting that changes the
         trained weights (batch size, schedule, seed, accumulation, precision), as
         JSON. Two programs that differ in any of them are different programs over one
         model.
 
         Raises:
-            TypeError: a value is not JSON (an optimizer default held as a tensor).
-            ValueError: the loss is a lambda.
+            TypeError: a value is not JSON (an optimizer default held as a tensor, a
+                NaN), or a loss's tensor is on the meta device.
+            ValueError: the loss is a lambda, or a function defined in a function or
+                capturing values (a decorator's wrapper).
         """
         return self._program(model, _program_payload(loss, optimizer, config))
 
     def _program(self, model: Definition, payload: Mapping[str, Any]) -> Definition:
         return self._put(
-            NodeSpec(PROGRAM_DOMAIN, _canonical(payload), edges=(Edge("impl", 0, model.node_id),))
+            NodeSpec(PROGRAM_DOMAIN, _json(payload), edges=(Edge("impl", 0, model.node_id),))
         )
 
     def _put(self, spec: NodeSpec) -> Definition:
@@ -1310,8 +1440,9 @@ class Ledger:
 
         *from_release* defaults to the execution's latest accepted checkpoint; with
         none, the attempt starts from the execution's own initial state. *inputs*, when
-        given, must be the execution's; an execution with a ``Path`` input needs them,
-        since the attempt holds those paths as the first resolved them. In a process
+        given, must be the execution's; an execution with a ``Path`` or
+        :class:`Remote` input needs them, since the attempt holds them as the first
+        resolved them. In a process
         group, on every rank as :meth:`run` is.
 
         Raises:
@@ -1346,7 +1477,10 @@ class Ledger:
         params = build.params or {}
         recorded = params.get("inputs", {})
         if inputs is None and any(isinstance(value, dict) for value in recorded.values()):
-            raise ValueError(f"execution {execution_id} reads paths: resume it with its inputs")
+            raise ValueError(
+                f"execution {execution_id} holds verified inputs (a Path or a Remote): "
+                "resume it with its inputs"
+            )
         if inputs is not None and inputs.spec != recorded:
             raise ValueError(f"these are not the inputs of execution {execution_id}")
         if from_release is None:
@@ -1576,10 +1710,15 @@ class Ledger:
         """
         self._build(execution_id)
         branches: dict[str, list[BuildState]] = {}
+        sources: dict[str, Release | None] = {}
         for build in self.builds.builds_of(EXECUTOR):
             init = _params(build).get("init")
+            if init is None:
+                continue
             # A release row outlives the checkpoint's bytes, so a collected one still links.
-            source = self.releases.get(init) if init is not None else None
+            if init not in sources:
+                sources[init] = self.releases.get(init)
+            source = sources[init]
             if source is not None:
                 branches.setdefault(source.build_id, []).append(build)
         found, frontier = [], [execution_id]
@@ -1848,17 +1987,17 @@ class Ledger:
         build = self.builds.get_build(execution_id)
         if build is None or build.computation_key is None:
             raise ValueError(f"execution {execution_id} does not exist")
-        # Every execution of one computation shares its key; the id is the execution's.
-        prefix = f"torch_{execution_id}@observed="
-        return [
+        # By id, not by computation key: the key's outputs are every checkpoint file.
+        found = [
             v
-            for v in self.store.versions_of_computation(build.computation_key)
-            if v.state == "ready" and v.id.startswith(prefix)
+            for v in self.store.list_versions_by_id_prefix(f"torch_{execution_id}@observed=")
+            if v.state == "ready"
         ]
+        return sorted(found, key=lambda v: (v.created_at or 0.0, v.id, v.version))
 
     def _hold(self, writer: _Checkpoints, seen: Mapping[str, Any], where: str) -> None:
-        """Raises InputChanged: a verified input, as *seen* *where*, cannot be read or
-        has bytes other than its pin."""
+        """Raises InputChanged: a verified input, as *seen* *where*, cannot be read, or
+        has bytes other than its pin or none."""
         for each in writer.inputs:
             now = seen.get(each.role, {})
             if now.get("pin") == each.pinned:
@@ -1873,7 +2012,8 @@ class Ledger:
             # The data this attempt trained on is gone: a resume need not wait for it.
             # A lapse, not a renewal to zero, as the run's own renewal goes on meanwhile.
             self.builds.lapse_lease(writer.execution_id, writer.attempt)
-            raise InputChanged(f"input {each.role!r} at {path} has other bytes {where}")
+            changed = "is gone" if "pin" in now and now["pin"] is None else "has other bytes"
+            raise InputChanged(f"input {each.role!r} at {path} {changed} {where}")
 
     def _require_lease(self, writer: _Checkpoints) -> None:
         conn = self.store._get_connection()

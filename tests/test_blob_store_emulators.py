@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ServiceRequestError
+from azure.storage.blob import BlobBlock
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 from vestigo.blob_store import (
@@ -275,6 +276,24 @@ def test_a_presigned_put_and_get_go_through_azurite(azurite):
     # The read SAS grants no write.
     assert _put(get_url, headers, b"overwritten") == 403
     assert azurite.read_blob(artifact, 1) == b"put through a SAS"
+
+
+def test_an_azure_blob_committed_under_its_old_content_md5_is_named_anew(azurite):
+    """A Put Block List, how the SDK uploads past 64 MiB, stores the Content-MD5 it is
+    sent unchecked: the bytes change and the MD5 does not, so it cannot pin them."""
+    name = f"inputs/{uuid.uuid4().hex[:8]}.bin"
+    blob = azurite._client.get_blob_client(name)
+    blob.upload_blob(b"A" * 16)
+    [(_, _, pinned)] = azurite.objects(name)
+    stale = blob.get_blob_properties().content_settings
+    blob.stage_block("b1", b"C" * 16)
+    blob.commit_block_list([BlobBlock("b1")], content_settings=stale)
+
+    assert blob.download_blob().readall() == b"C" * 16
+    assert blob.get_blob_properties().content_settings.content_md5 == stale.content_md5
+    [(_, _, named)] = azurite.objects(name)
+    assert named != pinned
+    assert azurite.objects("inputs/") == [(name, 16, named)]
 
 
 def _put(url: str, headers: dict[str, str], payload: bytes) -> int:
