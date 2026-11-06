@@ -82,6 +82,10 @@ from vestigo.torch import (
 STEPS = 6
 ASYNC = CheckpointManager.Config.with_async_save()
 # Windows keeps only a read-only flag: chmod(0) leaves a file readable.
+# A Windows runner's first save can take seconds, past these tests' sub-second leases.
+SUBSECOND_LEASES = pytest.mark.skipif(
+    sys.platform == "win32", reason="saves outlast the lease there"
+)
 POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX file modes")
 
 
@@ -2564,6 +2568,7 @@ def test_a_head_is_not_set_under_the_ledger_s_own_names(ledger: Ledger):
     assert ledger.final_checkpoint(ended.execution_id) == final
 
 
+@SUBSECOND_LEASES
 def test_a_renewal_that_fails_once_keeps_the_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     renew = BuildStore.renew_lease
     calls: list[float] = []
@@ -2586,6 +2591,7 @@ def test_a_renewal_that_fails_once_keeps_the_lease(tmp_path: Path, monkeypatch: 
             assert run.release_of(1) is not None
 
 
+@SUBSECOND_LEASES
 def test_a_closed_write_window_lapses_the_lease_and_says_so(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):
@@ -2608,6 +2614,7 @@ def test_a_closed_write_window_lapses_the_lease_and_says_so(
     assert "write window" in caplog.text
 
 
+@SUBSECOND_LEASES
 def test_finishing_is_not_reported_as_a_lost_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):

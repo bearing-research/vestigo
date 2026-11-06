@@ -102,6 +102,10 @@ jobs:
       # CPU torch, from the index pyproject.toml names for it; Postgres and the three
       # object stores (their emulators, in Docker) for the ledgers the adapter writes to.
       - run: uv sync --extra torch --extra sign --extra postgres --extra s3 --extra gcs --extra azure --locked
+      # Gloo binds to the address of the macOS runner's hostname, which its ranks cannot
+      # reach: every two-rank test hung.
+      - if: runner.os == 'macOS'
+        run: echo "GLOO_SOCKET_IFNAME=lo0" >> "$GITHUB_ENV"
       - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py
         env:
           VESTIGO_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
