@@ -168,6 +168,41 @@ def test_the_root_lists_the_whole_bucket(store):
     assert listed[f"{store.prefix}/{artifact}@v=1.arrow"] == len(b"listed")
 
 
+def _put_object(store, key: str, data: bytes) -> None:
+    """*data* at *key* of the store's bucket, outside its prefix, as another writer puts it."""
+    if isinstance(store, S3BlobStore):
+        store._client.put_object(Bucket=store.bucket, Key=key, Body=data)
+    elif isinstance(store, GCSBlobStore):
+        store._client.bucket(BUCKET).blob(key).upload_from_string(data)
+    else:
+        store._client.upload_blob(key, data, overwrite=True)
+
+
+def test_objects_lists_a_key_or_a_prefix_with_a_name_for_each_object_s_bytes(store):
+    root = f"objects-{uuid.uuid4().hex[:8]}"
+    _put_object(store, f"{root}/a.bin", b"a")
+    _put_object(store, f"{root}/sub/b.bin", b"bb")
+    _put_object(store, f"{root}/marker/", b"")
+    _put_object(store, f"{root}-other/c.bin", b"c")
+
+    under = {key: (size, name) for key, size, name in store.objects(f"{root}/")}
+    # The folder marker is left out (fake-gcs-server lists no name ending in "/", so on
+    # it this holds either way), as is a sibling that only shares the prefix's stem.
+    assert {key: size for key, (size, _) in under.items()} == {
+        f"{root}/a.bin": 1,
+        f"{root}/sub/b.bin": 2,
+    }
+    assert all(isinstance(name, str) and name for _, name in under.values())
+    a = (f"{root}/a.bin", *under[f"{root}/a.bin"])
+    assert store.objects(f"{root}/a.bin") == [a]
+    assert store.objects(f"{root}/none.bin") == []
+    # Bytes left alone keep their name; other bytes change it.
+    assert store.objects(f"{root}/a.bin") == [a]
+    _put_object(store, f"{root}/a.bin", b"A")
+    [(key, size, name)] = store.objects(f"{root}/a.bin")
+    assert (key, size) == a[:2] and name != a[2]
+
+
 def test_a_missing_bucket_is_an_error_where_the_service_tells_it_apart(backend):
     """S3 says ``NoSuchBucket`` on a GET and Azure ``ContainerNotFound`` on every call;
     neither reads as an absent blob. GCS answers the one ``NotFound`` for both, so a

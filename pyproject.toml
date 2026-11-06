@@ -89,6 +89,8 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 timeout = 180
 timeout_method = "thread"
+# A warning fails the test that raised it, here and in CI alike.
+filterwarnings = ["error"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests requiring external services",
