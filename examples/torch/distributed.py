@@ -5,6 +5,9 @@
     uv run torchrun --nproc-per-node 2 --master-addr 127.0.0.1 \
         examples/torch/distributed.py ledger
 
+Not on Windows: there torch 2.14's ``torchrun --master-addr`` asks for libuv, which
+its Windows wheels lack, whatever ``USE_LIBUV`` says.
+
 Every rank runs the same code. ``ledger.run`` is collective, as
 ``DistributedDataParallel`` is: rank 0 starts or resumes the run and holds the lease,
 and each rank gets its own ``Run``. Every rank writes its own files through the
