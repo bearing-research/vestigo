@@ -176,6 +176,10 @@ uv add "vestigo[torch]"     # the PyTorch adapter's torch and torch-checkpointin
 uv add "vestigo[torch,sign]"  # and Ed25519 signatures on its checkpoints (cryptography)
 ```
 
+Tested on Linux, macOS and Windows. Each release's wheel and sdist are on PyPI and,
+the same files, on the repository's GitHub release, with build provenance:
+`gh attestation verify vestigo-<version>-py3-none-any.whl -R bearing-research/vestigo`.
+
 ## Development
 
 ```bash

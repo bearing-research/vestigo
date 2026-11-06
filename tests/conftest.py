@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 
 import docker
@@ -107,12 +108,21 @@ def docker_daemon() -> None:
     Only possible locally: CI sets ``VESTIGO_REQUIRE_DOCKER`` so a missing daemon cannot
     skip a container-backed test to green.
     """
+    required = os.environ.get("VESTIGO_REQUIRE_DOCKER")
     try:
-        docker.from_env().ping()
+        with closing(docker.from_env()) as client:
+            os_type = client.info().get("OSType")
     except docker.errors.DockerException:
-        if os.environ.get("VESTIGO_REQUIRE_DOCKER"):
+        if required:
             raise RuntimeError("VESTIGO_REQUIRE_DOCKER is set and the Docker daemon is unreachable")
         pytest.skip("Docker daemon is not running")
+    # A Windows runner's daemon runs Windows containers; the suite's images are Linux.
+    if os_type != "linux":
+        if required:
+            raise RuntimeError(
+                f"VESTIGO_REQUIRE_DOCKER is set and the daemon runs {os_type} containers"
+            )
+        pytest.skip(f"the Docker daemon runs {os_type} containers, not Linux")
 
 
 @pytest.fixture(scope="session")

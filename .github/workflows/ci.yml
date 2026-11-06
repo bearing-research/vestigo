@@ -32,13 +32,25 @@ jobs:
       - run: uv run --frozen pre-commit run --all-files --show-diff-on-failure --color=always
 
   tests:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13", "3.14"]
+        # The oldest and newest Python on macOS (arm64) and Windows (x64). Neither runner
+        # runs Linux containers (no nested virtualization on macOS; Windows containers on
+        # Windows), so the Postgres and object-store tests skip there and run on Linux.
+        include:
+          - {os: macos-latest, python-version: "3.12"}
+          - {os: macos-latest, python-version: "3.14"}
+          - {os: windows-latest, python-version: "3.12"}
+          - {os: windows-latest, python-version: "3.14"}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
@@ -57,22 +69,30 @@ jobs:
               assert importlib.util.find_spec(mod) is None, f"{mod} unexpectedly installed"
           PY
 
-      # The Postgres suite starts a container through Docker on the runner;
-      # without a daemon it fails here rather than skipping to green.
+      # The Postgres suite starts a container through Docker on the Linux runner;
+      # without a daemon it fails there rather than skipping to green.
       # The torch adapter's tests have their own job.
       - run: uv run pytest -v -p no:cacheprovider --ignore=tests/test_torch.py
         env:
-          VESTIGO_REQUIRE_DOCKER: "1"
+          VESTIGO_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
 
   torch:
-    name: Tests (torch, Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Tests (torch, ${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        # The oldest and newest Python the package supports.
+        # The oldest and newest Python the package supports, on Linux with the containers;
+        # macOS and Windows on the oldest, their ledgers on SQLite and local disk.
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.14"]
+        include:
+          - {os: macos-latest, python-version: "3.12"}
+          - {os: windows-latest, python-version: "3.12"}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
@@ -84,4 +104,4 @@ jobs:
       - run: uv sync --extra torch --extra sign --extra postgres --extra s3 --extra gcs --extra azure --locked
       - run: uv run pytest -v -p no:cacheprovider tests/test_torch.py
         env:
-          VESTIGO_REQUIRE_DOCKER: "1"
+          VESTIGO_REQUIRE_DOCKER: ${{ runner.os == 'Linux' && '1' || '' }}
