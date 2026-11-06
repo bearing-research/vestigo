@@ -4304,6 +4304,7 @@ def test_the_training_example_resumes_where_it_stopped_then_branches(tmp_path: P
     sys.platform == "win32",
     reason="torch 2.14's torchrun --master-addr asks for libuv, which its Windows wheels lack",
 )
+@pytest.mark.timeout(300)  # two launches, each stopped at 120 s with its stacks
 def test_the_distributed_example_releases_every_ranks_files_and_resumes(tmp_path: Path):
     root = str(tmp_path / "ledger")
     stopped = _example("distributed.py", root, "--epochs=2", "--crash-at=1", ranks=2)
