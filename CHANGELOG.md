@@ -66,8 +66,8 @@ The schema gains `build_attempts.fenced_at`, added to an older database on open 
 
 - `vestigo.torch` saved nothing on Windows: torch-checkpointing hands the storage a
   native path or its `str`, whose backslashes read as one part, so every save refused
-  its own checkpoint id. `torchrun` there needs `USE_LIBUV=0`, which the guide says
-  (#67).
+  its own checkpoint id. The guide says torch 2.14's `torchrun --master-addr` cannot
+  start there (#67).
 - An asynchronous `Run.save` returned before torch-checkpointing had copied the
   state, so an `optimizer.step()` right after it could reach the accepted, signed
   checkpoint: a resume continued from weights no step produced. It now returns once
