@@ -4164,13 +4164,22 @@ def _example(
         stderr=subprocess.PIPE,
         text=True,
         cwd=cwd,
+        env={**os.environ, "PYTHONFAULTHANDLER": "1", "PYTHONUNBUFFERED": "1"},
         start_new_session=True,
     ) as process:
         try:
             # Inside pytest's own timeout, so a hang reports what the script said.
             stdout, stderr = process.communicate(timeout=120)
         except subprocess.TimeoutExpired:
-            _kill_tree(process.pid)
+            if sys.platform != "win32":
+                # Each process prints its threads' stacks as it aborts (PYTHONFAULTHANDLER).
+                os.killpg(process.pid, signal.SIGABRT)
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    _kill_tree(process.pid)
+            else:
+                _kill_tree(process.pid)
             stdout, stderr = process.communicate()
             raise AssertionError(f"{script} hung:\n{stdout}{stderr}") from None
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
