@@ -34,7 +34,7 @@ from collections.abc import Iterator
 from concurrent.futures import Future
 from contextlib import closing
 from datetime import timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -73,6 +73,7 @@ from vestigo.torch import (
     _file_digest,
     _Held,
     _kinds,
+    _Location,
     _portable,
     _report_written,
     _seen,
@@ -80,6 +81,8 @@ from vestigo.torch import (
 
 STEPS = 6
 ASYNC = CheckpointManager.Config.with_async_save()
+# Windows keeps only a read-only flag: chmod(0) leaves a file readable.
+POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX file modes")
 
 
 @pytest.fixture(
@@ -395,6 +398,7 @@ def test_a_failed_close_does_not_hide_why_the_block_was_left(
         assert resumed.restores_from == run.release_of(1).release_id
 
 
+@POSIX_MODES
 def test_a_failed_asynchronous_save_is_reported_by_its_future_alone(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -790,8 +794,9 @@ def test_a_directory_refuses_what_it_cannot_pin(ledger: Ledger, tmp_path: Path):
     refused = {
         "a link out of the tree": lambda t: (t / "out.bin").symlink_to(outside),
         "a link to a directory": lambda t: (t / "dir").symlink_to(t / "sub"),
-        "a special file": lambda t: os.mkfifo(t / "pipe"),
     }
+    if sys.platform != "win32":  # no FIFOs there
+        refused["a special file"] = lambda t: os.mkfifo(t / "pipe")
     for name, make in refused.items():
         tree = _tree(tmp_path / name.replace(" ", "-"))
         make(tree)
@@ -1070,7 +1075,7 @@ def test_a_rank_s_copies_must_be_the_bytes_rank_0_pinned(
         "eval": "s3://lake/eval.bin",
     }
     assert [each.pinned for each in copies] == [each.pinned for each in held]
-    with pytest.raises(InputChanged, match=f"at {other} has other bytes on rank 1"):
+    with pytest.raises(InputChanged, match=f"at {re.escape(str(other))} has other bytes on rank 1"):
         _copies({"train": other, "eval": remote}, held, 1)
 
     # Rank 0's own copy, as its scan found it, is not read again.
@@ -1158,7 +1163,8 @@ def test_a_relaunch_reads_no_input_again_but_one_whose_stat_changed(
     assert _key(ledger, data) == key
     assert len(reads) == 1
 
-    data.chmod(0o600)
+    # A new mtime: Windows reports no change time, which a chmod alone would move.
+    os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns - 10**9))
     assert _key(ledger, data) == key
     assert len(reads) == 2
 
@@ -1196,6 +1202,7 @@ def test_a_digest_is_cached_only_for_a_file_settled_before_its_read_began(
     assert len(reads) == 2
 
 
+@POSIX_MODES
 def test_the_digest_cache_is_its_owner_s_alone(ledger: Ledger, tmp_path: Path):
     _key(ledger, _file(tmp_path / "train.bin"))
     cache = Path(os.environ["VESTIGO_CACHE_DIR"])
@@ -1497,6 +1504,16 @@ def test_an_attempt_writes_only_its_own_checkpoints(ledger: Ledger):
             manager.close()
         with pytest.raises(PermissionError):
             run._checkpoints(SimpleNamespace(path=other._checkpoints.checkpoint_id(1)))
+
+
+@pytest.mark.parametrize("native", [PurePosixPath, PureWindowsPath], ids=["posix", "windows"])
+def test_a_checkpoint_path_is_read_by_its_own_parts(native):
+    """torch_checkpointing hands the storage a native Path: on Windows it holds backslashes."""
+    at = _Location.of(native("vestigo-torch/e1/a1/step-3/model/0.pt"))
+    assert (at.execution_id, at.attempt, at.step, at.file) == ("e1", "a1", 3, "model/0.pt")
+    assert LedgerStorage.remap_path(None, native("vestigo-torch/e1/a1/step-3")) == (
+        "vestigo-torch/e1/a1/step-3"
+    )
 
 
 def test_the_storage_removes_and_renames_nothing(ledger: Ledger):
@@ -3515,7 +3532,8 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     Asynchronous, the group gets its rank directly and the environment names none, so
     the writer's subprocess has only what each rank configured.
     """
-    os.setsid()  # killed with its writer subprocess if it hangs
+    if sys.platform != "win32":
+        os.setsid()  # killed with its writer subprocess if it hangs; Windows kills the tree
     asynchronous = case in ("async", "unread") or (case == "modes" and rank == 1)
     if case == "async":
         os.environ.pop("RANK", None)
@@ -3527,7 +3545,7 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         torch.accelerator.is_available = lambda: False
     dist.init_process_group(
         "gloo",
-        init_method=f"file://{root}/rendezvous",
+        init_method=Path(root, "rendezvous").as_uri(),
         rank=rank,
         world_size=world,
         timeout=timedelta(seconds=10) if case in ("stall", "lost") else None,
@@ -3679,6 +3697,14 @@ def _builds(ledger: Ledger) -> list[str]:
         conn.close()
 
 
+def _kill_tree(pid: int) -> None:
+    """Kill a process and every process it started."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], check=False, capture_output=True)
+    else:
+        os.killpg(pid, signal.SIGKILL)
+
+
 def _two_ranks(root: Path, case: str) -> tuple[list[int], list[dict], bytes]:
     """Each rank's exit code and outcome (None for a rank that wrote none), and the
     verify key."""
@@ -3701,7 +3727,7 @@ def _two_ranks(root: Path, case: str) -> tuple[list[int], list[dict], bytes]:
     for process in ranks:
         if process.is_alive():
             # Hung (a peer waiting for one that never comes): its session, writer too.
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_tree(process.pid)
             process.join()
     outcomes = [
         json.loads(path.read_text()) if (path := root / f"outcome{r}.json").exists() else None
@@ -3800,6 +3826,7 @@ def test_a_rank_that_dies_before_writing_leaves_no_release(tmp_path: Path):
         assert release.sequence == 1
 
 
+@POSIX_MODES
 def test_a_failed_asynchronous_save_does_not_stop_the_finish_on_any_rank(tmp_path: Path):
     exits, outcomes, _ = _two_ranks(tmp_path, "unread")
 
@@ -3848,7 +3875,9 @@ def test_a_rank_lost_as_the_run_opens_leaves_it_failed_not_held(tmp_path: Path):
         assert build is not None and build.state == "failed"
 
 
-@pytest.mark.parametrize("case", ["copies", "drift", "late", "retry"])
+@pytest.mark.parametrize(
+    "case", ["copies", "drift", "late", pytest.param("retry", marks=POSIX_MODES)]
+)
 def test_every_rank_s_copy_of_the_inputs_must_hold_for_a_release(tmp_path: Path, case: str):
     exits, outcomes, _ = _two_ranks(tmp_path, case)
 
@@ -4128,7 +4157,7 @@ def _example(
         try:
             stdout, stderr = process.communicate(timeout=300)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_tree(process.pid)
             process.communicate()
             raise
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
@@ -4182,7 +4211,8 @@ def test_the_gate_ships_what_the_trainer_signed_and_refuses_a_forgery(tmp_path: 
     root, keys = str(tmp_path / "ledger"), tmp_path / "keys"
     made = _example("keys.py", str(keys))
     assert made.returncode == 0, made.stderr
-    assert (keys / "signing.key").stat().st_mode & 0o777 == 0o600
+    if sys.platform != "win32":  # no POSIX modes there
+        assert (keys / "signing.key").stat().st_mode & 0o777 == 0o600
     again = _example("keys.py", str(keys))
     assert again.returncode == 1 and "exists" in again.stderr
     trained = _example("train.py", root, f"--signing-key={keys / 'signing.key'}")
