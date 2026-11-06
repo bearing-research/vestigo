@@ -3,7 +3,10 @@
 All notable changes to vestigo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.4.0 - 2026-11-06
+
+Program nodes change (#57, #60), so a torch run started before 0.4.0 starts fresh.
+The schema gains `build_attempts.fenced_at`, added to an older database on open (#62).
 
 ### Added
 
@@ -24,6 +27,105 @@ All notable changes to vestigo are recorded here. The format follows
   `functools.partial` with its arguments; a lambda loss is refused. Program
   nodes change, so a run started before resumes nowhere and starts fresh. The
   guide says what goes in `inputs` and `config` (#57).
+- A program records a loss module by every module in it (its name there, class and
+  public attributes, slots too) beside its tensor digests, so composite losses
+  around `nn.CrossEntropyLoss(label_smoothing=0.1)` and `0.3` are two programs; a
+  bound method by its function and its object (a module without its tensors); each
+  optimizer param group's own settings; a model's extra state by its type; a
+  compiled loss as what it compiles. A nested function, or one that captures values
+  (a decorator's wrapper), is refused with `ValueError` like a lambda. Program nodes
+  change again, so a run started before resumes nowhere and starts fresh (#60).
+- An Azure `Remote` input is pinned by ETag: a Put Block List stores any Content-MD5
+  it is sent, so a stale MD5 kept the pin while the bytes changed. Rewriting the
+  same bytes now names them anew (#60).
+- A removed or emptied input, or a `Remote` with no object left, is other bytes and
+  lapses the lease, as the guide said; it read as "cannot be read" (#60).
+- A save of a step at or below one the attempt accepted raises `ValueError` before
+  anything is staged; it returned the earlier release and dropped the new state. A
+  hosted run refuses a step again, and a checkpoint a later acceptance of its step
+  shadows refuses to load rather than loading the other (#61).
+- Every id and name prefix filter is exact about case on SQLite as on Postgres
+  (`list_versions_by_id_prefix`, `list_latest_by_id_prefix`, `name_prefix`,
+  `exclude_id_prefix`, `versions_lacking_definition(executor=)`, `find_dependents`):
+  SQLite's `LIKE` ignored ASCII case. An empty `exclude_id_prefix` excludes nothing;
+  an empty prefix to `list_*_by_id_prefix` raises `ValueError` (#62).
+- `create_artifact` refuses ids holding `/` or `\`, `..`, or ending in `~` and an
+  attempt id, which the blob store refused only once the row existed (#62).
+- An attempt a resume or a reclaim took the build from stays fenced, even once its
+  successor lapses (`build_attempts.fenced_at`, added to an older database on open)
+  (#62).
+- `docs/torch.md` documents `writable_seconds`, what an asynchronous save overlaps,
+  and what moves a program id (#60, #61, #64).
+
+### Fixed
+
+- An asynchronous `Run.save` returned before torch-checkpointing had copied the
+  state, so an `optimizer.step()` right after it could reach the accepted, signed
+  checkpoint: a resume continued from weights no step produced. It now returns once
+  the state is copied; the write still overlaps training (#61).
+- A run past its write window kept renewing its lease while every save was refused,
+  so no other process could resume it while the process lived; the renewal now
+  lapses the lease and logs, and the refusals name the closed window (#64).
+- A failed asynchronous save made `finish` and `close` raise its error again: on one
+  rank nothing was released, on several rank 0 raised while the others hung. The
+  future alone reports it; `finish` goes on to the final release, and a close error
+  no longer replaces the exception a `with` block leaves with (#64).
+- Two processes that both found nothing to resume opened two executions of one
+  computation; find-or-start is now one write. A final release that failed to land
+  held up every retry with `ReleaseOutOfOrder`; it is abandoned (#64).
+- vestigo's gloo group ignored the process group's timeout (30 minutes), was never
+  destroyed, and a rank lost as the run opened left rank 0 renewing; a non-zero
+  rank's read error never reached rank 0. `resume` of another executor's build took
+  its lease before refusing it; `HostedRun` wrote beside the host's folder;
+  `Run.manager` changed the caller's checkpointing config (#64).
+- `derive` from an earlier checkpoint while a later one's derivation was uploading
+  made the earlier outputs current; a file output was hashed, then read again to
+  upload; a failed derivation's placeholder stayed `building`. `collect` now reaps a
+  derivation whose lease ran out (its process died): it abandons the release and
+  fails its rows, placeholder and build, freeing the name (#61).
+- `collect`: a dry run listed and counted no staged orphans and a real run counted
+  their bytes as 0; an observation whose process died stayed `building`; a head set
+  to a reserved `vestigo-torch/` name could move another execution's final
+  checkpoint into collection; a `resume(from_release=)` did not mark its checkpoint
+  used (#61).
+- A genuinely signed report put in the manifest's place raised `KeyError`; it is an
+  `OSError` refusal. `checked_path` refuses backslashes and drives, which leave the
+  folder on Windows. A save and a load open no ledger of their own (10 and 17 per
+  checkpoint) and read each accepted checkpoint's files once (#61).
+- A program could not be recorded for a model with `get_extra_state`, a
+  `torch.compile`d loss, a `__slots__` callable, a sparse buffer, or a NaN or
+  infinity in `config` (which also broke rank agreement); each is recorded or raises
+  the documented `TypeError`. The digest cache is owner only and closes its
+  connection when it cannot open; a stat is trusted only past the racy window;
+  `observations` reads only the execution's ids (#60).
+- `sweep_zombie_builds` failed the rows of a build whose lease was live, so a torch
+  run longer than an hour inside a notebook lost its placeholder and staged files to
+  GC (#62).
+- `lapse_lease` took no build key, so on Postgres an acceptance past its fence could
+  commit after the lapse returned, and the lapse instant itself still counted as
+  live (#62).
+- A sweep's delete order handled two levels: a requirement chain, or a required
+  lower version under its id's top, went over several sweeps while the dry run
+  counted it in one (#62).
+- `stats(exclude_id_prefix=)` lost the bytes an included copy read from an excluded
+  canonical; `objects("")` (a `Remote` at a bucket's root) raised on every object
+  store; ADLS Gen2 directory entries listed as objects; an id holding a newline no
+  longer round-tripped its URI and a trailing newline parsed; `resume` of the
+  attempt's own lapsed lease said another attempt's lease was live (#62).
+
+### Tests and CI
+
+- The suite is warnings-fatal from its config, so CI runs it as `-W error`; the
+  torch job runs on Python 3.12 and 3.14; uv is pinned; the release smoke test
+  imports `checkpoint_files` and, with the `torch` extra, `vestigo.torch` (#65).
+- Tests for every documented refusal that had none (the `torch` and `sign` extras'
+  `ImportError`, a missing manifest, the storage's refused `delete`/`rmdir`/`rename`,
+  a loss named by a `str`, an unknown `RemoteBlobs` backend, `run` against a live
+  lease); `objects()` on MinIO, fake-gcs-server and Azurite in the matrix; weak
+  assertions made able to fail; hung ranks and torchrun killed by process group;
+  test clients closed (#65).
+- The README's API section lists every entry point and links absolutely, for PyPI
+  (#65).
 
 ## 0.3.1 - 2026-10-29
 
