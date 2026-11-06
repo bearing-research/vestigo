@@ -18,6 +18,11 @@ The schema gains `build_attempts.fenced_at`, added to an older database on open 
   in SQL, so a page is cut and the totals are summed without a consumer's
   bookkeeping rows (a build's placeholder, say). The prefix is literal: `_`
   and `%` match only themselves. `name_count` still counts every name (#59).
+- CI tests on macOS and Windows (Python 3.12 and 3.14; the torch job on 3.12) beside
+  Linux; the Postgres and object-store tests need Linux containers and skip there.
+  A release attests its wheel and sdist, smoke-tests the wheel on all three, and
+  attaches the same files to a GitHub release: `gh attestation verify <file> -R
+  bearing-research/vestigo` (#67).
 
 ### Changed
 
@@ -59,6 +64,10 @@ The schema gains `build_attempts.fenced_at`, added to an older database on open 
 
 ### Fixed
 
+- `vestigo.torch` saved nothing on Windows: torch-checkpointing hands the storage a
+  native path or its `str`, whose backslashes read as one part, so every save refused
+  its own checkpoint id. `torchrun` there needs `USE_LIBUV=0`, which the guide says
+  (#67).
 - An asynchronous `Run.save` returned before torch-checkpointing had copied the
   state, so an `optimizer.step()` right after it could reach the accepted, signed
   checkpoint: a resume continued from weights no step produced. It now returns once
