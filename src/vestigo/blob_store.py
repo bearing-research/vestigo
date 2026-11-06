@@ -6,7 +6,6 @@ artifact store's database.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import io
 import json
@@ -1198,18 +1197,15 @@ class AzureBlobStore(BlobStore):
 
     def objects(self, path: str) -> list[tuple[str, int, str]]:
         """Each blob at *path* in the container, a name or a prefix ending in ``/``, as
-        its name, size and what names its bytes: its Content-MD5 (``md5:<base64>``) when
-        the uploader set one, else its ETag (``etag:<value>``), which a metadata write
-        changes too. Folder markers left out. Not under :attr:`prefix`: any name of the
-        container.
+        its name, size and ETag (``etag:<value>``), which changes with every write, a
+        metadata write too. Folder markers left out. Not under :attr:`prefix`: any name
+        of the container.
 
         A backend error propagates.
         """
 
         def named(props: Any) -> tuple[str, int, str]:
-            md5 = props.content_settings.content_md5
-            if md5:
-                return props.name, int(props.size), f"md5:{base64.b64encode(bytes(md5)).decode()}"
+            # Not the Content-MD5: a block list commits whatever MD5 the uploader sends.
             etag = props.etag.strip('"')
             return props.name, int(props.size), f"etag:{etag}"
 
