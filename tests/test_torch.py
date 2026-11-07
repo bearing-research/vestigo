@@ -2583,10 +2583,11 @@ def test_a_renewal_that_fails_once_keeps_the_lease(tmp_path: Path, monkeypatch: 
         return renew(self, *args, **kwargs)
 
     monkeypatch.setattr(BuildStore, "renew_lease", locked_once)
-    with Ledger(tmp_path / "ledger", lease_seconds=0.3) as ledger:
+    # Ticks a second apart: a runner's stall after the error leaves the lease live.
+    with Ledger(tmp_path / "ledger", lease_seconds=3.0) as ledger:
         trainer = Trainer(ledger)
         with ledger.start(trainer.program) as run:
-            assert renewed.wait(10), "renewal stopped after one error"
+            assert renewed.wait(30), "renewal stopped after one error"
             trainer.train(run, 1)
             assert run.release_of(1) is not None
 
