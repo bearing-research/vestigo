@@ -5,6 +5,16 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `vestigo.digests.FileDigests`, the machine's cache of local files' sha256,
+  reused while a file's stat holds and torch-free: lookups that never read a file,
+  reads of the misses on threads remembered in one write (stopping at the first
+  file changed while it was read, with `settled_only`), and `prune`. A digest unused
+  for 90 days is forgotten. A cache file that cannot be opened is replaced by memory
+  for the instance's life, and a file stamped past the clock is logged once. Verified `Path` inputs use it, as Strata's
+  notebook will (#NN).
+
 ### Fixed
 
 - `ArtifactStore.garbage_collect` with `collectable`: a version the sweep keeps
@@ -19,6 +29,10 @@ All notable changes to vestigo are recorded here. The format follows
   a reader used or held during the sweep still finds its inputs to hold, and a
   collectable version that stays holds them from the next row on, not only from
   the next batch (#69).
+- A verified `Path` input holding a file whose name is not UTF-8 resolves; before,
+  the digest cache raised `UnicodeEncodeError` (#NN). The machine's digest cache no
+  longer grows without end: a launch on a directory forgets its files that are gone,
+  and a digest unused for 90 days is forgotten (#NN).
 
 ## 0.4.0 - 2026-11-06
 
