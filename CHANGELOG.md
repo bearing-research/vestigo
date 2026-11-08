@@ -13,7 +13,7 @@ All notable changes to vestigo are recorded here. The format follows
   file changed while it was read, with `settled_only`), and `prune`. A digest unused
   for 90 days is forgotten. A cache file that cannot be opened is replaced by memory
   for the instance's life, and a file stamped past the clock is logged once. Verified `Path` inputs use it, as Strata's
-  notebook will (#NN).
+  notebook will (#70).
 
 ### Fixed
 
@@ -30,9 +30,9 @@ All notable changes to vestigo are recorded here. The format follows
   collectable version that stays holds them from the next row on, not only from
   the next batch (#69).
 - A verified `Path` input holding a file whose name is not UTF-8 resolves; before,
-  the digest cache raised `UnicodeEncodeError` (#NN). The machine's digest cache no
+  the digest cache raised `UnicodeEncodeError` (#70). The machine's digest cache no
   longer grows without end: a launch on a directory forgets its files that are gone,
-  and a digest unused for 90 days is forgotten (#NN).
+  and a digest unused for 90 days is forgotten (#70).
 
 ## 0.4.0 - 2026-11-06
 
