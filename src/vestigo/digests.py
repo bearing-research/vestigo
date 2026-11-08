@@ -102,12 +102,33 @@ def _stat_key(st: os.stat_result) -> str:
     return str(_stat_fields(st))
 
 
-def _read_digest(path: str | os.PathLike[str]) -> str:
-    hasher = hashlib.sha256()
-    with open(path, "rb") as f:
+def _same_file(opened: os.stat_result, looked_up: os.stat_result) -> bool:
+    """Whether the file a read opened is, unchanged, the one stat'ed by its name."""
+    if os.name == "nt":
+        # A name's times and size there are the directory entry's copy, which can trail
+        # the file's own for a moment after a write: only which file it is compares. A
+        # change during the read still shows in the name's stat after it.
+        return (opened.st_dev, opened.st_ino) == (looked_up.st_dev, looked_up.st_ino)
+    return _stat_fields(opened) == _stat_fields(looked_up)
+
+
+def _read_digest(path: str | os.PathLike[str]) -> tuple[str, os.stat_result]:
+    """The sha256 of the file opened at *path*, and that file's stat after the read: the
+    name can lead elsewhere while it is read, and back before it is stat'ed again.
+
+    Raises:
+        OSError: *path* cannot be read, or is not a regular file once opened (a FIFO put
+            in a file's place would block the read, a device never end it).
+    """
+    # Unblocked: opening a FIFO waits for a writer.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    with open(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        hasher = hashlib.sha256()
         while chunk := f.read(_CHUNK):
             hasher.update(chunk)
-    return hasher.hexdigest()
+        return hasher.hexdigest(), os.fstat(fd)
 
 
 def _open(path: Path, *, own_folder: bool) -> sqlite3.Connection:
@@ -183,6 +204,7 @@ class FileDigests:
     def now(self) -> int:
         """This instance's clock, in ns: read before a walk, it is :meth:`prune`'s
         *walked_at*."""
+        self._check_open()
         return self._clock()
 
     def close(self) -> None:
@@ -234,8 +256,8 @@ class FileDigests:
         does not stop them, and comes back unsettled.
 
         *stats* are the paths' stats as the caller just took them, in a walk: none is
-        taken again before the reads, and a file whose stat has moved since comes back
-        unsettled.
+        taken again before the reads. A file read whose stat has moved since comes back
+        unsettled; a remembered digest is the one for the stat given.
 
         *settled_only* stops at the first file that changed while it was read, as a
         failed read does: what was read before it is remembered, and it raises.
@@ -266,8 +288,10 @@ class FileDigests:
         to_read = [i for i in missing if first.setdefault(stats_of[i][:2], i) == i]
 
         def read(i: int) -> Digest:
-            sha = _read_digest(paths[i])
-            return Digest(sha, settled=_stat_key(os.stat(paths[i])) == stats_of[i][1])
+            sha, read_from = _read_digest(paths[i])
+            # The file read, and the one its name leads to now, are both the one stat'ed.
+            settled = _same_file(read_from, taken[i])
+            return Digest(sha, settled=settled and _stat_key(os.stat(paths[i])) == stats_of[i][1])
 
         stopped: Exception | None = None
         pool = ThreadPoolExecutor(max_workers=workers or min(32, os.cpu_count() or 1))
