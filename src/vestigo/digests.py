@@ -46,6 +46,8 @@ _DAY_NS = 86_400 * 10**9
 _TOUCH_NS = _DAY_NS
 # A row unused this long goes: the file was deleted, moved, or is no longer read.
 _UNUSED_NS = 90 * _DAY_NS
+# Paths bound per lookup statement: SQLite before 3.32 allows 999 variables.
+_LOOKUP_CHUNK = 500
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS file_digests (path BLOB PRIMARY KEY, stat TEXT NOT NULL,"
@@ -158,6 +160,7 @@ class FileDigests:
         self._memory: dict[bytes, tuple[str, str]] = {}
         self._where: Path | None = None
         self._skew_logged = False
+        self._closed = False
         try:
             self._where = _cache_path() if path is None else Path(path)
             self._conn = _open(self._where, own_folder=path is None)
@@ -165,7 +168,9 @@ class FileDigests:
             self._degraded()
 
     def close(self) -> None:
+        """Close the cache file. A use after this raises ``ValueError``."""
         with self._lock:
+            self._closed = True
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
@@ -181,6 +186,7 @@ class FileDigests:
 
     def cached_many(self, paths: Iterable[str | os.PathLike[str]]) -> list[str | None]:
         """:meth:`cached` of each of *paths*, in one read of the cache."""
+        self._check_open()
         now = self._clock()
         known, used = self._lookup([(_row_path(p), _stat_key(os.stat(p))) for p in paths], now)
         self._write([], used, now)
@@ -220,6 +226,7 @@ class FileDigests:
             OSError: as :meth:`digest`, for the first of *paths* that fails.
             FileChanged: with *settled_only*, a file changed while it was read.
         """
+        self._check_open()
         paths = list(paths)
         taken = [os.stat(p) for p in paths] if stats is None else list(stats)
         stats_of = []
@@ -236,6 +243,9 @@ class FileDigests:
         if not missing:
             self._write([], used, now)
             return cast(list[Digest], found)
+        # One file named twice (two links into a tree, resolved) is read once.
+        first: dict[tuple[bytes, str], int] = {}
+        to_read = [i for i in missing if first.setdefault(stats_of[i][:2], i) == i]
 
         def read(i: int) -> Digest:
             sha = _read_digest(paths[i])
@@ -244,7 +254,7 @@ class FileDigests:
         stopped: Exception | None = None
         pool = ThreadPoolExecutor(max_workers=workers or min(32, os.cpu_count() or 1))
         try:
-            pending = {pool.submit(read, i): i for i in missing}
+            pending = {pool.submit(read, i): i for i in to_read}
             for future in as_completed(pending):
                 i = pending[future]
                 try:
@@ -258,7 +268,10 @@ class FileDigests:
         finally:
             # The reads not yet started are not started at all.
             pool.shutdown(cancel_futures=True)
-        read_now = [(i, d) for i in missing if (d := found[i]) is not None]
+        for i in missing:
+            if found[i] is None:
+                found[i] = found[first[stats_of[i][:2]]]
+        read_now = [(i, d) for i in to_read if (d := found[i]) is not None]
         self._skewed([paths[i] for i, _ in read_now if stats_of[i][2] > now])
         rows = [
             (stats_of[i][0], stats_of[i][1], d.sha256)
@@ -280,21 +293,12 @@ class FileDigests:
         # The separator: ``data2`` is not under ``data``.
         prefix = os.fsencode(os.path.join(Path(root).absolute(), ""))
         below = prefix[:-1] + bytes([prefix[-1] + 1])
-        keep = {_row_path(p) for p in seen}
+        keep = {where for p in seen if prefix <= (where := _row_path(p)) < below}
         with self._lock:
+            self._check_open()
             if self._conn is not None:
                 try:
-                    # A look first: most launches find nothing gone, and need no write lock.
-                    with _transaction(self._conn) as conn:
-                        gone = self._gone(conn, prefix, below, keep)
-                    if not gone:
-                        return 0
-                    # IMMEDIATE, so looked at again: a read lock raised to a write one
-                    # fails at once, unwaited, when another connection is writing.
-                    with _transaction(self._conn, "BEGIN IMMEDIATE") as conn:
-                        gone = self._gone(conn, prefix, below, keep)
-                        conn.executemany("DELETE FROM file_digests WHERE path = ?", gone)
-                    return len(gone)
+                    return self._prune(self._conn, prefix, below, keep)
                 except sqlite3.Error:
                     self._degraded()
             forgotten = [w for w in self._memory if w.startswith(prefix) and w not in keep]
@@ -303,13 +307,29 @@ class FileDigests:
             return len(forgotten)
 
     @staticmethod
-    def _gone(
-        conn: sqlite3.Connection, prefix: bytes, below: bytes, keep: set[bytes]
-    ) -> list[tuple[bytes]]:
-        rows = conn.execute(
-            "SELECT path FROM file_digests WHERE path >= ? AND path < ?", (prefix, below)
-        ).fetchall()
-        return [(where,) for (where,) in rows if where not in keep]
+    def _prune(conn: sqlite3.Connection, prefix: bytes, below: bytes, keep: set[bytes]) -> int:
+        # The walk's paths in a table of this connection's own, so the rows under the root
+        # are compared in SQLite rather than fetched: a tree may hold a million files.
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS prune_keep (path BLOB PRIMARY KEY)")
+        try:
+            gone = (
+                "FROM file_digests WHERE path >= ? AND path < ?"
+                " AND path NOT IN (SELECT path FROM temp.prune_keep)"
+            )
+            # A look first: most launches find nothing gone, and need no write lock. The
+            # paths go in inside it, one commit rather than one per row; a write to the
+            # temp table locks no other connection out.
+            with _transaction(conn) as reading:
+                reading.executemany("INSERT INTO temp.prune_keep VALUES (?)", [(w,) for w in keep])
+                [any_gone] = reading.execute(f"SELECT EXISTS (SELECT 1 {gone})", (prefix, below))
+            if not any_gone[0]:
+                return 0
+            # The write lock before anything is read: a read lock raised to a write one
+            # fails at once, unwaited, when another connection is writing.
+            with _transaction(conn, "BEGIN IMMEDIATE") as writing:
+                return writing.execute(f"DELETE {gone}", (prefix, below)).rowcount
+        finally:
+            conn.execute("DELETE FROM temp.prune_keep")
 
     def _lookup(
         self, keys: Sequence[tuple[bytes, str]], now: int
@@ -317,6 +337,8 @@ class FileDigests:
         """Each key's remembered sha256, and the paths of the hits last marked used over
         a day before *now*."""
         with self._lock:
+            # Again under the lock: a close from another thread may have come since.
+            self._check_open()
             rows = self._rows([where for where, _ in keys], now)
         known: list[str | None] = []
         used = []
@@ -332,14 +354,19 @@ class FileDigests:
     def _rows(self, paths: Sequence[bytes], now: int) -> list[tuple[str, str, int] | None]:
         if self._conn is not None:
             try:
+                found: dict[bytes, tuple[str, str, int]] = {}
+                unique = list(dict.fromkeys(paths))
                 with _transaction(self._conn) as conn:
-                    return [
-                        conn.execute(
-                            "SELECT stat, sha256, used_at FROM file_digests WHERE path = ?",
-                            (where,),
-                        ).fetchone()
-                        for where in paths
-                    ]
+                    for start in range(0, len(unique), _LOOKUP_CHUNK):
+                        chunk = unique[start : start + _LOOKUP_CHUNK]
+                        marks = ", ".join("?" * len(chunk))
+                        for where, key, sha, used_at in conn.execute(
+                            "SELECT path, stat, sha256, used_at FROM file_digests"
+                            f" WHERE path IN ({marks})",
+                            chunk,
+                        ):
+                            found[where] = (key, sha, used_at)
+                return [found.get(where) for where in paths]
             except sqlite3.Error:
                 self._degraded()
         # Memory lasts the instance's life: never marked used, never forgotten.
@@ -353,6 +380,7 @@ class FileDigests:
         if not rows and not used:
             return
         with self._lock:
+            self._check_open()
             if self._conn is not None:
                 try:
                     with _transaction(self._conn, "BEGIN IMMEDIATE") as conn:
@@ -371,6 +399,10 @@ class FileDigests:
                 except sqlite3.Error:
                     self._degraded()
             self._memory.update({where: (key, sha) for where, key, sha in rows})
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise ValueError("this FileDigests is closed")
 
     def _degraded(self) -> None:
         """From the cache file to memory, for the rest of this instance's life. Called in

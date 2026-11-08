@@ -12,8 +12,10 @@ All notable changes to vestigo are recorded here. The format follows
   reads of the misses on threads remembered in one write (stopping at the first
   file changed while it was read, with `settled_only`), and `prune`. A digest unused
   for 90 days is forgotten. A cache file that cannot be opened is replaced by memory
-  for the instance's life, and a file stamped past the clock is logged once. Verified `Path` inputs use it, as Strata's
-  notebook will (#70).
+  for the instance's life, and a file stamped past the clock is logged once.
+  Lookups go in batches, a file named twice is read once, prune compares in SQLite,
+  and a closed instance refuses use. Verified `Path` inputs use it, as Strata's
+  notebook will (#70, #72).
 
 ### Fixed
 

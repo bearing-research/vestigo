@@ -438,6 +438,83 @@ def _write_beside(path: Path) -> None:
         db.execute("COMMIT")
 
 
+def test_a_closed_cache_refuses_to_be_used(tmp_path: Path, cache: FileDigests):
+    """Rather than go on as an empty cache in memory that nothing persists."""
+    data = tmp_path / "a.csv"
+    data.write_bytes(b"1,2\n")
+    cache.close()
+
+    for use in (
+        lambda: cache.cached(data),
+        lambda: cache.digest(data),
+        lambda: cache.prune(tmp_path, [data]),
+    ):
+        with pytest.raises(ValueError, match="closed"):
+            use()
+    cache.close()  # twice is fine
+
+
+def test_a_close_from_another_thread_mid_call_is_refused(tmp_path: Path, cache: FileDigests):
+    """A close that lands after a call began, as another thread's can, is seen under the
+    lock, rather than the call going on against memory."""
+    data = tmp_path / "a.csv"
+    data.write_bytes(b"1,2\n")
+
+    def closing_as_the_paths_are_taken():
+        cache.close()
+        yield data
+
+    with pytest.raises(ValueError, match="closed"):
+        cache.cached_many(closing_as_the_paths_are_taken())
+
+
+def test_one_file_named_twice_is_read_once(tmp_path: Path, cache: FileDigests, reads: list[Path]):
+    """Two links into a tree to one file resolve to one path."""
+    data = tmp_path / "a.csv"
+    data.write_bytes(b"1,2\n")
+
+    once, again = cache.digest_many([data, data])
+
+    assert once == again == Digest(_sha(b"1,2\n"), settled=True)
+    assert reads == [data]
+
+
+def test_a_large_lookup_is_a_few_statements(tmp_path: Path, cache: FileDigests):
+    """Not one per file: a tree of 100k files was 100k statements under the lock."""
+    files = [tmp_path / f"{i:04}.csv" for i in range(1200)]
+    for i, path in enumerate(files):
+        path.write_bytes(b"%d\n" % i)
+    cache.digest_many(files)
+    statements: list[str] = []
+    assert cache._conn is not None
+    cache._conn.set_trace_callback(statements.append)
+
+    assert None not in cache.cached_many(files)
+
+    assert len([s for s in statements if s.startswith("SELECT")]) == 3
+
+
+def test_prune_puts_the_walk_s_paths_in_with_one_commit(tmp_path: Path, cache: FileDigests):
+    """Not one transaction per path, and none for a path outside the root: a walk may
+    find a million files."""
+    root = tmp_path / "data"
+    root.mkdir()
+    inside = [root / f"{i}.csv" for i in range(5)]
+    for path in inside:
+        path.write_bytes(b"1\n")
+    cache.digest_many(inside)
+    statements: list[str] = []
+    assert cache._conn is not None
+    cache._conn.set_trace_callback(statements.append)
+
+    assert cache.prune(root, [*inside, tmp_path / "elsewhere.csv"]) == 0
+
+    inserts = [i for i, s in enumerate(statements) if s.startswith("INSERT INTO temp.prune_keep")]
+    assert len(inserts) == len(inside)
+    begin = max(i for i, s in enumerate(statements[: inserts[0]]) if s.startswith("BEGIN"))
+    assert not any(s.startswith("COMMIT") for s in statements[begin : inserts[-1]])
+
+
 def test_a_missing_file_raises(tmp_path: Path, cache: FileDigests):
     with pytest.raises(FileNotFoundError):
         cache.digest(tmp_path / "absent.csv")
