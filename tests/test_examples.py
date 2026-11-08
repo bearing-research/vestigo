@@ -79,7 +79,7 @@ def test_the_releases_example_fences_the_stalled_worker(tmp_path: Path):
 
 
 def test_the_readme_s_first_look_counts_a_file_once(tmp_path: Path):
-    """The README's example, as a reader pastes it: a rerun finds the counts, an edit recounts."""
+    """The README's example, as pasted: a rerun finds, an edit recounts, a revert finds again."""
     readme = (EXAMPLES.parent.parent / "README.md").read_text(encoding="utf-8")
     [code] = re.findall(r"```python\n(.*?)```", readme, flags=re.S)
     script = tmp_path / "count_words.py"
@@ -102,6 +102,8 @@ def test_the_readme_s_first_look_counts_a_file_once(tmp_path: Path):
     assert run() == ["found notes.txt in word-counts@v=1", "the 3, dog 2, fox 1"]
     notes.write_text("A cat. A cat sat.\n", encoding="utf-8")
     assert run() == ["counted notes.txt into word-counts@v=2", "a 2, cat 2, sat 1"]
+    notes.write_text("The fox saw the dog.\nThe dog ran.\n", encoding="utf-8")
+    assert run() == ["found notes.txt in word-counts@v=1", "the 3, dog 2, fox 1"]
 
     store = ArtifactStore(tmp_path / "ledger")
     try:

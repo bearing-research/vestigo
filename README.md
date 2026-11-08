@@ -33,7 +33,7 @@ consumer, and imports nothing of it. *Vestigo* is Latin for "I track down, I tra
 
 ## A first look
 
-Count the words in a file, and keep the counts: the same file is counted once.
+Count the words in a file, and keep the counts: the same text is counted once.
 
 ```python
 """Usage: python count_words.py notes.txt"""
@@ -48,32 +48,38 @@ from pathlib import Path
 from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.store import ArtifactStore
 
+if len(sys.argv) != 2:
+    sys.exit(__doc__)
 path = Path(sys.argv[1])
 text = path.read_bytes()
-# What produces the counts: this code's version, over these bytes.
+# What produces the counts: this code's version, over this text. A file from
+# outside the ledger has no provenance of its own, so its bytes stand in for it.
 spec = TransformSpec("count-words@v1", {"sha256": hashlib.sha256(text).hexdigest()}, [])
 key = compute_provenance_hash([], spec)
 
 store = ArtifactStore(Path("ledger"))  # SQLite and local bytes under ledger/
-counts = store.find_by_provenance(key)
-if counts is None:
-    words = Counter(re.findall(r"\w+", text.decode("utf-8").lower()))
-    data = json.dumps(words.most_common()).encode()
-    version = store.create_artifact("word-counts", key, spec)
-    store.write_blob("word-counts", version, data)
-    counts = store.finalize_artifact("word-counts", version, "{}", None, len(data))
-    print(f"counted {path} into word-counts@v={counts.version}")
-else:
-    print(f"found {path} in word-counts@v={counts.version}")
+try:
+    counts = store.find_by_provenance(key)
+    if counts is None:
+        words = Counter(re.findall(r"\w+", text.decode("utf-8").lower()))
+        data = json.dumps(words.most_common()).encode()
+        version = store.create_artifact("word-counts", key, spec)
+        store.write_blob("word-counts", version, data)
+        counts = store.finalize_artifact("word-counts", version, "{}", None, len(data))
+        print(f"counted {path} into {counts.id}@v={counts.version}")
+    else:
+        print(f"found {path} in {counts.id}@v={counts.version}")
 
-top = json.loads(store.read_blob(counts.id, counts.version))[:3]
-print(", ".join(f"{word} {n}" for word, n in top))
-store.close()
+    top = json.loads(store.read_blob(counts.id, counts.version))[:3]
+    print(", ".join(f"{word} {n}" for word, n in top))
+finally:
+    store.close()
 ```
 
 Run it twice on one file and the second run counts nothing. Edit the file, or bump
 `count-words@v1` after changing the counting, and the next run stores a new version
-of `word-counts`; the earlier ones stay as they were.
+of `word-counts`; the earlier ones stay, and a file back at an earlier text finds
+its counts again.
 
 [The ledger guide](https://github.com/bearing-research/vestigo/blob/main/docs/ledger.md) goes on from here to names, lineage, builds,
 releases and retention. For training, [the PyTorch guide](https://github.com/bearing-research/vestigo/blob/main/docs/torch.md) opens
