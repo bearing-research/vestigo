@@ -76,3 +76,28 @@ def test_the_releases_example_fences_the_stalled_worker(tmp_path: Path):
         assert final is not None and final.state == "ready"
     finally:
         store.close()
+
+
+def test_the_readme_s_first_look_stores_its_result_once(tmp_path: Path):
+    """The README's example, as a reader pastes it: the second run finds the first's."""
+    readme = (EXAMPLES.parent.parent / "README.md").read_text(encoding="utf-8")
+    [code] = re.findall(r"```python\n(.*?)```", readme, flags=re.S)
+    script = tmp_path / "first_look.py"
+    script.write_text(code, encoding="utf-8")
+
+    for _ in range(2):
+        result = subprocess.run(
+            [sys.executable, "-W", "error", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=tmp_path,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.split() == ["word-counts", "1"]
+
+    store = ArtifactStore(tmp_path / "ledger")
+    try:
+        assert [v.version for v in store.list_versions_by_id_prefix("word-counts")] == [1]
+    finally:
+        store.close()

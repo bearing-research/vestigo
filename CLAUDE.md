@@ -89,8 +89,8 @@ to PyPI and attaches the same files to a GitHub release. ty checks `src` only.
 | `checkpoint_files` | the layout of a checkpoint made of files (each file's params, the manifest), torch-free: what `torch` writes and reads and a host publishing for a `HostedRun` records |
 | `torch` | the PyTorch adapter: model and program nodes, executions as builds, `LedgerStorage` (`torch_checkpointing`'s storage over the ledger: each file a `building` version before its bytes, any blob backend), each checkpoint a release of every rank's report under a manifest, accepted by rank 0 after the barrier under the run's lease, signed when the ledger has a key; `Ledger.configure` a storage that only loads; `Ledger.execution`, `executions`, `resumed_from` and `descendants` read the lineage; `Run.observe` records an `ExportedProgram` beside them, in no node; `HostedRun` saves into folders a `Host` (a Strata cell) publishes |
 
-The README's API section is the public surface; keep it in step when a
-module gains an entry point.
+`docs/api.md` is the public surface; keep it in step when a module gains an
+entry point, and the README's overview when a capability is added.
 
 ## Important invariants
 
