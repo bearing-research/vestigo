@@ -266,6 +266,6 @@ take. `release(...)` drops a root. A version that needs others beside its inputs
 
 ## Where to go next
 
-- The module list and every export: the [README](../README.md#api).
+- The module list and every export: the [API reference](api.md).
 - The lifecycles' TLA+ models: [`formal/`](../formal/README.md).
 - PyTorch: [`docs/torch.md`](torch.md).

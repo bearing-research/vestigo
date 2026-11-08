@@ -5,6 +5,12 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- The README is an overview: what vestigo does, a first example (which the suite
+  runs), install and the documentation. Every module and its exports moved to
+  `docs/api.md` (#77).
+
 ### Added
 
 - `vestigo.digests.FileDigests`, the machine's cache of local files' sha256,
