@@ -367,9 +367,12 @@ a special file such as a pipe, and a directory with no files; a link to a file i
 the tree counts as that file. A relaunch costs a `stat` per file, not a read: digests
 are cached per machine in `$VESTIGO_CACHE_DIR`, else `$XDG_CACHE_HOME/vestigo`, else
 `~/.cache/vestigo` (with none usable, every file is hashed), readable by its owner
-only. A file whose mtime or ctime was within two seconds of a scan is hashed again
-at each check until a scan finds it older, since a write in the same timestamp tick
-could leave its stat unchanged.
+only; a launch on a directory forgets the digests of its files that are gone, and a
+digest unused for 90 days is forgotten. The cache is `vestigo.digests.FileDigests`,
+which needs no torch. A file whose mtime or
+ctime was within two seconds of a scan is hashed again at each check until a scan
+finds it older, since a write in the same timestamp tick could leave its stat
+unchanged.
 
 **A `Remote` is verified through its object store.** `Remote("s3://bucket/key")` names
 one object and `Remote("gs://bucket/prefix/")` (ending in `/`) every object under it;

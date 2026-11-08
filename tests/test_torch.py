@@ -35,7 +35,7 @@ from concurrent.futures import Future
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -47,6 +47,7 @@ from torch.distributed import distributed_c10d
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorage
 
+import vestigo.digests
 import vestigo.torch
 from vestigo import checkpoint_files
 from vestigo.blob_store import BlobSettings
@@ -70,7 +71,6 @@ from vestigo.torch import (
     _canonical,
     _Checkpoints,
     _copies,
-    _file_digest,
     _Held,
     _kinds,
     _Location,
@@ -733,16 +733,18 @@ def _key(ledger: Ledger, path: Path) -> str:
     return ledger.computation_key(Trainer(ledger).program, {"train": path})
 
 
-def _counted(monkeypatch: pytest.MonkeyPatch, name: str) -> list:
-    """Calls of ``vestigo.torch.<name>``, each one's first argument."""
+def _counted(
+    monkeypatch: pytest.MonkeyPatch, name: str, module: ModuleType = vestigo.torch
+) -> list:
+    """Calls of ``<module>.<name>``, each one's first argument."""
     calls = []
-    real = getattr(vestigo.torch, name)
+    real = getattr(module, name)
 
     def counted(*args, **kwargs):
         calls.append(args[0])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(vestigo.torch, name, counted)
+    monkeypatch.setattr(module, name, counted)
     return calls
 
 
@@ -943,7 +945,7 @@ def test_a_stat_that_hashed_to_the_pin_is_not_read_again(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     # Older than a scan's timestamp tick, so the stat that hashed to the pin is trusted.
-    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
+    monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
     data = _file(tmp_path / "train.bin")
     trainer = Trainer(ledger)
     with _run(ledger, trainer, {"train": data}) as run:
@@ -1024,11 +1026,11 @@ def test_a_save_scans_its_inputs_once_reads_none_and_ships_no_listing(
     for i in range(300):
         _file(large / "shards" / f"{i:04}.bin", b"%d" % i)
     # Files older than a scan's timestamp tick, whose stat a check trusts.
-    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
+    monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
     sizes = []
     scans = _counted(monkeypatch, "_scan")
     pins = _counted(monkeypatch, "_pin")
-    reads = _counted(monkeypatch, "_file_digest")
+    reads = _counted(monkeypatch, "_read_digest", vestigo.digests)
     for tree in (small, large):
         trainer = Trainer(ledger)
         with _run(ledger, trainer, {"train": tree}) as run:
@@ -1066,7 +1068,7 @@ def test_a_rank_s_copies_must_be_the_bytes_rank_0_pinned(
     objects = _bucket(monkeypatch)
     objects["s3://lake/eval.bin"] = (1, "etag:e")
     # Files older than a scan's timestamp tick, whose stat a check trusts.
-    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
+    monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
     data = _file(tmp_path / "rank0" / "train.bin")
     copy = _file(tmp_path / "rank1" / "train.bin")
     other = _file(tmp_path / "other" / "train.bin", b"rowz")
@@ -1162,8 +1164,8 @@ def test_a_relaunch_reads_no_input_again_but_one_whose_stat_changed(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     # Every file here is settled, so the cache keeps each digest it reads.
-    monkeypatch.setattr("vestigo.torch._RACY_NS", 0)
-    reads = _counted(monkeypatch, "_file_digest")
+    monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
+    reads = _counted(monkeypatch, "_read_digest", vestigo.digests)
     data = _file(tmp_path / "train.bin")
     key = _key(ledger, data)
     assert _key(ledger, data) == key
@@ -1178,7 +1180,7 @@ def test_a_relaunch_reads_no_input_again_but_one_whose_stat_changed(
 def test_a_file_changed_in_the_last_two_seconds_is_read_each_time(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    reads = _counted(monkeypatch, "_file_digest")
+    reads = _counted(monkeypatch, "_read_digest", vestigo.digests)
     # An old mtime does not settle it: rsync and cp -p set one back, and the ctime is now.
     data = _file(tmp_path / "train.bin")
     old = time.time() - 3600
@@ -1193,16 +1195,16 @@ def test_a_digest_is_cached_only_for_a_file_settled_before_its_read_began(
 ):
     # A long pass: the clock is ten seconds on once the file is read.
     now = [time.time_ns()]
-    hashed = vestigo.torch._hash
+    hashed = vestigo.digests._read_digest
 
-    def slow(scanned: object) -> str:
+    def slow(path: Path) -> str:
         now[0] += 10 * 10**9
-        return hashed(scanned)
+        return hashed(path)
 
     monkeypatch.setattr("vestigo.torch.time.time_ns", lambda: now[0])
-    monkeypatch.setattr("vestigo.torch._hash", slow)
+    monkeypatch.setattr("vestigo.digests._read_digest", slow)
     data = _file(tmp_path / "train.bin")
-    reads = _counted(monkeypatch, "_file_digest")
+    reads = _counted(monkeypatch, "_read_digest", vestigo.digests)
     _key(ledger, data)
     _key(ledger, data)
     assert len(reads) == 2
@@ -1220,7 +1222,7 @@ def test_a_corrupt_digest_cache_closes_its_connection(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     # The warning's record would hold the failed frame, and the connection, alive.
-    monkeypatch.setattr(logging.getLogger("vestigo.torch"), "disabled", True)
+    monkeypatch.setattr(logging.getLogger("vestigo.digests"), "disabled", True)
     cache = Path(os.environ["VESTIGO_CACHE_DIR"])
     _file(cache / "digests.sqlite", b"not a database, " * 64)
     with warnings.catch_warnings(record=True) as caught:
@@ -1233,12 +1235,14 @@ def test_a_corrupt_digest_cache_closes_its_connection(
 def test_a_file_written_while_it_is_hashed_is_refused(
     ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    def raced(path: Path) -> tuple[int, str]:
-        read = _file_digest(path)
-        path.write_bytes(b"rowz")
+    hashed = vestigo.digests._read_digest
+
+    def raced(path: Path) -> str:
+        read = hashed(path)
+        Path(path).write_bytes(b"rowz")
         return read
 
-    monkeypatch.setattr("vestigo.torch._file_digest", raced)
+    monkeypatch.setattr("vestigo.digests._read_digest", raced)
     with pytest.raises(InputChanged, match="while it was hashed"):
         _key(ledger, _file(tmp_path / "train.bin"))
 
@@ -1251,15 +1255,40 @@ def test_the_first_failed_read_stops_the_hashing(
         _file(tree / f"{i:02}.bin", b"%d" % i)
     reads = []
 
-    def failing(path: Path) -> tuple[int, str]:
+    def failing(path: Path) -> str:
         reads.append(path)
         raise PermissionError(path)
 
-    monkeypatch.setattr("vestigo.torch._file_digest", failing)
+    monkeypatch.setattr("vestigo.digests._read_digest", failing)
     monkeypatch.setattr("vestigo.torch.os.cpu_count", lambda: 1)
     with pytest.raises(PermissionError):
         _key(ledger, tree)
     # One worker: the one that failed, and at most the one it took up meanwhile.
+    assert len(reads) <= 2
+
+
+def test_the_first_file_written_as_it_is_hashed_stops_the_hashing(
+    ledger: Ledger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    tree = tmp_path / "tree"
+    for i in range(20):
+        _file(tree / f"{i:02}.bin", b"%d" % i)
+    hashed = vestigo.digests._read_digest
+    reads = []
+
+    def raced(path: Path) -> str:
+        reads.append(path)
+        if len(reads) > 1:
+            time.sleep(0.2)  # slow, as a real read is: else the worker races ahead
+        read = hashed(path)
+        Path(path).write_bytes(b"rowz")
+        return read
+
+    monkeypatch.setattr("vestigo.digests._read_digest", raced)
+    monkeypatch.setattr("vestigo.torch.os.cpu_count", lambda: 1)
+    with pytest.raises(InputChanged, match="while it was hashed"):
+        _key(ledger, tree)
+    # One worker: the one that changed, and at most the one it took up meanwhile.
     assert len(reads) <= 2
 
 
@@ -1275,11 +1304,37 @@ def test_an_unusable_digest_cache_hashes_every_input(
         blocked = _file(tmp_path / "a-file", b"")
         monkeypatch.setenv("VESTIGO_CACHE_DIR", str(blocked / "cache"))
     data = _file(tmp_path / "train.bin")
-    with caplog.at_level(logging.WARNING, logger="vestigo.torch"):
+    with caplog.at_level(logging.WARNING, logger="vestigo.digests"):
         assert _key(ledger, data) == ledger.computation_key(
             Trainer(ledger).program, {"train": _file(tmp_path / "again" / "train.bin")}
         )
     assert "No digest cache" in caplog.text
+
+
+def test_a_folder_holding_a_name_that_is_not_utf8_resolves(tmp_path: Path):
+    tree = tmp_path / "tree"
+    _file(tree / "plain.csv", b"0\n")
+    try:
+        # Windows's names are UTF-16: no bytes name to decode, so none that is not UTF-8.
+        _file(tree / os.fsdecode(b"caf\xe9.csv"), b"1,2\n")
+    except (OSError, UnicodeError):
+        pytest.skip("this filesystem only takes valid names")
+    assert vestigo.torch._resolve({"train": tree}).spec["train"]["files"] == 2
+
+
+def test_a_directory_input_s_files_that_are_gone_leave_the_digest_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Every file here is settled, so the cache keeps each digest it reads.
+    monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
+    tree = _tree(tmp_path / "tree")
+    vestigo.torch._resolve({"train": tree})
+    (tree / "a.bin").unlink()
+    vestigo.torch._resolve({"train": tree})
+    cache = Path(os.environ["VESTIGO_CACHE_DIR"]) / "digests.sqlite"
+    with closing(sqlite3.connect(cache)) as db:
+        rows = [os.fsdecode(path) for (path,) in db.execute("SELECT path FROM file_digests")]
+    assert rows == [str((tree / "sub" / "b.bin").resolve())]
 
 
 def _bucket(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str]]:

@@ -49,7 +49,6 @@ import logging
 import os
 import pickle
 import re
-import sqlite3
 import stat
 import tempfile
 import threading
@@ -57,7 +56,7 @@ import time
 import uuid
 import zipfile
 from collections.abc import Callable, Collection, Generator, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -78,6 +77,7 @@ try:
 except ImportError as exc:
     raise ImportError("vestigo.torch needs the torch extra: install vestigo[torch]") from exc
 
+import vestigo.digests
 from vestigo import checkpoint_files
 from vestigo.blob_store import (
     AzureBlobStore,
@@ -87,7 +87,7 @@ from vestigo.blob_store import (
     S3BlobStore,
 )
 from vestigo.build_store import AttemptState, BuildState, BuildStore
-from vestigo.file_modes import private_dir, private_file
+from vestigo.digests import FileChanged, FileDigests
 from vestigo.graph import Edge, NodeId, NodeSpec, Traversal
 from vestigo.operations import AdvanceReference
 from vestigo.provenance import (
@@ -237,11 +237,8 @@ class InputChanged(Exception):
     """A verified input's bytes are not the ones its run resolved, or are gone."""
 
 
-# A file is (where its bytes are, the stat that changes with any write to them).
-_Scanned = tuple[str, tuple[int, ...]]
-# A digest is cached only for a file whose mtime and ctime are older than this, since
-# a write in the same timestamp tick as the lookup could leave every stat field as it was.
-_RACY_NS = 2_000_000_000
+# A file is (where its bytes are, its stat: what of it changes with any write is its key).
+_Scanned = tuple[str, os.stat_result]
 # What an operating system writes into a folder someone browses; never a dataset's.
 _JUNK = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 
@@ -263,8 +260,9 @@ def _real(path: Path) -> Path:
         raise OSError(f"{path} is a link loop") from exc
 
 
-def _scan(path: Path) -> list[tuple[str, _Scanned]]:
-    """Every file of the input at *path*, by its name under it ("" for a file).
+def _scan(path: Path) -> tuple[Path, list[tuple[str, _Scanned]]]:
+    """Every file of the input at *path*, by its name under it ("" for a file), and
+    where *path* leads.
 
     The path named may be a link. Inside a directory a link may name a file of the
     tree; any other link, or a file that is not a regular one, is refused. Files an
@@ -277,7 +275,7 @@ def _scan(path: Path) -> list[tuple[str, _Scanned]]:
     """
     root = _real(path)
     if not root.is_dir():
-        return [("", _regular(root))]
+        return root, [("", _regular(root))]
     files = []
     for top, dirs, names in os.walk(root, onerror=_reraise):
         for name in dirs:
@@ -294,27 +292,27 @@ def _scan(path: Path) -> list[tuple[str, _Scanned]]:
             files.append((entry.relative_to(root).as_posix(), _regular(real)))
     if not files:
         raise _Empty(f"{path} holds no file")
-    return sorted(files)
+    return root, sorted(files)
 
 
 def _regular(real: Path) -> _Scanned:
     st = os.stat(real)
     if not stat.S_ISREG(st.st_mode):
         raise ValueError(f"{real} is not a regular file")
-    return str(real), _stat_key(st)
+    return str(real), st
 
 
 def _fingerprint(files: Sequence[tuple[str, _Scanned]]) -> str:
     return hashlib.sha256(
-        _canonical([[name, real, list(key)] for name, (real, key) in files])
+        _canonical([[name, real, list(_stat_key(st))] for name, (real, st) in files])
     ).hexdigest()
 
 
 def _trusted(files: Sequence[tuple[str, _Scanned]], scanned_at: int) -> str:
     """*files*' fingerprint, which a later check takes as the same bytes; "" while a
-    file was written within ``_RACY_NS`` of the scan, as the digest cache judges it."""
-    settled = scanned_at - _RACY_NS
-    if all(max(key[3], key[4]) < settled for _, (_, key) in files):
+    file was written within ``digests._RACY_NS`` of the scan, as the digest cache judges it."""
+    settled = scanned_at - vestigo.digests._RACY_NS
+    if all(max(_stat_key(st)[3:]) < settled for _, (_, st) in files):
         return _fingerprint(files)
     return ""
 
@@ -323,87 +321,28 @@ class _Empty(ValueError):
     """A directory holds no file: refused as an input, and gone from one that held some."""
 
 
-def _cache_path() -> Path:
-    if root := os.environ.get("VESTIGO_CACHE_DIR"):
-        return Path(root) / "digests.sqlite"
-    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(base) / "vestigo" / "digests.sqlite"
+def _pin(files: list[tuple[str, _Scanned]], root: Path | None = None) -> dict[str, Any]:
+    """What the key holds of a verified input: its bytes' digest, not where they are.
 
-
-def _hash(scanned: _Scanned) -> str:
-    real, key = scanned
-    _, digest = _file_digest(Path(real))
-    if _stat_key(os.stat(real)) != key:
-        raise InputChanged(f"{real} changed while it was hashed")
-    return digest
-
-
-def _cache(path: Path) -> sqlite3.Connection:
-    # Owner-only: its rows name every file each run on the machine read.
-    private_dir(path.parent)
-    cache = sqlite3.connect(private_file(path), timeout=30)
-    try:
-        cache.execute(
-            "CREATE TABLE IF NOT EXISTS digests "
-            "(path TEXT PRIMARY KEY, stat TEXT NOT NULL, sha256 TEXT NOT NULL)"
-        )
-    except sqlite3.Error:
-        cache.close()
-        raise
-    return cache
-
-
-def _digests(files: Sequence[_Scanned]) -> list[str]:
-    """Each file's sha256, read only where the machine's digest cache has none for its
-    stat: a relaunch on the same data costs a stat per file."""
-    found: list[str | None] = []
-    path = None
-    try:
-        path = _cache_path()
-        with closing(_cache(path)) as cache:
-            for real, key in files:
-                row = cache.execute(
-                    "SELECT sha256 FROM digests WHERE path = ? AND stat = ?", (real, str(key))
-                ).fetchone()
-                found.append(row[0] if row else None)
-    except (OSError, RuntimeError, sqlite3.Error):
-        # No home, a read-only one, sqlite on NFS: hash everything rather than fail.
-        logger.warning("No digest cache at %s; hashing every input", path, exc_info=True)
-        found = [None] * len(files)
-        path = None
-    missing = [i for i, digest in enumerate(found) if digest is None]
-    # Before any file is read: a write after its stat was last taken shows in the stat
-    # only if that write's timestamp tick is later than the one the stat holds.
-    settled = time.time_ns() - _RACY_NS
-    pool = ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 1))
-    try:
-        pending = {pool.submit(_hash, files[i]): i for i in missing}
-        for future in as_completed(pending):
-            found[pending[future]] = future.result()
-    finally:
-        # On the first failure, the files not yet started are not read at all.
-        pool.shutdown(cancel_futures=True)
-    rows = [
-        (files[i][0], str(files[i][1]), found[i])
-        for i in missing
-        if max(files[i][1][3], files[i][1][4]) < settled
-    ]
-    if path is not None and rows:
+    A file is read only where the machine's digest cache has none for its stat, so a
+    relaunch on the same data costs a stat per file. Given a directory's *root*, the
+    cache forgets its files that are gone.
+    """
+    reals = [real for _, (real, _) in files]
+    with closing(FileDigests()) as cache:
         try:
-            with closing(_cache(path)) as cache, cache:
-                cache.executemany("INSERT OR REPLACE INTO digests VALUES (?, ?, ?)", rows)
-        except (OSError, sqlite3.Error):
-            logger.warning("Could not cache input digests at %s", path, exc_info=True)
-    return cast(list[str], found)
-
-
-def _pin(files: list[tuple[str, _Scanned]]) -> dict[str, Any]:
-    """What the key holds of a verified input: its bytes' digest, not where they are."""
-    digests = _digests([scanned for _, scanned in files])
+            # Settled only: a file written as it is read stops the reads not yet started.
+            stats = [st for _, (_, st) in files]
+            digests = cache.digest_many(reals, stats=stats, settled_only=True)
+        except FileChanged as exc:
+            raise InputChanged(f"{exc} changed while it was hashed") from None
+        if root is not None:
+            cache.prune(root, reals)
     if files[0][0] == "":
-        return {"sha256": digests[0], "size": files[0][1][1][2]}
+        return {"sha256": digests[0].sha256, "size": files[0][1][1].st_size}
     listing = [
-        [name, key[2], digest] for (name, (_, key)), digest in zip(files, digests, strict=True)
+        [name, st.st_size, digest.sha256]
+        for (name, (_, st)), digest in zip(files, digests, strict=True)
     ]
     return {"tree": hashlib.sha256(_canonical(listing)).hexdigest(), "files": len(listing)}
 
@@ -500,8 +439,9 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
     for role, value in (inputs or {}).items():
         if isinstance(value, Path):
             scanned_at = time.time_ns()
-            files = _scan(value)
-            spec[role] = _pin(files)
+            root, files = _scan(value)
+            # Once, at launch: a check whose stat moved need not walk the cache too.
+            spec[role] = _pin(files, root if files[0][0] != "" else None)
             held.append(_Held(role, str(value.absolute()), _trusted(files, scanned_at), spec[role]))
         elif isinstance(value, Remote):
             spec[role] = _pin_remote(value, value.objects())
@@ -554,7 +494,7 @@ def _seen(held: Sequence[_Held], known: dict[str, str]) -> dict[str, Any]:
             continue
         try:
             scanned_at = time.time_ns()
-            files = _scan(Path(each.path))
+            _, files = _scan(Path(each.path))
             scanned = _fingerprint(files)
             if scanned in (each.scanned, known.get(each.role)):
                 pin = each.pinned
@@ -778,7 +718,7 @@ def _copies(inputs: Mapping[str, Input], held: Sequence[_Held], rank: int) -> tu
             continue
         path = cast(Path, inputs[each.role])
         scanned_at = time.time_ns()
-        files = _scan(path)
+        _, files = _scan(path)
         if _fingerprint(files) != each.scanned and _pin(files) != each.pinned:
             raise InputChanged(f"input {each.role!r} at {path} has other bytes on rank {rank}")
         copies.append(
