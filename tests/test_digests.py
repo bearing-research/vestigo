@@ -872,3 +872,20 @@ def test_a_file_stamped_past_the_clock_is_not_remembered_and_said_once(
     assert cache.cached_many(files) == [None, None]
     [said] = _warnings(caplog, "later than this machine's clock")
     assert str(files[0]) in said.getMessage()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="debug: Windows stat against fstat")
+def test_debug_windows_stat_against_fstat(tmp_path: Path):
+    data = tmp_path / "a.csv"
+    data.write_bytes(b"1,2\n")
+    by_name = os.stat(data)
+    fd = os.open(data, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        before = os.fstat(fd)
+        os.read(fd, 100)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    fields = [f for f in dir(by_name) if f.startswith("st_")]
+    rows = [(f, getattr(by_name, f), getattr(before, f), getattr(after, f)) for f in fields]
+    raise AssertionError("\n".join(f"DEBUG {f}: name={a!r} fstat={b!r} after={c!r}" for f, a, b, c in rows))
