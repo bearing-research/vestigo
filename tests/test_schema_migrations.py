@@ -6,9 +6,8 @@ The Postgres half lives in ``test_artifact_store_postgres.py``.
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
-import threading
-import time
 
 import pytest
 
@@ -147,58 +146,30 @@ class TestExistingDatabase:
 class TestTwoFirstBoots:
     """Two processes creating one SQLite store together both come out at the latest version."""
 
-    def test_the_fresh_stamp_runs_under_the_write_lock(self, tmp_path):
-        """Interleaved at the stamp: the first boot has read 'absent' and not yet
-        inserted when the second boot finds the tables. Under the lock the second
-        waits (its no-wait connection reports the lock instead); without it the
-        second stamps every version first and the first boot's insert collides."""
-
-        class NoWait(SqliteDialect):
-            def connect(self):
-                conn = sqlite3.connect(str(self.db_path), timeout=0.05)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA foreign_keys=ON")
-                conn.row_factory = sqlite3.Row
-                return conn
-
+    def test_a_second_boot_between_the_tables_and_the_stamp_finds_it_current(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The tables and the stamp go in one locked script: a second boot that found
+        the tables without the stamp would take the store for the baseline and replay
+        every migration on one born at the latest shape."""
         target = tmp_path / "artifacts"
-        second: dict[str, object] = {}
+        real = SqliteDialect.begin_write
+        second: list[ArtifactStore] = []
 
-        def boot_second():
-            try:
-                second["store"] = ArtifactStore(target, dialect=NoWait(target / "artifacts.sqlite"))
-            except sqlite3.OperationalError as exc:
-                second["error"] = exc
+        def then_the_second_boots(self, conn, key):
+            # The first boot's first lock after its tables were made.
+            if not second:
+                monkeypatch.setattr(SqliteDialect, "begin_write", real)
+                second.append(ArtifactStore(target))
+            real(self, conn, key)
 
-        original = ArtifactStore._stamp_schema_version
-
-        def interleaved(self, conn, version):
-            if version != _LATEST_SCHEMA_VERSION or "ran" in second:
-                return original(self, conn, version)
-            second["ran"] = True
-            stamped = conn.execute(
-                "SELECT 1 FROM schema_version WHERE version = ?", (version,)
-            ).fetchone()
-            if stamped is not None:
-                return
-            other = threading.Thread(target=boot_second)
-            other.start()
-            other.join(timeout=10)
-            conn.execute(
-                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-                (version, time.time()),
-            )
-
-        ArtifactStore._stamp_schema_version = interleaved
-        try:
+        monkeypatch.setattr(SqliteDialect, "begin_write", then_the_second_boots)
+        with caplog.at_level(logging.INFO, logger="vestigo.store"):
             first = ArtifactStore(target)
-        finally:
-            ArtifactStore._stamp_schema_version = original
 
-        assert "store" not in second, "the second boot got in between the read and the insert"
-        assert "locked" in str(second["error"])
+        assert second
+        assert [r.message for r in caplog.records if "migration" in r.message] == []
         assert _version(first.db_path) == _LATEST_SCHEMA_VERSION
-        assert ArtifactStore(target).stats()["total_versions"] == 0
         conn = sqlite3.connect(first.db_path)
         try:
             assert conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1

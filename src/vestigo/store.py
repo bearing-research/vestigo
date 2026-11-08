@@ -34,7 +34,12 @@ from vestigo.graph import (
 )
 from vestigo.provenance import TransformSpec, parse_transform_spec
 from vestigo.releases import RELEASE_DDL
-from vestigo.sql_backend import SqlDialect, SqliteDialect, StoreConnection
+from vestigo.sql_backend import (
+    SqlDialect,
+    SqliteDialect,
+    StoreConnection,
+    _sqlite_script_locked,
+)
 
 if TYPE_CHECKING:
     from vestigo.blob_store import BlobStore
@@ -1480,28 +1485,31 @@ class ArtifactStore:
                     )
                     conn.commit()
             else:
-                conn.executescript(_SCHEMA_SQL)
-                conn.executescript(_SCHEMA_VERSION_SQL)
-                # Born at the latest shape, so it must not replay migrations
-                # that would add what the constants already gave it. Under the
-                # migration lock: executescript commits each CREATE, so another
-                # process can find the tables and stamp the store first.
-                self._dialect.begin_write(conn, "__schema__")
-                self._stamp_schema_version(conn, _LATEST_SCHEMA_VERSION)
-                conn.commit()
+                # Born at the latest shape, so it must not replay migrations that would
+                # add what the constants already gave it. Stamped with its tables, in one
+                # transaction: another process that found them without the stamp would
+                # take the store for the baseline.
+                _sqlite_script_locked(
+                    conn,
+                    _SCHEMA_SQL
+                    + _SCHEMA_VERSION_SQL
+                    + "INSERT OR IGNORE INTO schema_version (version, applied_at)"
+                    f" VALUES ({_LATEST_SCHEMA_VERSION}, {time.time()!r});",
+                )
 
             # Registry and publication tables: idempotent, for fresh and existing databases alike.
-            conn.executescript(_REGISTRY_SCHEMA_SQL)
-            conn.executescript(_PUBLICATION_SCHEMA_SQL)
+            script = _REGISTRY_SCHEMA_SQL + _PUBLICATION_SCHEMA_SQL
             if not table_exists:
                 # Born current, so migration 10 will not add it. An existing database may
                 # hold duplicate active rows, which that migration revokes first.
-                conn.execute(_ACTIVE_PUBLICATION_INDEX_SQL)
-            cursor = conn.execute("PRAGMA table_info(registry_audit)")
-            audit_columns = {row["name"] for row in cursor.fetchall()}
-            if "from_artifact_id" not in audit_columns:
-                conn.execute("ALTER TABLE registry_audit ADD COLUMN from_artifact_id TEXT")
-            conn.commit()
+                script += _ACTIVE_PUBLICATION_INDEX_SQL + ";"
+            _sqlite_script_locked(conn, script)
+            if not self._dialect.column_exists(conn, "registry_audit", "from_artifact_id"):
+                self._dialect.begin_write(conn, "__schema__")
+                # Looked at again under the lock: another process may have added it.
+                if not self._dialect.column_exists(conn, "registry_audit", "from_artifact_id"):
+                    conn.execute("ALTER TABLE registry_audit ADD COLUMN from_artifact_id TEXT")
+                conn.commit()
 
             # After the SQLite-only steps above brought a legacy database to the baseline.
             # Everything from here is portable.
@@ -1903,7 +1911,10 @@ class ArtifactStore:
         commit: two processes opening a database together would otherwise both apply
         migration N, and the loser of a non-idempotent one would fail.
         """
-        conn.executescript(self._dialect.adapt_ddl(_SCHEMA_VERSION_SQL))
+        if self._dialect.supports_legacy_migration:
+            _sqlite_script_locked(conn, _SCHEMA_VERSION_SQL)
+        else:
+            conn.executescript(self._dialect.adapt_ddl(_SCHEMA_VERSION_SQL))
         self._dialect.begin_write(conn, "__schema__")
         row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
         current = row["version"] if row is not None and row["version"] is not None else None

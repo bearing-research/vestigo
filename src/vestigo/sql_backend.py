@@ -713,24 +713,37 @@ class PostgresDialect:
         conn.execute("SELECT pg_advisory_xact_lock(?)", (advisory_lock_id(key),))
 
 
+def _sqlite_script_locked(conn: StoreConnection, script: str) -> None:
+    """*script* as one write transaction on SQLite.
+
+    Two processes creating one new ledger at once otherwise interleave their DDL, and one
+    can have the other's land between a statement's prepare and its step: "database schema
+    has changed". ``executescript`` commits whatever is open first, so the script takes the
+    file's write lock itself.
+    """
+    conn.executescript(f"BEGIN IMMEDIATE;\n{script}\n;COMMIT;")
+
+
 def create_tables(dialect: SqlDialect, table: str, ddl: str) -> None:
     """Create a consumer's own tables beside the ledger's, once per database.
 
     ``table`` is the one whose presence means ``ddl`` already ran, on either backend.
     CREATE TABLE IF NOT EXISTS races in Postgres when every node runs this at startup,
-    so there creation is serialized under a lock keyed on the table. SQLite takes no
-    such lock: two processes creating at once still need ``IF NOT EXISTS``.
+    so there creation is serialized under a lock keyed on the table; on SQLite under the
+    file's write lock. Two processes creating at once still need ``IF NOT EXISTS``.
     """
     conn = dialect.connect()
     try:
         if dialect.schema_exists(conn, table):
             return
-        if not dialect.supports_legacy_migration:
-            dialect.begin_write(conn, f"__{table}_schema__")
-            # Another node may have created it while this one waited for the lock.
-            if dialect.schema_exists(conn, table):
-                conn.commit()
-                return
+        if dialect.supports_legacy_migration:
+            _sqlite_script_locked(conn, ddl)
+            return
+        dialect.begin_write(conn, f"__{table}_schema__")
+        # Another node may have created it while this one waited for the lock.
+        if dialect.schema_exists(conn, table):
+            conn.commit()
+            return
         conn.executescript(dialect.adapt_ddl(ddl))
         conn.commit()
     finally:

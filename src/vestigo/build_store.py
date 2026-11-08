@@ -17,7 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vestigo.sql_backend import SqlDialect, SqliteDialect, StoreConnection
+from vestigo.sql_backend import (
+    SqlDialect,
+    SqliteDialect,
+    StoreConnection,
+    _sqlite_script_locked,
+)
 
 _BUILD_SCHEMA_SQL = """
 -- Build state: tracks async build lifecycle
@@ -344,16 +349,11 @@ class BuildStore:
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN logs TEXT")
                     conn.commit()
             else:
-                conn.executescript(_BUILD_SCHEMA_SQL)
-                conn.commit()
+                _sqlite_script_locked(conn, _BUILD_SCHEMA_SQL)
 
-            conn.executescript(_ATTEMPT_SCHEMA_SQL)
-            conn.executescript(_CONSOLE_SCHEMA_SQL)
-            conn.commit()
+            _sqlite_script_locked(conn, _ATTEMPT_SCHEMA_SQL + _CONSOLE_SCHEMA_SQL)
             self._add_release_columns(conn)
-            for statement in _LINEAGE_INDEXES:
-                conn.execute(statement)
-            conn.commit()
+            _sqlite_script_locked(conn, ";\n".join(_LINEAGE_INDEXES))
         finally:
             conn.close()
 

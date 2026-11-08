@@ -14,6 +14,7 @@ import pytest
 from psycopg.pq import TransactionStatus
 
 from vestigo import sql_backend
+from vestigo.build_store import BuildStore
 from vestigo.sql_backend import (
     SERVER_THREAD_LIMIT,
     PostgresDialect,
@@ -25,6 +26,7 @@ from vestigo.sql_backend import (
     create_tables,
     translate_placeholders,
 )
+from vestigo.store import ArtifactStore
 
 
 class TestTranslatePlaceholders:
@@ -688,3 +690,44 @@ class TestPooledConnectionLifecycle:
             assert killer.execute("SELECT pg_terminate_backend(%s)", (pid,)).fetchone()[0]
         with dialect.connect() as conn:
             assert conn.execute("SELECT pg_backend_pid()").fetchone()[0] != pid
+
+
+def _unlocked_ddl(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Each CREATE or ALTER a SQLite connection runs outside a ``BEGIN IMMEDIATE``."""
+    unlocked: list[str] = []
+    real = SqliteDialect.connect
+
+    def traced(self: SqliteDialect):
+        conn = real(self)
+        locked = [False]
+
+        def seen(statement: str) -> None:
+            head = statement.lstrip().upper()
+            if head.startswith("BEGIN IMMEDIATE"):
+                locked[0] = True
+            elif head.startswith(("COMMIT", "ROLLBACK")):
+                locked[0] = False
+            elif head.startswith(("CREATE", "ALTER")) and not locked[0]:
+                unlocked.append(" ".join(head.split()[:6]))
+
+        conn.set_trace_callback(seen)
+        return conn
+
+    monkeypatch.setattr(SqliteDialect, "connect", traced)
+    return unlocked
+
+
+def test_a_new_sqlite_ledger_s_schema_is_made_under_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two processes opening a new ledger at once: DDL that runs unlocked can have the
+    other's land between its prepare and its step, and fail with "database schema has
+    changed" (seen on a two-rank torch run)."""
+    unlocked = _unlocked_ddl(monkeypatch)
+    for _ in range(2):  # the first open creates, the second finds
+        store = ArtifactStore(tmp_path / "ledger")
+        BuildStore(store.db_path, dialect=store.dialect)
+        create_tables(
+            store.dialect, "consumer_rows", "CREATE TABLE IF NOT EXISTS consumer_rows (id TEXT);"
+        )
+    assert unlocked == []
