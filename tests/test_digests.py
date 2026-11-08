@@ -94,6 +94,12 @@ def _writes_into(folder: Path) -> bool:
     return True
 
 
+def _walk_begins(cache: FileDigests) -> int:
+    """A walk begun after every write so far: one past the cache's clock, which ticks
+    coarsely on Windows."""
+    return cache.now() + 1
+
+
 def _warnings(caplog: pytest.LogCaptureFixture, text: str) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.name == "vestigo.digests" and text in r.getMessage()]
 
@@ -372,13 +378,42 @@ def test_prune_forgets_only_the_files_a_walk_of_its_root_did_not_find(
         path.write_bytes(path.name.encode())
         cache.digest(path)
 
-    assert cache.prune(root, [kept]) == 2
+    assert cache.prune(root, [kept], walked_at=_walk_begins(cache)) == 2
 
     assert cache.cached(kept) is not None
     assert cache.cached(beside) is not None
     # Still on disk, unchanged: only the forgotten row makes them unknown.
     assert cache.cached(gone) is None
     assert cache.cached(nested) is None
+
+
+@pytest.mark.parametrize("kept_in", ["file", "memory"])
+def test_prune_keeps_what_was_remembered_after_its_walk_began(tmp_path: Path, kept_in: str):
+    """Two launches on one root: a file that came after this walk passed it, which the
+    other launch read, is not forgotten by this one's prune (it would cost a read)."""
+    root = tmp_path / "data"
+    root.mkdir()
+    old, gone, new = root / "old.csv", root / "gone.csv", root / "new.csv"
+    for path in (old, gone):
+        path.write_bytes(path.name.encode())
+    if kept_in == "memory":
+        (tmp_path / "state").write_bytes(b"")  # a file where the cache's folder goes
+    now = [time.time_ns() + _LATER_NS]
+    cache = FileDigests(tmp_path / "state" / "digests.sqlite", clock=lambda: now[0])
+    try:
+        assert (cache._conn is None) == (kept_in == "memory")
+        cache.digest_many([old, gone])
+        now[0] += 1
+        walked_at = now[0]  # finds old.csv only
+        gone.unlink()
+        new.write_bytes(b"new.csv")
+        now[0] += 1
+        cache.digest(new)  # the other launch, after the walk passed
+
+        assert cache.prune(root, [old], walked_at=walked_at) == 1
+        assert cache.cached_many([old, new]) == [_sha(b"old.csv"), _sha(b"new.csv")]
+    finally:
+        cache.close()
 
 
 def test_prune_waits_for_another_writer_rather_than_failing(
@@ -404,7 +439,7 @@ def test_prune_waits_for_another_writer_rather_than_failing(
     assert cache._conn is not None
     cache._conn.set_trace_callback(deleting)
     with caplog.at_level(logging.WARNING, logger="vestigo.digests"):
-        assert cache.prune(root, files[:1]) == 1
+        assert cache.prune(root, files[:1], walked_at=_walk_begins(cache)) == 1
     other.join()
 
     assert not _warnings(caplog, "No digest cache")
@@ -424,7 +459,7 @@ def test_prune_that_finds_nothing_gone_takes_no_write_lock(
     with closing(sqlite3.connect(tmp_path / "state" / "digests.sqlite")) as other:
         other.execute("BEGIN IMMEDIATE")  # another process's write, under way
         with caplog.at_level(logging.WARNING, logger="vestigo.digests"):
-            assert cache.prune(root, [kept]) == 0
+            assert cache.prune(root, [kept], walked_at=_walk_begins(cache)) == 0
         other.rollback()
 
     assert not _warnings(caplog, "No digest cache")
@@ -447,7 +482,7 @@ def test_a_closed_cache_refuses_to_be_used(tmp_path: Path, cache: FileDigests):
     for use in (
         lambda: cache.cached(data),
         lambda: cache.digest(data),
-        lambda: cache.prune(tmp_path, [data]),
+        lambda: cache.prune(tmp_path, [data], walked_at=_walk_begins(cache)),
     ):
         with pytest.raises(ValueError, match="closed"):
             use()
@@ -507,7 +542,9 @@ def test_prune_puts_the_walk_s_paths_in_with_one_commit(tmp_path: Path, cache: F
     assert cache._conn is not None
     cache._conn.set_trace_callback(statements.append)
 
-    assert cache.prune(root, [*inside, tmp_path / "elsewhere.csv"]) == 0
+    assert (
+        cache.prune(root, [*inside, tmp_path / "elsewhere.csv"], walked_at=_walk_begins(cache)) == 0
+    )
 
     inserts = [i for i, s in enumerate(statements) if s.startswith("INSERT INTO temp.prune_keep")]
     assert len(inserts) == len(inside)
@@ -574,7 +611,7 @@ def test_a_name_that_is_not_utf8_is_read_remembered_and_pruned(
 
     assert cache.digest(odd).sha256 == _sha(b"1,2\n")
     assert cache.cached(odd) == _sha(b"1,2\n")
-    assert cache.prune(root, []) == 1
+    assert cache.prune(root, [], walked_at=_walk_begins(cache)) == 1
     assert cache.cached(odd) is None
     assert reads == [odd]
 

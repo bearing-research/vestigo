@@ -936,8 +936,10 @@ def test_a_file_too_fresh_to_trust_its_stat_is_read_at_each_check(
     [held] = vestigo.torch._resolve({"train": data}).held
     data.write_bytes(b"BBBB")
     os.utime(data, ns=(first.st_atime_ns, first.st_mtime_ns))
-    real = vestigo.torch._stat_key
-    monkeypatch.setattr(vestigo.torch, "_stat_key", lambda st: (*real(st)[:4], first.st_ctime_ns))
+    real = vestigo.torch._stat_fields
+    monkeypatch.setattr(
+        vestigo.torch, "_stat_fields", lambda st: (*real(st)[:4], first.st_ctime_ns)
+    )
     assert vestigo.torch._seen([held], {})["train"]["pin"] != held.pinned
 
 
@@ -1329,12 +1331,41 @@ def test_a_directory_input_s_files_that_are_gone_leave_the_digest_cache(
     monkeypatch.setattr("vestigo.digests._RACY_NS", 0)
     tree = _tree(tmp_path / "tree")
     vestigo.torch._resolve({"train": tree})
+    cache = Path(os.environ["VESTIGO_CACHE_DIR"]) / "digests.sqlite"
+    with closing(sqlite3.connect(cache)) as db, db:
+        # Read a tick before the next walk begins: Windows' clock can give both one time,
+        # and a row written as a walk begins is spared.
+        db.execute("UPDATE file_digests SET used_at = used_at - 1")
     (tree / "a.bin").unlink()
     vestigo.torch._resolve({"train": tree})
-    cache = Path(os.environ["VESTIGO_CACHE_DIR"]) / "digests.sqlite"
     with closing(sqlite3.connect(cache)) as db:
         rows = [os.fsdecode(path) for (path,) in db.execute("SELECT path FROM file_digests")]
     assert rows == [str((tree / "sub" / "b.bin").resolve())]
+
+
+def test_a_launch_s_prune_keeps_what_another_launch_remembered_during_its_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The cutoff is read before the walk: a file that came after the walk passed its
+    folder, which another launch on the same tree read, keeps its digest."""
+    tree = _tree(tmp_path / "tree")
+    vestigo.torch._resolve({"train": tree})
+    cache = Path(os.environ["VESTIGO_CACHE_DIR"]) / "digests.sqlite"
+    later = os.fsencode(tree.resolve() / "later.bin")
+    scan = vestigo.torch._scan
+
+    def walk_then_another_launch(path: Path):
+        found = scan(path)
+        with closing(sqlite3.connect(cache)) as db, db:
+            db.execute(
+                "INSERT INTO file_digests VALUES (?, 'stat', 'sha', ?)", (later, time.time_ns())
+            )
+        return found
+
+    monkeypatch.setattr(vestigo.torch, "_scan", walk_then_another_launch)
+    vestigo.torch._resolve({"train": tree})
+    with closing(sqlite3.connect(cache)) as db:
+        assert db.execute("SELECT 1 FROM file_digests WHERE path = ?", (later,)).fetchone()
 
 
 def _bucket(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str]]:
