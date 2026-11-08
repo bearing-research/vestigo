@@ -85,9 +85,21 @@ def _row_path(path: str | os.PathLike[str]) -> bytes:
     return os.fsencode(Path(path).absolute())
 
 
+def _stat_fields(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    """What of a file's stat moves with any write to it; ``vestigo.torch`` holds its
+    inputs on the same fields."""
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _trusts(st: os.stat_result, at: int) -> bool:
+    """Whether *st* names one set of bytes for a read begun at *at*: the file last
+    changed over :data:`_RACY_NS` before. ``vestigo.torch`` trusts a scan by it too."""
+    return max(st.st_mtime_ns, st.st_ctime_ns) < at - _RACY_NS
+
+
 def _stat_key(st: os.stat_result) -> str:
     # As text: an inode can pass SQLite's signed 64 bits (NFS, overlayfs xino, ReFS).
-    return str((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+    return str(_stat_fields(st))
 
 
 def _read_digest(path: str | os.PathLike[str]) -> str:
@@ -157,7 +169,8 @@ class FileDigests:
         self._clock = clock or time.time_ns
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
-        self._memory: dict[bytes, tuple[str, str]] = {}
+        # Each path's (stat key, sha256, when it was remembered).
+        self._memory: dict[bytes, tuple[str, str, int]] = {}
         self._where: Path | None = None
         self._skew_logged = False
         self._closed = False
@@ -166,6 +179,11 @@ class FileDigests:
             self._conn = _open(self._where, own_folder=path is None)
         except (OSError, RuntimeError, sqlite3.Error):
             self._degraded()
+
+    def now(self) -> int:
+        """This instance's clock, in ns: read before a walk, it is :meth:`prune`'s
+        *walked_at*."""
+        return self._clock()
 
     def close(self) -> None:
         """Close the cache file. A use after this raises ``ValueError``."""
@@ -276,7 +294,7 @@ class FileDigests:
         rows = [
             (stats_of[i][0], stats_of[i][1], d.sha256)
             for i, d in read_now
-            if d.settled and stats_of[i][2] < now - _RACY_NS
+            if d.settled and _trusts(taken[i], now)
         ]
         # What was read before a stop is remembered too.
         self._write(rows, used, now)
@@ -284,11 +302,24 @@ class FileDigests:
             raise stopped
         return cast(list[Digest], found)
 
-    def prune(self, root: str | os.PathLike[str], seen: Collection[str | os.PathLike[str]]) -> int:
+    def prune(
+        self,
+        root: str | os.PathLike[str],
+        seen: Collection[str | os.PathLike[str]],
+        *,
+        walked_at: int,
+    ) -> int:
         """Forget the files under *root* not in *seen*, what a walk of it just found.
 
-        *root* is spelled as the walk spelled the paths it read. Returns how many were
+        *root* is spelled as the walk spelled the paths it read. *walked_at* is
+        :meth:`now` read before the walk began: a row remembered since, as another job
+        on the same root can write after this walk passed, is kept. Returns how many were
         forgotten.
+
+        Each forgotten row costs one read later, never a wrong digest. That is so of a
+        row another host wrote, its clock behind this one's, to a cache both share; and
+        of one spelled through a link and ``..`` under *root*, which names a file
+        elsewhere: rows are matched by their spelling.
         """
         # The separator: ``data2`` is not under ``data``.
         prefix = os.fsencode(os.path.join(Path(root).absolute(), ""))
@@ -298,22 +329,28 @@ class FileDigests:
             self._check_open()
             if self._conn is not None:
                 try:
-                    return self._prune(self._conn, prefix, below, keep)
+                    return self._prune(self._conn, prefix, below, keep, walked_at)
                 except sqlite3.Error:
                     self._degraded()
-            forgotten = [w for w in self._memory if w.startswith(prefix) and w not in keep]
+            forgotten = [
+                w
+                for w, (_, _, at) in self._memory.items()
+                if w.startswith(prefix) and w not in keep and at < walked_at
+            ]
             for where in forgotten:
                 del self._memory[where]
             return len(forgotten)
 
     @staticmethod
-    def _prune(conn: sqlite3.Connection, prefix: bytes, below: bytes, keep: set[bytes]) -> int:
+    def _prune(
+        conn: sqlite3.Connection, prefix: bytes, below: bytes, keep: set[bytes], walked_at: int
+    ) -> int:
         # The walk's paths in a table of this connection's own, so the rows under the root
         # are compared in SQLite rather than fetched: a tree may hold a million files.
         conn.execute("CREATE TEMP TABLE IF NOT EXISTS prune_keep (path BLOB PRIMARY KEY)")
         try:
             gone = (
-                "FROM file_digests WHERE path >= ? AND path < ?"
+                "FROM file_digests WHERE path >= ? AND path < ? AND used_at < ?"
                 " AND path NOT IN (SELECT path FROM temp.prune_keep)"
             )
             # A look first: most launches find nothing gone, and need no write lock. The
@@ -321,13 +358,15 @@ class FileDigests:
             # temp table locks no other connection out.
             with _transaction(conn) as reading:
                 reading.executemany("INSERT INTO temp.prune_keep VALUES (?)", [(w,) for w in keep])
-                [any_gone] = reading.execute(f"SELECT EXISTS (SELECT 1 {gone})", (prefix, below))
+                [any_gone] = reading.execute(
+                    f"SELECT EXISTS (SELECT 1 {gone})", (prefix, below, walked_at)
+                )
             if not any_gone[0]:
                 return 0
             # The write lock before anything is read: a read lock raised to a write one
             # fails at once, unwaited, when another connection is writing.
             with _transaction(conn, "BEGIN IMMEDIATE") as writing:
-                return writing.execute(f"DELETE {gone}", (prefix, below)).rowcount
+                return writing.execute(f"DELETE {gone}", (prefix, below, walked_at)).rowcount
         finally:
             conn.execute("DELETE FROM temp.prune_keep")
 
@@ -369,9 +408,9 @@ class FileDigests:
                 return [found.get(where) for where in paths]
             except sqlite3.Error:
                 self._degraded()
-        # Memory lasts the instance's life: never marked used, never forgotten.
+        # Memory lasts the instance's life: never marked used, forgotten only by a prune.
         return [
-            None if (row := self._memory.get(where)) is None else (*row, now) for where in paths
+            None if (row := self._memory.get(where)) is None else (*row[:2], now) for where in paths
         ]
 
     def _write(self, rows: Sequence[_Row], used: Sequence[bytes], now: int) -> None:
@@ -398,7 +437,7 @@ class FileDigests:
                     return
                 except sqlite3.Error:
                     self._degraded()
-            self._memory.update({where: (key, sha) for where, key, sha in rows})
+            self._memory.update({where: (key, sha, now) for where, key, sha in rows})
 
     def _check_open(self) -> None:
         if self._closed:

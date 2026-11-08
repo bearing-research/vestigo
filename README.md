@@ -104,7 +104,8 @@ The package exports nothing at its top level; a consumer imports each module.
   `cached`, `cached_many` (never read a file), `digest`, `digest_many` (the misses
   read on threads, remembered in one write; `stats=` a walk's own, `workers=` the
   threads, `settled_only=` raises `FileChanged` at the first file changed while it
-  was read), `prune(root, seen)` and `close` (a use after it raises), each digest a
+  was read), `prune(root, seen, walked_at=)` (keeps what was remembered since `walked_at`,
+  the instance's `now()` read before the walk) and `close` (a use after it raises), each digest a
   `Digest(sha256, settled)`; a digest unused for 90 days is forgotten. It imports
   no torch.
 - `vestigo.checkpoint_files`: the layout of a checkpoint made of files

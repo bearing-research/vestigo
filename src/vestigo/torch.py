@@ -87,7 +87,7 @@ from vestigo.blob_store import (
     S3BlobStore,
 )
 from vestigo.build_store import AttemptState, BuildState, BuildStore
-from vestigo.digests import FileChanged, FileDigests
+from vestigo.digests import FileChanged, FileDigests, _stat_fields, _trusts
 from vestigo.graph import Edge, NodeId, NodeSpec, Traversal
 from vestigo.operations import AdvanceReference
 from vestigo.provenance import (
@@ -220,16 +220,6 @@ def _signed(manifest: Mapping[str, Any]) -> bytes:
     return _canonical({k: v for k, v in manifest.items() if k != "signature"})
 
 
-def _file_digest(path: Path) -> tuple[int, str]:
-    hasher = hashlib.sha256()
-    size = 0
-    with open(path, "rb") as f:
-        while chunk := f.read(_CHUNK):
-            hasher.update(chunk)
-            size += len(chunk)
-    return size, hasher.hexdigest()
-
-
 # --- Verified inputs ---
 
 
@@ -241,11 +231,6 @@ class InputChanged(Exception):
 _Scanned = tuple[str, os.stat_result]
 # What an operating system writes into a folder someone browses; never a dataset's.
 _JUNK = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
-
-
-def _stat_key(st: os.stat_result) -> tuple[int, ...]:
-    # ctime too: nothing sets it back, so an edit that restores the mtime still shows.
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _reraise(exc: OSError) -> None:
@@ -304,15 +289,14 @@ def _regular(real: Path) -> _Scanned:
 
 def _fingerprint(files: Sequence[tuple[str, _Scanned]]) -> str:
     return hashlib.sha256(
-        _canonical([[name, real, list(_stat_key(st))] for name, (real, st) in files])
+        _canonical([[name, real, list(_stat_fields(st))] for name, (real, st) in files])
     ).hexdigest()
 
 
 def _trusted(files: Sequence[tuple[str, _Scanned]], scanned_at: int) -> str:
     """*files*' fingerprint, which a later check takes as the same bytes; "" while a
-    file was written within ``digests._RACY_NS`` of the scan, as the digest cache judges it."""
-    settled = scanned_at - vestigo.digests._RACY_NS
-    if all(max(_stat_key(st)[3:]) < settled for _, (_, st) in files):
+    file was written too lately before the scan, as the digest cache judges it."""
+    if all(_trusts(st, scanned_at) for _, (_, st) in files):
         return _fingerprint(files)
     return ""
 
@@ -321,12 +305,12 @@ class _Empty(ValueError):
     """A directory holds no file: refused as an input, and gone from one that held some."""
 
 
-def _pin(files: list[tuple[str, _Scanned]], root: Path | None = None) -> dict[str, Any]:
+def _pin(files: list[tuple[str, _Scanned]], walk: tuple[Path, int] | None = None) -> dict[str, Any]:
     """What the key holds of a verified input: its bytes' digest, not where they are.
 
     A file is read only where the machine's digest cache has none for its stat, so a
-    relaunch on the same data costs a stat per file. Given a directory's *root*, the
-    cache forgets its files that are gone.
+    relaunch on the same data costs a stat per file. Given a directory's *walk* (its root,
+    and the clock read before its scan began), the cache forgets its files that are gone.
     """
     reals = [real for _, (real, _) in files]
     with closing(FileDigests()) as cache:
@@ -336,8 +320,9 @@ def _pin(files: list[tuple[str, _Scanned]], root: Path | None = None) -> dict[st
             digests = cache.digest_many(reals, stats=stats, settled_only=True)
         except FileChanged as exc:
             raise InputChanged(f"{exc} changed while it was hashed") from None
-        if root is not None:
-            cache.prune(root, reals)
+        if walk is not None:
+            root, walked_at = walk
+            cache.prune(root, reals, walked_at=walked_at)
     if files[0][0] == "":
         return {"sha256": digests[0].sha256, "size": files[0][1][1].st_size}
     listing = [
@@ -441,7 +426,7 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
             scanned_at = time.time_ns()
             root, files = _scan(value)
             # Once, at launch: a check whose stat moved need not walk the cache too.
-            spec[role] = _pin(files, root if files[0][0] != "" else None)
+            spec[role] = _pin(files, (root, scanned_at) if files[0][0] != "" else None)
             held.append(_Held(role, str(value.absolute()), _trusted(files, scanned_at), spec[role]))
         elif isinstance(value, Remote):
             spec[role] = _pin_remote(value, value.objects())
@@ -2200,7 +2185,7 @@ class Ledger:
             definition=[writer.program],
             computation_key=writer.computation_key,
         )
-        size, digest = _file_digest(archive)
+        size, digest = archive.stat().st_size, vestigo.digests._read_digest(archive)
         try:
             self.store.publish_blob_from_path(artifact_id, version, archive)
             stored = self.store.finalize_artifact(
