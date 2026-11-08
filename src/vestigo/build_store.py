@@ -21,8 +21,10 @@ from vestigo.sql_backend import (
     SqlDialect,
     SqliteDialect,
     StoreConnection,
-    _sqlite_script_locked,
 )
+
+# What a legacy SQLite ``artifact_builds`` may lack, added on its open.
+_LEGACY_BUILD_COLUMNS = {"lease_owner", "input_uris", "logs"}
 
 _BUILD_SCHEMA_SQL = """
 -- Build state: tracks async build lifecycle
@@ -305,17 +307,17 @@ class BuildStore:
             if not self._dialect.supports_legacy_migration:
                 if not self._dialect.schema_exists(conn, "artifact_builds"):
                     self._dialect.begin_write(conn, "__build_schema__")
-                    conn.executescript(self._dialect.adapt_ddl(_BUILD_SCHEMA_SQL))
+                    self._dialect.execute_ddl(conn, _BUILD_SCHEMA_SQL)
                     conn.commit()
                 if not self._dialect.schema_exists(conn, "build_attempts"):
                     self._dialect.begin_write(conn, "__build_schema__")
-                    conn.executescript(self._dialect.adapt_ddl(_ATTEMPT_SCHEMA_SQL))
+                    self._dialect.execute_ddl(conn, _ATTEMPT_SCHEMA_SQL)
                     for statement in _LINEAGE_INDEXES:
                         conn.execute(statement)
                     conn.commit()
                 if not self._dialect.schema_exists(conn, "build_console_chunks"):
                     self._dialect.begin_write(conn, "__build_schema__")
-                    conn.executescript(self._dialect.adapt_ddl(_CONSOLE_SCHEMA_SQL))
+                    self._dialect.execute_ddl(conn, _CONSOLE_SCHEMA_SQL)
                     conn.commit()
                 self._add_release_columns(conn)
                 return
@@ -325,37 +327,46 @@ class BuildStore:
             )
             table_exists = cursor.fetchone() is not None
 
-            if table_exists:
-                cursor = conn.execute("PRAGMA table_info(artifact_builds)")
-                columns = {row["name"] for row in cursor.fetchall()}
-
-                if "lease_owner" not in columns:
+            if table_exists and self._missing_legacy_columns(conn):
+                self._dialect.begin_write(conn, "__build_schema__")
+                # Looked at again under the lock: another process may have added them.
+                missing = self._missing_legacy_columns(conn)
+                if "lease_owner" in missing:
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN lease_owner TEXT")
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN lease_expires_at REAL")
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_build_lease_expires "
                         "ON artifact_builds(state, lease_expires_at)"
                     )
-                    conn.commit()
-
                 # Pull-model columns.
-                if "input_uris" not in columns:
+                if "input_uris" in missing:
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN input_uris TEXT")
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN params TEXT")
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN name TEXT")
-                    conn.commit()
-
-                if "logs" not in columns:
+                if "logs" in missing:
                     conn.execute("ALTER TABLE artifact_builds ADD COLUMN logs TEXT")
-                    conn.commit()
-            else:
-                _sqlite_script_locked(conn, _BUILD_SCHEMA_SQL)
+                conn.commit()
 
-            _sqlite_script_locked(conn, _ATTEMPT_SCHEMA_SQL + _CONSOLE_SCHEMA_SQL)
+            self._dialect.begin_write(conn, "__build_schema__")
+            if not table_exists:
+                self._dialect.execute_ddl(conn, _BUILD_SCHEMA_SQL)
+            script = _ATTEMPT_SCHEMA_SQL + _CONSOLE_SCHEMA_SQL
+            if not self._dialect.schema_exists(conn, "build_attempts"):
+                # Born with every column, so _add_release_columns, which adds these
+                # with the columns they index, has nothing to do; as on Postgres.
+                script += ";\n".join(_LINEAGE_INDEXES) + ";"
+            self._dialect.execute_ddl(conn, script)
+            conn.commit()
             self._add_release_columns(conn)
-            _sqlite_script_locked(conn, ";\n".join(_LINEAGE_INDEXES))
         finally:
             conn.close()
+
+    def _missing_legacy_columns(self, conn: StoreConnection) -> set[str]:
+        return {
+            column
+            for column in _LEGACY_BUILD_COLUMNS
+            if not self._dialect.column_exists(conn, "artifact_builds", column)
+        }
 
     def _add_release_columns(self, conn: StoreConnection) -> None:
         """The columns added since the first schema, on a database from before them."""

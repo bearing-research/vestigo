@@ -16,6 +16,10 @@ All notable changes to vestigo are recorded here. The format follows
   Lookups go in batches, a file named twice is read once, prune compares in SQLite,
   and a closed instance refuses use. Verified `Path` inputs use it, as Strata's
   notebook will (#70, #72).
+- `SqlDialect.execute_ddl(conn, script)` runs a schema script inside the open
+  transaction, never committing it, on either backend: on SQLite `executescript`
+  commits first, so `begin_write` before it held nothing. A dialect of one's own
+  implements it (#73).
 
 ### Fixed
 
@@ -40,6 +44,16 @@ All notable changes to vestigo are recorded here. The format follows
   created under the file's write lock, and a new ledger is stamped with its schema
   version in the same transaction, so another process never takes it for an old one
   and replays every migration (#71).
+- Two processes opening, at once, a SQLite ledger an older vestigo wrote no longer
+  fail with `duplicate column name`: the columns and the `artifact_names` key an
+  upgrade adds go in under the write lock, looked for again under it (#73).
+- `create_tables` looks for its table again under the lock on SQLite too, so a
+  consumer's DDL runs once per database on either backend and needs no
+  `IF NOT EXISTS` (#73).
+- A first boot of a SQLite ledger killed part way no longer leaves a store stamped
+  current without the unique index on active publications, which only a migration
+  adds to an existing store: every table and the stamp go in one transaction, as
+  on Postgres (#73).
 
 ## 0.4.0 - 2026-11-06
 

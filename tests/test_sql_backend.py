@@ -702,7 +702,10 @@ def _unlocked_ddl(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         locked = [False]
 
         def seen(statement: str) -> None:
-            head = statement.lstrip().upper()
+            # Past a leading comment, which a script's statement keeps (a header's).
+            lines = statement.strip().splitlines()
+            head = "\n".join(line for line in lines if not line.lstrip().startswith("--"))
+            head = head.lstrip().upper()
             if head.startswith("BEGIN IMMEDIATE"):
                 locked[0] = True
             elif head.startswith(("COMMIT", "ROLLBACK")):
@@ -731,3 +734,181 @@ def test_a_new_sqlite_ledger_s_schema_is_made_under_the_write_lock(
             store.dialect, "consumer_rows", "CREATE TABLE IF NOT EXISTS consumer_rows (id TEXT);"
         )
     assert unlocked == []
+
+
+def _rolled_back_to_the_oldest_shape(db_path: Path) -> None:
+    """A ledger as the oldest vestigo left it: no tenant columns or key, no lease, pull or
+    log columns on builds, no audit source column, no version stamped."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            DROP INDEX idx_tenant_provenance_unique;
+            DROP INDEX idx_versions_tenant;
+            DROP INDEX idx_build_lease_expires;
+            ALTER TABLE artifact_versions DROP COLUMN tenant;
+            ALTER TABLE artifact_versions DROP COLUMN principal;
+            ALTER TABLE artifact_builds DROP COLUMN lease_owner;
+            ALTER TABLE artifact_builds DROP COLUMN lease_expires_at;
+            ALTER TABLE artifact_builds DROP COLUMN input_uris;
+            ALTER TABLE artifact_builds DROP COLUMN params;
+            ALTER TABLE artifact_builds DROP COLUMN name;
+            ALTER TABLE artifact_builds DROP COLUMN logs;
+            ALTER TABLE registry_audit DROP COLUMN from_artifact_id;
+            DROP TABLE artifact_names;
+            CREATE TABLE artifact_names (
+                name TEXT PRIMARY KEY, artifact_id TEXT NOT NULL,
+                version INTEGER NOT NULL, updated_at REAL NOT NULL
+            );
+            DELETE FROM schema_version;
+        """)
+    finally:
+        conn.close()
+
+
+def test_an_old_sqlite_ledger_is_upgraded_under_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two ranks opening a ledger an older vestigo wrote both find a column missing: one
+    that adds it unlocked fails the other ("duplicate column name")."""
+    store = ArtifactStore(tmp_path / "ledger")
+    BuildStore(store.db_path, dialect=store.dialect)
+    _rolled_back_to_the_oldest_shape(store.db_path)
+    unlocked = _unlocked_ddl(monkeypatch)
+
+    store = ArtifactStore(tmp_path / "ledger")
+    BuildStore(store.db_path, dialect=store.dialect)
+
+    assert unlocked == []
+    conn = store.dialect.connect()
+    try:
+        assert store.dialect.column_exists(conn, "artifact_versions", "tenant")
+        assert store.dialect.column_exists(conn, "artifact_names", "tenant")
+        assert store.dialect.column_exists(conn, "artifact_builds", "logs")
+    finally:
+        conn.close()
+
+
+def test_sqlite_ddl_runs_in_the_open_transaction_statement_by_statement(tmp_path: Path):
+    """Cut where SQLite says a statement ends, not at every ``;``, and never committed:
+    a rollback takes it all back."""
+    dialect = SqliteDialect(tmp_path / "ddl.sqlite")
+    conn = dialect.connect()
+    try:
+        dialect.begin_write(conn, "__schema__")
+        dialect.execute_ddl(
+            conn,
+            """
+            -- a comment's ; is not an end
+            CREATE TABLE notes (body TEXT DEFAULT 'a;b');
+            CREATE TRIGGER stamp AFTER INSERT ON notes BEGIN
+                UPDATE notes SET body = body || ';' WHERE rowid = new.rowid;
+            END;
+            CREATE TABLE last (x) -- the last statement, its ; left off
+            """,
+        )
+        # A comment after the last ``;``, as ``executescript`` took it.
+        dialect.execute_ddl(conn, "CREATE TABLE more (x); -- the end")
+        conn.execute("INSERT INTO notes DEFAULT VALUES")
+        assert conn.execute("SELECT body FROM notes").fetchone()[0] == "a;b;"
+        assert dialect.schema_exists(conn, "last")
+        assert dialect.schema_exists(conn, "more")
+        conn.rollback()
+        assert not dialect.schema_exists(conn, "notes")
+        # A trigger never ended would otherwise be dropped without a word.
+        with pytest.raises(ValueError, match="incomplete"):
+            dialect.execute_ddl(conn, "CREATE TRIGGER half AFTER INSERT ON x BEGIN SELECT 1;")
+    finally:
+        conn.close()
+
+
+def test_consumer_tables_made_meanwhile_are_found_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Another process creates the table while this one waits for the lock: its DDL, with
+    no ``IF NOT EXISTS``, must not run again."""
+    dialect = SqliteDialect(tmp_path / "consumer.sqlite")
+    ddl = "CREATE TABLE consumer_rows (id TEXT);"
+    real = SqliteDialect.schema_exists
+    first_looks: list[bool] = []
+
+    def the_other_creates_after_the_first_look(self: SqliteDialect, conn, table: str) -> bool:
+        first_looks.append(real(self, conn, table))
+        monkeypatch.setattr(SqliteDialect, "schema_exists", real)
+        other = sqlite3.connect(self.db_path)
+        try:
+            other.executescript(ddl)
+        finally:
+            other.close()
+        return first_looks[0]
+
+    statements: list[str] = []
+    connect = SqliteDialect.connect
+
+    def traced(self: SqliteDialect):
+        conn = connect(self)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(SqliteDialect, "schema_exists", the_other_creates_after_the_first_look)
+    monkeypatch.setattr(SqliteDialect, "connect", traced)
+    create_tables(dialect, "consumer_rows", ddl)
+
+    assert first_looks == [False]
+    assert "BEGIN IMMEDIATE" in statements
+    assert not any(s.lstrip().startswith("CREATE") for s in statements)
+
+
+def test_a_first_boot_that_dies_part_way_leaves_nothing_half_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A boot killed before its last schema commit: the next finds no store and makes the
+    whole of it, rather than one stamped current that lacks the rest (the unique index on
+    active publications, which only migration 10 adds to an existing store)."""
+    real = SqliteDialect.execute_ddl
+
+    def dies_at_the_publication_index(self: SqliteDialect, conn, script: str) -> None:
+        if "idx_publications_active" in script:
+            raise sqlite3.OperationalError("killed")
+        real(self, conn, script)
+
+    monkeypatch.setattr(SqliteDialect, "execute_ddl", dies_at_the_publication_index)
+    with pytest.raises(sqlite3.OperationalError, match="killed"):
+        ArtifactStore(tmp_path / "ledger")
+    monkeypatch.setattr(SqliteDialect, "execute_ddl", real)
+
+    store = ArtifactStore(tmp_path / "ledger")
+    conn = store.dialect.connect()
+    try:
+        index = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'idx_publications_active'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert index is not None
+
+
+def test_a_current_sqlite_build_store_opens_under_one_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Each lock an open takes waits behind any live writer, a rank releasing a checkpoint;
+    a new store gets its lineage indexes with the attempts table, not on every open."""
+    store = ArtifactStore(tmp_path / "ledger")
+    BuildStore(store.db_path, dialect=store.dialect)
+    conn = sqlite3.connect(store.db_path)
+    try:
+        indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+    assert {"idx_build_executor", "idx_attempt_resumed_from"} <= indexes
+    statements: list[str] = []
+    connect = SqliteDialect.connect
+
+    def traced(self: SqliteDialect):
+        conn = connect(self)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(SqliteDialect, "connect", traced)
+    BuildStore(store.db_path, dialect=store.dialect)
+
+    assert [s for s in statements if s.startswith("BEGIN IMMEDIATE")] == ["BEGIN IMMEDIATE"]
