@@ -1278,6 +1278,8 @@ def test_the_first_file_written_as_it_is_hashed_stops_the_hashing(
 
     def raced(path: Path) -> str:
         reads.append(path)
+        if len(reads) > 1:
+            time.sleep(0.2)  # slow, as a real read is: else the worker races ahead
         read = hashed(path)
         Path(path).write_bytes(b"rowz")
         return read
@@ -1313,8 +1315,9 @@ def test_a_folder_holding_a_name_that_is_not_utf8_resolves(tmp_path: Path):
     tree = tmp_path / "tree"
     _file(tree / "plain.csv", b"0\n")
     try:
+        # Windows's names are UTF-16: no bytes name to decode, so none that is not UTF-8.
         _file(tree / os.fsdecode(b"caf\xe9.csv"), b"1,2\n")
-    except (OSError, UnicodeEncodeError):
+    except (OSError, UnicodeError):
         pytest.skip("this filesystem only takes valid names")
     assert vestigo.torch._resolve({"train": tree}).spec["train"]["files"] == 2
 

@@ -243,6 +243,13 @@ def test_a_file_is_judged_settled_by_the_clock_before_its_read(
         cache.close()
 
 
+def _after_the_stop(reads: list[Path]) -> None:
+    # A read after the third is slow, as a real one is: the one worker would otherwise
+    # race through tiny files before the caller cancels them.
+    if len(reads) > 3:
+        time.sleep(0.2)
+
+
 def test_settled_only_stops_at_the_first_file_that_changed(
     tmp_path: Path, cache: FileDigests, monkeypatch: pytest.MonkeyPatch
 ):
@@ -255,6 +262,7 @@ def test_settled_only_stops_at_the_first_file_that_changed(
 
     def written_during(path: Path) -> str:
         reads.append(Path(path))
+        _after_the_stop(reads)
         digest = real(path)
         if len(reads) == 3:
             with open(path, "ab") as f:
@@ -284,6 +292,7 @@ def test_what_was_read_before_a_failed_read_is_remembered(
 
     def failing_third(path: Path) -> str:
         reads.append(Path(path))
+        _after_the_stop(reads)
         if len(reads) == 3:
             raise PermissionError(path)
         return real(path)
@@ -449,6 +458,9 @@ def test_an_inode_past_sqlites_integers_is_kept(
     assert reads == [data]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows takes `..` off a path's spelling before any link"
+)
 def test_a_path_through_a_link_and_up_is_the_file_it_names(
     tmp_path: Path, cache: FileDigests, reads: list[Path]
 ):
@@ -476,10 +488,11 @@ def test_a_name_that_is_not_utf8_is_read_remembered_and_pruned(
 ):
     root = tmp_path / "data"
     root.mkdir()
-    odd = root / os.fsdecode(b"caf\xe9.csv")
     try:
+        # Windows's names are UTF-16: no bytes name to decode, so none that is not UTF-8.
+        odd = root / os.fsdecode(b"caf\xe9.csv")
         odd.write_bytes(b"1,2\n")
-    except (OSError, UnicodeEncodeError):
+    except (OSError, UnicodeError):
         pytest.skip("this filesystem only takes valid names")
 
     assert cache.digest(odd).sha256 == _sha(b"1,2\n")
