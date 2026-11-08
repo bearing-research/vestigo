@@ -15,7 +15,7 @@ All notable changes to vestigo are recorded here. The format follows
   for the instance's life, and a file stamped past the clock is logged once.
   Lookups go in batches, a file named twice is read once, prune compares in SQLite,
   and a closed instance refuses use. Verified `Path` inputs use it, as Strata's
-  notebook will (#70, #NN).
+  notebook will (#70, #72).
 
 ### Fixed
 
