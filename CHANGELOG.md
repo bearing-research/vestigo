@@ -33,6 +33,11 @@ All notable changes to vestigo are recorded here. The format follows
   the digest cache raised `UnicodeEncodeError` (#70). The machine's digest cache no
   longer grows without end: a launch on a directory forgets its files that are gone,
   and a digest unused for 90 days is forgotten (#70).
+- Two processes opening one new SQLite ledger at once (the ranks of a torch run)
+  no longer fail with `database schema has changed`: its tables and indexes are
+  created under the file's write lock, and a new ledger is stamped with its schema
+  version in the same transaction, so another process never takes it for an old one
+  and replays every migration (#71).
 
 ## 0.4.0 - 2026-11-06
 
