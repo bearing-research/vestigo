@@ -31,7 +31,7 @@ def reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     seen: list[Path] = []
     real = vestigo.digests._read_digest
 
-    def counted(path: Path) -> tuple[str, str]:
+    def counted(path: Path) -> tuple[str, os.stat_result]:
         seen.append(Path(path))
         return real(path)
 
@@ -216,7 +216,7 @@ def test_a_file_written_while_it_is_read_is_unsettled_and_not_kept(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def written_during(path: Path) -> tuple[str, str]:
+    def written_during(path: Path) -> tuple[str, os.stat_result]:
         reads.append(path)
         digest = real(path)
         if len(reads) == 1:
@@ -251,7 +251,7 @@ def test_a_file_is_judged_settled_by_the_clock_before_its_read(
     now = [time.time_ns()]
     real = vestigo.digests._read_digest
 
-    def slow(path: Path) -> tuple[str, str]:
+    def slow(path: Path) -> tuple[str, os.stat_result]:
         now[0] += _LATER_NS
         return real(path)
 
@@ -281,7 +281,7 @@ def test_settled_only_stops_at_the_first_file_that_changed(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def written_during(path: Path) -> tuple[str, str]:
+    def written_during(path: Path) -> tuple[str, os.stat_result]:
         reads.append(Path(path))
         _after_the_stop(reads)
         digest = real(path)
@@ -311,7 +311,7 @@ def test_what_was_read_before_a_failed_read_is_remembered(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def failing_third(path: Path) -> tuple[str, str]:
+    def failing_third(path: Path) -> tuple[str, os.stat_result]:
         reads.append(Path(path))
         _after_the_stop(reads)
         if len(reads) == 3:
@@ -568,6 +568,20 @@ def test_prune_puts_the_walk_s_paths_in_with_one_commit(tmp_path: Path, cache: F
     assert not any(s.startswith("COMMIT") for s in statements[begin : inserts[-1]])
 
 
+def test_on_windows_a_file_opened_is_matched_by_its_size_and_times(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """From 3.12 Windows's stat and fstat give one file another volume serial and id:
+    only what both agree on can say the file opened is the one stat'ed."""
+    looked_up = SimpleNamespace(st_dev=2**40, st_ino=2**70, st_size=4, st_mtime_ns=1, st_ctime_ns=2)
+    opened = SimpleNamespace(st_dev=7, st_ino=9, st_size=4, st_mtime_ns=1, st_ctime_ns=2)
+    rewritten = SimpleNamespace(**{**vars(opened), "st_mtime_ns": 3})
+    monkeypatch.setattr(vestigo.digests.os, "name", "nt")
+
+    assert vestigo.digests._same_file(opened, looked_up)
+    assert not vestigo.digests._same_file(rewritten, looked_up)
+
+
 def test_a_missing_file_raises(tmp_path: Path, cache: FileDigests):
     with pytest.raises(FileNotFoundError):
         cache.digest(tmp_path / "absent.csv")
@@ -691,7 +705,7 @@ def test_bytes_read_from_elsewhere_while_the_name_led_there_are_not_remembered(
     data.write_bytes(b"AAAA")
     real = vestigo.digests._read_digest
 
-    def swapped_while_read(path: Path) -> tuple[str, str]:
+    def swapped_while_read(path: Path) -> tuple[str, os.stat_result]:
         folder.rename(tmp_path / "aside")
         folder.mkdir()
         data.write_bytes(b"BBBB")

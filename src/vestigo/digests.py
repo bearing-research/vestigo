@@ -102,9 +102,20 @@ def _stat_key(st: os.stat_result) -> str:
     return str(_stat_fields(st))
 
 
-def _read_digest(path: str | os.PathLike[str]) -> tuple[str, str]:
-    """The sha256 of the file opened at *path*, and that file's stat key after the read:
-    the name can lead elsewhere while it is read, and back before it is stat'ed again.
+def _same_file(opened: os.stat_result, looked_up: os.stat_result) -> bool:
+    """Whether the file a read opened is, unchanged, the one stat'ed by its name."""
+    if os.name == "nt":
+        # From 3.12 Windows's stat names a file by its volume's 64-bit serial and a
+        # 128-bit id, fstat by the 32-bit serial and a 64-bit index; the times and the
+        # size agree (ctime is the creation time there).
+        fields = ("st_size", "st_mtime_ns", "st_ctime_ns")
+        return all(getattr(opened, f) == getattr(looked_up, f) for f in fields)
+    return _stat_fields(opened) == _stat_fields(looked_up)
+
+
+def _read_digest(path: str | os.PathLike[str]) -> tuple[str, os.stat_result]:
+    """The sha256 of the file opened at *path*, and that file's stat after the read: the
+    name can lead elsewhere while it is read, and back before it is stat'ed again.
 
     Raises:
         OSError: *path* cannot be read, or is not a regular file once opened (a FIFO put
@@ -118,7 +129,7 @@ def _read_digest(path: str | os.PathLike[str]) -> tuple[str, str]:
         hasher = hashlib.sha256()
         while chunk := f.read(_CHUNK):
             hasher.update(chunk)
-        return hasher.hexdigest(), _stat_key(os.fstat(fd))
+        return hasher.hexdigest(), os.fstat(fd)
 
 
 def _open(path: Path, *, own_folder: bool) -> sqlite3.Connection:
@@ -280,8 +291,8 @@ class FileDigests:
         def read(i: int) -> Digest:
             sha, read_from = _read_digest(paths[i])
             # The file read, and the one its name leads to now, are both the one stat'ed.
-            key = stats_of[i][1]
-            return Digest(sha, settled=read_from == key == _stat_key(os.stat(paths[i])))
+            settled = _same_file(read_from, taken[i])
+            return Digest(sha, settled=settled and _stat_key(os.stat(paths[i])) == stats_of[i][1])
 
         stopped: Exception | None = None
         pool = ThreadPoolExecutor(max_workers=workers or min(32, os.cpu_count() or 1))
