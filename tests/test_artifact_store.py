@@ -33,6 +33,8 @@ from vestigo.store import (
     ArtifactStore,
     ArtifactVersion,
     StagedVersion,
+    _deletion_order,
+    _Holds,
     get_artifact_store,
     reset_artifact_store,
 )
@@ -2916,6 +2918,183 @@ class TestAHoldAfterTheClaim(_Racing):
         assert len(refused) == 1, "the hold landed on a claimed version"
         assert store.retention_roots() == []
         assert store.list_publications(include_revoked=True) == []
+
+
+_READS_UP_1 = {"vestigo://artifact/up@v=1": "up@v=1"}
+
+
+def _used_ago(store, artifact_id: str, seconds: float) -> None:
+    conn = store._get_connection()
+    try:
+        conn.execute(
+            "UPDATE artifact_versions SET created_at = ?, last_used_at = ? WHERE id = ?",
+            (time.time() - seconds, time.time() - seconds, artifact_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _swept(store, keys, **kwargs) -> set[tuple[str, int]]:
+    """Which of *keys* a sweep takes, after checking its dry run named the same."""
+    planned = store.garbage_collect(dry_run=True, **kwargs)["collected"]
+    store.garbage_collect(**kwargs)
+    gone = {key for key in keys if store.get_artifact(*key) is None}
+    assert gone == {(r["artifact_id"], r["version"]) for r in planned}
+    return gone
+
+
+class TestACollectableVersionKeptHoldsItsInputs(_Racing):
+    """A ``collectable`` version the sweep keeps anyway is still its id's current value,
+    so it holds its inputs: only one the sweep takes stops being a root."""
+
+    @pytest.fixture
+    def up(self, store):
+        """``up@v=1``, which the readers read, and ``up@v=2``, up's current value."""
+        _finished(store, "up", "p-up-1")
+        _finished(store, "up", "p-up-2")
+        _used_ago(store, "up", 86400)
+        return [("up", 1), ("up", 2)]
+
+    @pytest.mark.parametrize("policy", [{"keep_superseded": 0}, {"max_idle_days": 0}])
+    def test_the_floor_keeps_a_reader_and_its_input(self, store, up, policy):
+        _finished(store, "reader", "p-r", input_versions=_READS_UP_1)
+        _used_ago(store, "reader", 60)
+
+        gone = _swept(
+            store,
+            [*up, ("reader", 1)],
+            collectable=[("reader", 1)],
+            min_idle_seconds=3600,
+            **policy,
+        )
+
+        assert gone == set()
+
+    def test_a_reader_the_sweep_takes_frees_its_input_in_the_same_pass(self, store, up):
+        _finished(store, "reader", "p-r", input_versions=_READS_UP_1)
+        _used_ago(store, "reader", 86400)
+
+        gone = _swept(
+            store,
+            [*up, ("reader", 1)],
+            collectable=[("reader", 1)],
+            keep_superseded=0,
+            min_idle_seconds=3600,
+        )
+
+        assert gone == {("reader", 1), ("up", 1)}
+
+    def test_the_gap_rule_keeps_a_top_version_and_its_input(self, store, up):
+        _finished(store, "R", "p-r-1")
+        _finished(store, "R", "p-r-2", input_versions=_READS_UP_1)
+        _used_ago(store, "R", 86400)
+        store.retain("R", 1, kind="pin", holder="review")
+
+        gone = _swept(store, [*up, ("R", 1), ("R", 2)], collectable=[("R", 2)], keep_superseded=0)
+
+        assert gone == set()
+
+    def test_what_a_kept_reader_holds_is_not_counted_by_keep_superseded(self, store, up):
+        """``up@v=1`` is up's one spare version once the reader holds ``up@v=2``."""
+        _finished(store, "up", "p-up-3")
+        _used_ago(store, "up", 86400)
+        _finished(store, "reader", "p-r", input_versions={"vestigo://artifact/up@v=2": "up@v=2"})
+        _used_ago(store, "reader", 60)
+
+        gone = _swept(
+            store,
+            [*up, ("up", 3), ("reader", 1)],
+            collectable=[("reader", 1)],
+            keep_superseded=1,
+            min_idle_seconds=3600,
+        )
+
+        assert gone == set()
+
+    @pytest.mark.parametrize("batch", [1, None], ids=["row-a-batch", "one-batch"])
+    @pytest.mark.parametrize("reader", ["reader", "zreader"])
+    def test_a_reader_kept_mid_sweep_holds_its_input(
+        self, store, competitor, up, monkeypatch, reader, batch
+    ):
+        """A read after the selection keeps the reader, which the sweep takes before what
+        it read whichever id sorts first; reachability then holds ``up@v=1``, in the
+        reader's batch as in a later one."""
+        _finished(store, reader, "p-r", input_versions=_READS_UP_1)
+        _used_ago(store, reader, 86400)
+        if batch:
+            monkeypatch.setattr("vestigo.store._GC_DELETE_BATCH", batch)
+        gaps = ArtifactStore._without_version_gaps
+        landed = []
+
+        def read_after_choosing(conn, chosen):
+            if not landed:
+                landed.append(True)
+                competitor.read_blob(reader, 1)
+            return gaps(conn, chosen)
+
+        monkeypatch.setattr(
+            ArtifactStore, "_without_version_gaps", staticmethod(read_after_choosing)
+        )
+        result = store.garbage_collect(collectable=[(reader, 1)], keep_superseded=0)
+        monkeypatch.undo()
+
+        assert landed and result["deleted_count"] == 0
+        assert store.get_artifact(reader, 1) is not None
+        assert store.get_artifact("up", 1) is not None
+
+    def test_a_read_that_would_close_a_cycle_is_left_out_of_the_order(self):
+        """``z@1`` read ``a@1``, then ``a@2`` read ``z@1``: the first orders the reader
+        first, the second would close a cycle with ``a``'s versions and is left out."""
+        keys = [("a", 1), ("a", 2), ("z", 1)]
+        chosen = {key: {"key": key, "superseded_by": None} for key in keys}
+        reads = [(("z", 1), ("a", 1)), (("a", 2), ("z", 1))]
+
+        order = [row["key"] for row in _deletion_order(chosen, [], reads)]
+
+        assert order == [("z", 1), ("a", 1), ("a", 2)]
+
+    def test_a_spared_collectable_value_holds_its_inputs(self, store, up):
+        _finished(store, "reader", "p-r", input_versions=_READS_UP_1)
+        _used_ago(store, "reader", 86400)
+
+        gone = _swept(
+            store,
+            [*up, ("reader", 1)],
+            collectable=[("reader", 1)],
+            spare=[("reader", 1)],
+            keep_superseded=0,
+        )
+
+        assert gone == set()
+
+    @pytest.mark.parametrize(
+        ("kept", "walks"), [(("reader", 1), 2), (("up", 1), 1)], ids=["current", "superseded"]
+    )
+    def test_only_a_kept_current_value_costs_another_pass(
+        self, store, up, monkeypatch, kept, walks
+    ):
+        """The holds are read once; a walk is repeated only for a kept current value,
+        the one kind of version whose release changes what is held."""
+        _finished(store, "reader", "p-r", input_versions=_READS_UP_1)
+        _used_ago(store, kept[0], 60)
+        loads, walks_seen = [], []
+        holds, reachable = ArtifactStore._holds, _Holds.reachable
+
+        def load(self, *args, **kwargs):
+            loads.append(True)
+            return holds(self, *args, **kwargs)
+
+        def walk(self, *args):
+            walks_seen.append(True)
+            return reachable(self, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_holds", load)
+        monkeypatch.setattr(_Holds, "reachable", walk)
+
+        store.garbage_collect(collectable=[kept], min_idle_seconds=3600, dry_run=True)
+
+        assert (len(loads), len(walks_seen)) == (1, walks)
 
 
 _POINTER_WRITERS = {

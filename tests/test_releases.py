@@ -11,6 +11,7 @@ SQLite and on Postgres. Nothing here imports Strata.
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -1037,6 +1038,49 @@ class TestReferencesAndAuthorities:
 
 class TestCheckpointRetention:
     """What a sweep may take: collectable checkpoints and the roots that hold them."""
+
+    def test_a_checkpoint_inside_the_floor_keeps_what_it_read(self, ledger: Ledger):
+        """A notebook checkpoint part is its id's current value and records the run's
+        inputs; collectable but kept by the idle floor, it still holds them."""
+        for provenance in ("p-up-1", "p-up-2"):
+            version = ledger.store.create_artifact("up", provenance, SPEC)
+            ledger.store.write_blob("up", version, b"u")
+            ledger.store.finalize_artifact("up", version, "{}", None, 1)
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        part = f"{build_id}-checkpoint-{release.sequence}-model"
+        version = ledger.store.create_artifact(
+            part,
+            checkpoint_output_key(PARENT, build_id, release.sequence, "model"),
+            SPEC,
+            computation_key=PARENT,
+            release_id=release.release_id,
+            input_versions={"vestigo://artifact/up@v=1": "up@v=1"},
+        )
+        ledger.store.write_blob(part, version, b"w")
+        ledger.releases.accept(release.release_id, [_staged_row(part, version, b"w")])
+        _checkpoint(ledger, build_id)  # newer, so the first is collectable
+        # Accept records a use on the ledger's clock; the sweep's floor reads the wall's.
+        conn = ledger.store._get_connection()
+        try:
+            conn.execute(
+                "UPDATE artifact_versions SET created_at = 0, last_used_at = 0 WHERE id = 'up'"
+            )
+            conn.execute(
+                "UPDATE artifact_versions SET last_used_at = ? WHERE id <> 'up'", (time.time(),)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        collectable = ledger.releases.collectable_checkpoints()
+        assert collectable == [(part, version)]
+
+        ledger.store.garbage_collect(
+            collectable=collectable, keep_superseded=0, min_idle_seconds=3600
+        )
+
+        assert ledger.store.get_artifact(part, version) is not None
+        assert ledger.store.get_artifact("up", 1) is not None
 
     def test_gc_under_a_root_keeps_the_head_and_collects_the_rest(self, ledger: Ledger):
         build_id = _build(ledger)

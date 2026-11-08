@@ -3,6 +3,23 @@
 All notable changes to vestigo are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `ArtifactStore.garbage_collect` with `collectable`: a version the sweep keeps
+  anyway (inside `min_idle_seconds`, or by the gap, pointer or folder rules, or
+  used or held during the sweep) holds its inputs again, as a current value does,
+  and what it holds no longer counts toward `keep_superseded`. Before, every
+  `collectable` version stopped holding its inputs, so a notebook checkpoint the
+  idle floor kept could lose the versions it was built from in the same pass. A
+  collectable input of a kept collectable reader now stays with it, as do the
+  inputs of a current value in both `collectable` and `spare` (#69).
+- `ArtifactStore.garbage_collect` deletes a reader before the versions it read, so
+  a reader used or held during the sweep still finds its inputs to hold, and a
+  collectable version that stays holds them from the next row on, not only from
+  the next batch (#69).
+
 ## 0.4.0 - 2026-11-06
 
 Program nodes change (#57, #60), so a torch run started before 0.4.0 starts fresh.

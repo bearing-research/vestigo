@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -173,13 +173,16 @@ def _split_ref(ref: str) -> tuple[str, int]:
 def _deletion_order(
     chosen: Mapping[tuple[str, int], Any],
     edges: Collection[tuple[tuple[str, int], tuple[str, int]]],
+    reads: Collection[tuple[tuple[str, int], tuple[str, int]]] = (),
 ) -> list[Any]:
     """*chosen*'s rows, each after every chosen row the sweep's claim needs gone first.
 
     A pointer before its canonical, a requirer before what it requires (*edges*, from
     requirer to required), an id's lower versions before its higher ones; so a chain of
     any depth goes in one sweep. Ties go by requirement, pointer, version. A cycle, which
-    no claim can take, comes last.
+    no claim can take, comes last. A reader goes before what it read (*reads*, from
+    reader to input), where that closes no cycle: one that stays mid-sweep then still
+    finds its inputs to hold.
     """
     required = {to for _, to in edges}
 
@@ -207,6 +210,25 @@ def _deletion_order(
     for key, firsts in before.items():
         for first in firsts:
             after[first].append(key)
+
+    def follows(start: tuple[str, int], target: tuple[str, int]) -> bool:
+        """Whether *target* must already come after *start*."""
+        seen, pending = {start}, [start]
+        while pending:
+            for later in after[pending.pop()]:
+                if later == target:
+                    return True
+                if later not in seen:
+                    seen.add(later)
+                    pending.append(later)
+        return False
+
+    for reader, read in reads:
+        if reader not in before or read not in before or reader in before[read]:
+            continue
+        if reader != read and not follows(read, reader):
+            before[read].add(reader)
+            after[reader].append(read)
     waiting = {key: len(firsts) for key, firsts in before.items()}
     ready = [(rank(key), key) for key, count in waiting.items() if count == 0]
     heapq.heapify(ready)
@@ -220,6 +242,55 @@ def _deletion_order(
                 heapq.heappush(ready, (rank(later), later))
     ordered += sorted((key for key, count in waiting.items() if count), key=rank)
     return [chosen[key] for key in ordered]
+
+
+@dataclass
+class _Holds:
+    """What holds a version, read once, so a sweep can walk it again without a read.
+
+    ``roots`` hold whatever ``current`` (each caller-named id's current value) is not
+    told to leave out; ``inputs``, ``canonical`` and ``required`` are the edges a hold
+    follows.
+    """
+
+    roots: list[tuple[str, int]]
+    current: set[tuple[str, int]]
+    inputs: dict[tuple[str, int], str]
+    canonical: dict[tuple[str, int], tuple[str, int]]
+    required: dict[tuple[str, int], list[tuple[str, int]]]
+    _read: dict[tuple[str, int], list[tuple[str, int]]] = field(default_factory=dict)
+
+    def read_by(self, node: tuple[str, int]) -> list[tuple[str, int]]:
+        """The versions *node*'s recorded inputs name."""
+        if node not in self._read:
+            # Parsed as the lineage walk parses it, so that what GC protects and what a
+            # publication's chain will follow cannot drift apart: a name-URI edge records
+            # the concrete version it read in its value, and that ancestor is as reachable
+            # as any other. Anything else is a table or an external leaf.
+            recorded_inputs = self.inputs.get(node)
+            edges = json.loads(recorded_inputs) if recorded_inputs else {}
+            self._read[node] = [
+                ancestor
+                for uri, recorded in edges.items()
+                if (ancestor := _ancestor_of(uri, recorded)) is not None
+            ]
+        return self._read[node]
+
+    def reachable(self, not_current: Collection[tuple[str, int]] = ()) -> set[tuple[str, int]]:
+        """Every version held, with its whole chain, the current values in *not_current*
+        not counting as roots."""
+        reachable: set[tuple[str, int]] = set()
+        pending = [*self.roots, *(key for key in self.current if key not in not_current)]
+        while pending:
+            node = pending.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            if node in self.canonical:
+                pending.append(self.canonical[node])
+            pending += self.required.get(node, ())
+            pending += self.read_by(node)
+        return reachable
 
 
 def _declared_content_type(transform_spec: str | None) -> str:
@@ -4964,19 +5035,13 @@ class ArtifactStore:
                 (artifact_id, version),
             )
 
-    def _protected_reachable(
-        self,
-        conn: StoreConnection,
-        *,
-        current_values: bool = True,
-        not_current: Collection[tuple[str, int]] = (),
-    ) -> set[tuple[str, int]]:
-        """Every version something holds, with its whole chain of inputs.
+    def _holds(self, conn: StoreConnection, *, current_values: bool = True) -> _Holds:
+        """Every root that holds a version, and every edge a hold follows.
 
         Roots: names and aliases; pending alias changes; publications (revoked ones
         too) and retention roots; running builds; and with ``current_values`` the
-        current value of every caller-named id, except those in ``not_current``. A
-        held version holds what it requires. Deliberately not tenant-scoped:
+        current value of every caller-named id, which a walk may leave out. A held
+        version holds what it requires. Deliberately not tenant-scoped:
         over-protecting is free, and proving chains never cross tenants is not.
         """
         roots_sql = (
@@ -4990,16 +5055,18 @@ class ArtifactStore:
             "WHERE state = 'building'"
         )
         roots = [(row["artifact_id"], row["version"]) for row in conn.execute(roots_sql)]
-        if current_values:
-            roots += [
+        current = (
+            {
                 (row["artifact_id"], row["version"])
                 for row in conn.execute(
                     "SELECT id AS artifact_id, MAX(version) AS version "
                     "FROM artifact_versions WHERE minted = 0 "
                     "AND state IN ('ready', 'superseded') GROUP BY id"
                 )
-                if (row["artifact_id"], row["version"]) not in not_current
-            ]
+            }
+            if current_values
+            else set()
+        )
         # One read of every recorded edge, walked in memory: a notebook store
         # has a root per cell output, and a query per node would be the sweep.
         inputs: dict[tuple[str, int], str] = {
@@ -5026,30 +5093,7 @@ class ArtifactStore:
             required.setdefault((row["from_artifact_id"], row["from_version"]), []).append(
                 (row["to_artifact_id"], row["to_version"])
             )
-
-        reachable: set[tuple[str, int]] = set()
-        pending = list(roots)
-        while pending:
-            node = pending.pop()
-            if node in reachable:
-                continue
-            reachable.add(node)
-            if node in canonical:
-                pending.append(canonical[node])
-            pending += required.get(node, ())
-            recorded_inputs = inputs.get(node)
-            if not recorded_inputs:
-                continue
-            for uri, recorded in json.loads(recorded_inputs).items():
-                # Parsed as the lineage walk parses it, so that what GC protects
-                # and what a publication's chain will follow cannot drift apart:
-                # a name-URI edge records the concrete version it read
-                # in its value, and that ancestor is as reachable as any other.
-                # Anything else is a table or an external leaf.
-                ancestor = _ancestor_of(uri, recorded)
-                if ancestor is not None:
-                    pending.append(ancestor)
-        return reachable
+        return _Holds(roots, current, inputs, canonical, required)
 
     @staticmethod
     def _required_versions(
@@ -5261,7 +5305,7 @@ class ArtifactStore:
         """Collect the versions nothing needs, least recently used first.
 
         A candidate has no name or alias, is not in any protected chain
-        (``_protected_reachable``), is not ``building``, is not the current value of a
+        (``_holds``), is not ``building``, is not the current value of a
         caller-named id (unless ``collect_latest``), and was last used (or created) at
         least ``min_idle_seconds`` ago.
 
@@ -5269,12 +5313,14 @@ class ArtifactStore:
         the least recently used down to 80% of it; with ``keep_superseded``, each id's
         candidates past that many earlier ready/superseded versions (failed ones
         never count); and the ``collectable`` versions, which the caller knows nothing
-        needs though each may be its id's current value. With none of the four set
-        nothing is collected. A version of an id ``exempt`` accepts goes only as
-        ``collectable``, and a version in ``spare`` (not its inputs) never goes. An
-        id never loses its highest version while keeping a lower one, so a version
-        number is never reused. A folder file goes only with every manifest of its
-        tenant naming it, and the cap evicts a folder whole, at its newest member's use.
+        needs though each may be its id's current value. One the sweep keeps anyway
+        (the idle floor, a hold, the gap rule) still holds its inputs, as a current
+        value does. With none of the four set nothing is collected. A version of an
+        id ``exempt`` accepts goes only as ``collectable``, and a version in ``spare``
+        never goes (nor its inputs, if it is a current value). An id never loses its
+        highest version while keeping a lower one, so a version number is never
+        reused. A folder file goes only with every manifest of its tenant naming it,
+        and the cap evicts a folder whole, at its newest member's use.
 
         ``tenant`` limits the sweep, and the ``max_bytes`` measure, to that tenant;
         ``include_tenantless`` adds the legacy tenantless rows every tenant shares.
@@ -5340,27 +5386,14 @@ class ArtifactStore:
             # facing an id whose versions share a timestamp takes the oldest.
             filters += f" ORDER BY {used} ASC, av.id ASC, av.version ASC"
 
-            protected = self._protected_reachable(
-                conn, current_values=not collect_latest, not_current=set(collectable)
-            ) | set(spare)
-            candidates = [
+            # An exempt id's versions go only as ``collectable``, which ``any_rows`` offers.
+            rows = [
                 row
                 for row in conn.execute(query + filters, params).fetchall()
-                if (row["id"], row["version"]) not in protected
-                and not (exempt and exempt(row["id"]))
+                if not (exempt and exempt(row["id"]))
             ]
             wanted = set(collectable)
-            if wanted:
-                seen = {(row["id"], row["version"]) for row in candidates}
-                current = [
-                    row
-                    for row in conn.execute(any_value + filters, params).fetchall()
-                    if (row["id"], row["version"]) in wanted - seen
-                    and (row["id"], row["version"]) not in protected
-                ]
-                candidates = sorted(
-                    candidates + current, key=lambda r: (r["used"], r["id"], r["version"])
-                )
+            any_rows = conn.execute(any_value + filters, params).fetchall() if wanted else []
             # Measured over what the sweep may collect: a tenant's cap is on
             # its own share, or one tenant's sweep would empty its cache while
             # the others kept the store over the cap.
@@ -5389,51 +5422,83 @@ class ArtifactStore:
                 """The files in *picked* that a manifest not in it names."""
                 return {key for key in picked if any(m not in picked for m in namers.get(key, ()))}
 
-            chosen: dict[tuple[str, int], Any] = {
-                (row["id"], row["version"]): row
-                for row in candidates
-                if (row["id"], row["version"]) in wanted
-            }
-            if max_idle_days is not None:
-                idle_before = now - max_idle_days * 86400
-                for row in candidates:
-                    if row["used"] < idle_before:
-                        chosen[(row["id"], row["version"])] = row
-            for key in split(chosen):
-                del chosen[key]
-            if max_bytes is not None and store_bytes > max_bytes:
-                target = int(max_bytes * _EVICT_TO_FRACTION)
-                remaining = store_bytes - sum(r["byte_size"] or 0 for r in chosen.values())
-                by_key = {(row["id"], row["version"]): row for row in candidates}
-                for row in candidates:
-                    if remaining <= target:
-                        break
-                    key = (row["id"], row["version"])
-                    if key in chosen:
-                        continue
-                    unit = self._folder_unit(key, row["used"], folders, namers, by_key, chosen)
-                    for member in unit or ():
-                        chosen[member] = by_key[member]
-                        remaining -= by_key[member]["byte_size"] or 0
+            def select(protected: set[tuple[str, int]]) -> dict[tuple[str, int], Any]:
+                """What the sweep takes while *protected* stays."""
+                candidates = [row for row in rows if (row["id"], row["version"]) not in protected]
+                if wanted:
+                    missing = wanted - {(row["id"], row["version"]) for row in candidates}
+                    current = [
+                        row
+                        for row in any_rows
+                        if (row["id"], row["version"]) in missing
+                        and (row["id"], row["version"]) not in protected
+                    ]
+                    candidates = sorted(
+                        candidates + current, key=lambda r: (r["used"], r["id"], r["version"])
+                    )
+                chosen: dict[tuple[str, int], Any] = {
+                    (row["id"], row["version"]): row
+                    for row in candidates
+                    if (row["id"], row["version"]) in wanted
+                }
+                if max_idle_days is not None:
+                    idle_before = now - max_idle_days * 86400
+                    for row in candidates:
+                        if row["used"] < idle_before:
+                            chosen[(row["id"], row["version"])] = row
+                for key in split(chosen):
+                    del chosen[key]
+                if max_bytes is not None and store_bytes > max_bytes:
+                    target = int(max_bytes * _EVICT_TO_FRACTION)
+                    remaining = store_bytes - sum(r["byte_size"] or 0 for r in chosen.values())
+                    by_key = {(row["id"], row["version"]): row for row in candidates}
+                    for row in candidates:
+                        if remaining <= target:
+                            break
+                        key = (row["id"], row["version"])
+                        if key in chosen:
+                            continue
+                        unit = self._folder_unit(key, row["used"], folders, namers, by_key, chosen)
+                        for member in unit or ():
+                            chosen[member] = by_key[member]
+                            remaining -= by_key[member]["byte_size"] or 0
 
-            if keep_superseded is not None:
-                kept: dict[str, int] = {}
-                for row in sorted(candidates, key=lambda r: (r["id"], -r["version"])):
-                    if row["state"] != "failed" and kept.get(row["id"], 0) < keep_superseded:
-                        kept[row["id"]] = kept.get(row["id"], 0) + 1
-                        continue
-                    chosen.setdefault((row["id"], row["version"]), row)
+                if keep_superseded is not None:
+                    kept: dict[str, int] = {}
+                    for row in sorted(candidates, key=lambda r: (r["id"], -r["version"])):
+                        if row["state"] != "failed" and kept.get(row["id"], 0) < keep_superseded:
+                            kept[row["id"]] = kept.get(row["id"], 0) + 1
+                            continue
+                        chosen.setdefault((row["id"], row["version"]), row)
 
-            chosen = self._with_their_pointers(conn, chosen, candidates)
-            # The gap and pointer rules can keep a manifest; its files stay with it.
-            held: set[tuple[str, int]] = set()
-            while broken := split(chosen):
-                held |= broken
-                chosen = self._with_their_pointers(
-                    conn,
-                    {key: row for key, row in chosen.items() if key not in held},
-                    [row for row in candidates if (row["id"], row["version"]) not in held],
-                )
+                chosen = self._with_their_pointers(conn, chosen, candidates)
+                # The gap and pointer rules can keep a manifest; its files stay with it.
+                held: set[tuple[str, int]] = set()
+                while broken := split(chosen):
+                    held |= broken
+                    chosen = self._with_their_pointers(
+                        conn,
+                        {key: row for key, row in chosen.items() if key not in held},
+                        [row for row in candidates if (row["id"], row["version"]) not in held],
+                    )
+                return chosen
+
+            # A collectable version stops being a root only once the sweep takes it: one
+            # the floor, a hold or the gap rule keeps is still a current value, which holds
+            # its inputs. Only a kept current value adds a root, so only one is worth another
+            # pass; each releases fewer, so this ends, usually one pass later. One given up
+            # is not offered again, though a later pass might let it go: that only takes
+            # less, and the next sweep takes the rest.
+            spared = set(spare)
+            holds = self._holds(conn, current_values=not collect_latest)
+            released = set(wanted)
+            while True:
+                protected = holds.reachable(released) | spared
+                chosen = select(protected)
+                kept = released.difference(chosen)
+                released -= kept
+                if not kept & holds.current:
+                    break
 
             if dry_run:
                 return {
@@ -5474,8 +5539,18 @@ class ArtifactStore:
                     "FROM retention_edges"
                 )
             ]
-            ordered = _deletion_order(chosen, edges)
+            reads = [(key, read) for key in chosen for read in holds.read_by(key)]
+            ordered = _deletion_order(chosen, edges, reads)
             stayed: set[tuple[str, int]] = set()
+
+            def stay(key: tuple[str, int]) -> None:
+                nonlocal protected
+                stayed.add(key)
+                # A collectable value that stays holds its inputs from the next row on,
+                # not only from the next batch.
+                if key in released and key in holds.current:
+                    protected = holds.reachable(released - stayed) | spared
+
             for position, row in enumerate(ordered):
                 # Committed in batches: one transaction over a large sweep holds SQLite's write
                 # lock long enough to stall every writer behind it.
@@ -5491,13 +5566,14 @@ class ArtifactStore:
                     # Reachability again, under the write lock, per batch: a hold landing on
                     # a reader since the selection (a name, a pin) keeps the reader's inputs.
                     # On Postgres the lock serializes sweeps only, so a hold can still land
-                    # between this read and a claim below.
+                    # between this read and a claim below. A collectable version that
+                    # stayed is a current value again, and holds its inputs.
                     self._dialect.begin_write(conn, "__gc__")
-                    protected = self._protected_reachable(
-                        conn, current_values=not collect_latest, not_current=wanted
-                    ) | set(spare)
+                    holds = self._holds(conn, current_values=not collect_latest)
+                    protected = holds.reachable(released - stayed) | spared
                 artifact_id, version, byte_size = row["id"], row["version"], row["byte_size"] or 0
                 if namers.get((artifact_id, version), set()) & stayed:
+                    stay((artifact_id, version))
                     logger.info(
                         "garbage_collect: keeping %s@v=%d, a folder naming it stayed.",
                         artifact_id,
@@ -5505,7 +5581,7 @@ class ArtifactStore:
                     )
                     continue
                 if (artifact_id, version) in protected:
-                    stayed.add((artifact_id, version))
+                    stay((artifact_id, version))
                     logger.info(
                         "garbage_collect: keeping %s@v=%d, held since it was selected.",
                         artifact_id,
@@ -5557,7 +5633,7 @@ class ArtifactStore:
                 # On Postgres the claim read the holds from a snapshot older than its wait for
                 # the row lock; a hold that committed during the wait shows in a later read.
                 if claimed.rowcount == 0 or self._held_now(conn, artifact_id, version):
-                    stayed.add((artifact_id, version))
+                    stay((artifact_id, version))
                     logger.info(
                         "garbage_collect: keeping %s@v=%d, used or held since it was selected.",
                         artifact_id,
@@ -5579,7 +5655,7 @@ class ArtifactStore:
                     # pointer wins. Skip it (uncounted, blob untouched) rather than fail the whole
                     # sweep on one race.
                     conn.execute("ROLLBACK TO SAVEPOINT gc_row")
-                    stayed.add((artifact_id, version))
+                    stay((artifact_id, version))
                     logger.info(
                         "garbage_collect: skipping %s@v=%d, something referenced "
                         "it after it was selected.",
