@@ -24,6 +24,19 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Fixed
 
+- `ArtifactStore.garbage_collect` no longer leaves a current value missing a version
+  it read or requires. Versions that need each other gone first, such as one reading
+  or requiring a lower version of its own id, now go together or not at all. Before,
+  the sweep could take the input and keep the reader: every time with a requirement
+  on a lower version, and when the reader was used mid-sweep otherwise. A cycle of
+  requirements through an id's versions (`b@v=1` requires `a@v=1`, `a@v=2` requires
+  `b@v=1`) that nothing else holds is now collected; before, it stayed forever (#76).
+- When a collectable current value goes, the version its id then resolves to (under a
+  failed or building rebuild) holds its inputs, as a current value does; before, they
+  could go in the same pass (#76).
+- `keep_superseded` counts only versions that stay: a collectable current value the
+  sweep takes no longer uses a slot, so `keep_superseded=1` keeps one earlier
+  version (#76).
 - `ArtifactStore.garbage_collect` with `collectable`: a version the sweep keeps
   anyway (inside `min_idle_seconds`, or by the gap, pointer or folder rules, or
   used or held during the sweep) holds its inputs again, as a current value does,

@@ -174,78 +174,122 @@ def _split_ref(ref: str) -> tuple[str, int]:
     return artifact_id, int(version)
 
 
+# A version nothing used or held since the sweep selected it (id, version, the use it
+# was selected at, then id and version four times): a garbage-collection claim.
+_UNHELD_SQL = """
+    id = ? AND version = ? AND COALESCE(last_used_at, created_at) <= ?
+    AND NOT EXISTS (SELECT 1 FROM artifact_names n WHERE n.artifact_id = ? AND n.version = ?)
+    AND NOT EXISTS (SELECT 1 FROM artifact_aliases a WHERE a.artifact_id = ? AND a.version = ?)
+    AND NOT EXISTS (SELECT 1 FROM retention_roots r WHERE r.artifact_id = ? AND r.version = ?)
+    AND NOT EXISTS (SELECT 1 FROM artifact_publications pub
+                    WHERE pub.artifact_id = ? AND pub.version = ?)
+"""
+
+
 def _deletion_order(
     chosen: Mapping[tuple[str, int], Any],
     edges: Collection[tuple[tuple[str, int], tuple[str, int]]],
     reads: Collection[tuple[tuple[str, int], tuple[str, int]]] = (),
-) -> list[Any]:
-    """*chosen*'s rows, each after every chosen row the sweep's claim needs gone first.
+) -> list[list[Any]]:
+    """*chosen*'s rows in groups, each after every chosen row the sweep's claim needs
+    gone first.
 
     A pointer before its canonical, a requirer before what it requires (*edges*, from
-    requirer to required), an id's lower versions before its higher ones; so a chain of
-    any depth goes in one sweep. Ties go by requirement, pointer, version. A cycle, which
-    no claim can take, comes last. A reader goes before what it read (*reads*, from
-    reader to input), where that closes no cycle: one that stays mid-sweep then still
-    finds its inputs to hold.
+    requirer to required), an id's lower versions before its higher ones, and a reader
+    before what it read (*reads*, from reader to input), so one that stays mid-sweep
+    still finds its inputs to hold; a chain of any depth goes in one sweep. Ties go by
+    requirement, pointer, version. Rows that need each other gone first (a version
+    reading or requiring a lower one of its own id, a cycle of requirements through an
+    id's versions) are one
+    group, which the sweep takes whole or not at all: one at a time, a member that
+    stayed could be left missing what another took, and a cycle of requirements could
+    never go.
     """
     required = {to for _, to in edges}
 
     def rank(key: tuple[str, int]) -> tuple[bool, bool, int, str]:
         return (key in required, chosen[key]["superseded_by"] is None, key[1], key[0])
 
-    before: dict[tuple[str, int], set[tuple[str, int]]] = {key: set() for key in chosen}
+    after: dict[tuple[str, int], set[tuple[str, int]]] = {key: set() for key in chosen}
+
+    def first(earlier: tuple[str, int], later: tuple[str, int]) -> None:
+        if earlier != later and earlier in after and later in after:
+            after[earlier].add(later)
+
     for requirer, needed in edges:
-        if requirer in before and needed in before and requirer != needed:
-            before[needed].add(requirer)
+        first(requirer, needed)
     versions: dict[str, list[int]] = {}
     for artifact_id, version in chosen:
         versions.setdefault(artifact_id, []).append(version)
     for artifact_id, numbers in versions.items():
         numbers.sort()
         for lower, higher in zip(numbers, numbers[1:], strict=False):
-            before[(artifact_id, higher)].add((artifact_id, lower))
+            first((artifact_id, lower), (artifact_id, higher))
     for key, row in chosen.items():
         if row["superseded_by"]:
-            canonical = _split_ref(row["superseded_by"])
-            if canonical in before and canonical != key:
-                before[canonical].add(key)
-
-    after: dict[tuple[str, int], list[tuple[str, int]]] = {key: [] for key in chosen}
-    for key, firsts in before.items():
-        for first in firsts:
-            after[first].append(key)
-
-    def follows(start: tuple[str, int], target: tuple[str, int]) -> bool:
-        """Whether *target* must already come after *start*."""
-        seen, pending = {start}, [start]
-        while pending:
-            for later in after[pending.pop()]:
-                if later == target:
-                    return True
-                if later not in seen:
-                    seen.add(later)
-                    pending.append(later)
-        return False
-
+            first(key, _split_ref(row["superseded_by"]))
     for reader, read in reads:
-        if reader not in before or read not in before or reader in before[read]:
+        first(reader, read)
+
+    # The groups are the strongly connected parts of that order (Tarjan's, iterative).
+    index: dict[tuple[str, int], int] = {}
+    low: dict[tuple[str, int], int] = {}
+    stack: list[tuple[str, int]] = []
+    on_stack: set[tuple[str, int]] = set()
+    group_of: dict[tuple[str, int], int] = {}
+    groups: list[list[tuple[str, int]]] = []
+    for root in sorted(chosen, key=rank):
+        if root in index:
             continue
-        if reader != read and not follows(read, reader):
-            before[read].add(reader)
-            after[reader].append(read)
-    waiting = {key: len(firsts) for key, firsts in before.items()}
-    ready = [(rank(key), key) for key, count in waiting.items() if count == 0]
+        index[root] = low[root] = len(index)
+        stack.append(root)
+        on_stack.add(root)
+        walk = [(root, iter(sorted(after[root], key=rank)))]
+        while walk:
+            node, laters = walk[-1]
+            for later in laters:
+                if later not in index:
+                    index[later] = low[later] = len(index)
+                    stack.append(later)
+                    on_stack.add(later)
+                    walk.append((later, iter(sorted(after[later], key=rank))))
+                    break
+                if later in on_stack:
+                    low[node] = min(low[node], index[later])
+            else:
+                walk.pop()
+                if walk:
+                    low[walk[-1][0]] = min(low[walk[-1][0]], low[node])
+                if low[node] == index[node]:
+                    members = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        group_of[member] = len(groups)
+                        members.append(member)
+                        if member == node:
+                            break
+                    groups.append(sorted(members, key=rank))
+
+    waiting = [0] * len(groups)
+    later_groups: list[set[int]] = [set() for _ in groups]
+    for earlier, laters in after.items():
+        for later in laters:
+            a, b = group_of[earlier], group_of[later]
+            if a != b and b not in later_groups[a]:
+                later_groups[a].add(b)
+                waiting[b] += 1
+    ready = [(rank(groups[g][0]), g) for g, count in enumerate(waiting) if count == 0]
     heapq.heapify(ready)
-    ordered: list[tuple[str, int]] = []
+    ordered: list[list[Any]] = []
     while ready:
-        _, key = heapq.heappop(ready)
-        ordered.append(key)
-        for later in after[key]:
+        _, g = heapq.heappop(ready)
+        ordered.append([chosen[key] for key in groups[g]])
+        for later in later_groups[g]:
             waiting[later] -= 1
             if waiting[later] == 0:
-                heapq.heappush(ready, (rank(later), later))
-    ordered += sorted((key for key, count in waiting.items() if count), key=rank)
-    return [chosen[key] for key in ordered]
+                heapq.heappush(ready, (rank(groups[later][0]), later))
+    return ordered
 
 
 @dataclass
@@ -280,11 +324,19 @@ class _Holds:
             ]
         return self._read[node]
 
-    def reachable(self, not_current: Collection[tuple[str, int]] = ()) -> set[tuple[str, int]]:
+    def reachable(
+        self,
+        not_current: Collection[tuple[str, int]] = (),
+        also: Collection[tuple[str, int]] = (),
+    ) -> set[tuple[str, int]]:
         """Every version held, with its whole chain, the current values in *not_current*
-        not counting as roots."""
+        not counting as roots, and those in *also* counting as current values."""
         reachable: set[tuple[str, int]] = set()
-        pending = [*self.roots, *(key for key in self.current if key not in not_current)]
+        pending = [
+            *self.roots,
+            *(key for key in self.current if key not in not_current),
+            *also,
+        ]
         while pending:
             node = pending.pop()
             if node in reachable:
@@ -5329,11 +5381,14 @@ class ArtifactStore:
 
         Collected: candidates idle beyond ``max_idle_days``; when over ``max_bytes``,
         the least recently used down to 80% of it; with ``keep_superseded``, each id's
-        candidates past that many earlier ready/superseded versions (failed ones
-        never count); and the ``collectable`` versions, which the caller knows nothing
-        needs though each may be its id's current value. One the sweep keeps anyway
-        (the idle floor, a hold, the gap rule) still holds its inputs, as a current
-        value does. With none of the four set nothing is collected. A version of an
+        candidates past that many earlier ready/superseded versions (failed ones, and
+        ones the sweep takes anyway, never count); and the ``collectable`` versions,
+        which the caller knows nothing needs though each may be its id's current value.
+        One the sweep keeps anyway (the idle floor, a hold, the gap rule) still holds its
+        inputs, as a current value does, and so does the version an id is left
+        resolving to when its collectable current value goes. Versions that need each
+        other gone first (one reading or requiring a lower version of its own id) go
+        together or not at all. With none of the four set nothing is collected. A version of an
         id ``exempt`` accepts goes only as ``collectable``, and a version in ``spare``
         never goes (nor its inputs, if it is a current value). An id never loses its
         highest version while keeping a lower one, so a version number is never
@@ -5484,10 +5539,14 @@ class ArtifactStore:
                 if keep_superseded is not None:
                     kept: dict[str, int] = {}
                     for row in sorted(candidates, key=lambda r: (r["id"], -r["version"])):
+                        key = (row["id"], row["version"])
+                        # One going anyway (a collectable current value) is no version kept.
+                        if key in chosen:
+                            continue
                         if row["state"] != "failed" and kept.get(row["id"], 0) < keep_superseded:
                             kept[row["id"]] = kept.get(row["id"], 0) + 1
                             continue
-                        chosen.setdefault((row["id"], row["version"]), row)
+                        chosen[key] = row
 
                 chosen = self._with_their_pointers(conn, chosen, candidates)
                 # The gap and pointer rules can keep a manifest; its files stay with it.
@@ -5510,12 +5569,29 @@ class ArtifactStore:
             spared = set(spare)
             holds = self._holds(conn, current_values=not collect_latest)
             released = set(wanted)
+            tracked = {key[0] for key in released & holds.current}
+            results = self._results_of(conn, tracked)
+
+            def left_current(going: Collection[tuple[str, int]]) -> set[tuple[str, int]]:
+                """The version each collectable current value going leaves current: its
+                id's newest ready or superseded version that stays."""
+                exposed = set()
+                for artifact_id, numbers in results.items():
+                    if (artifact_id, numbers[0]) in going:
+                        stays = next((v for v in numbers if (artifact_id, v) not in going), None)
+                        if stays is not None:
+                            exposed.add((artifact_id, stays))
+                return exposed
+
+            exposed: set[tuple[str, int]] = set()
             while True:
-                protected = holds.reachable(released) | spared
+                protected = holds.reachable(released, exposed) | spared
                 chosen = select(protected)
                 kept = released.difference(chosen)
                 released -= kept
-                if not kept & holds.current:
+                more = left_current(chosen) - exposed
+                exposed |= more
+                if not kept & holds.current and not more:
                     break
 
             if dry_run:
@@ -5558,22 +5634,34 @@ class ArtifactStore:
                 )
             ]
             reads = [(key, read) for key in chosen for read in holds.read_by(key)]
-            ordered = _deletion_order(chosen, edges, reads)
+            groups = _deletion_order(chosen, edges, reads)
             stayed: set[tuple[str, int]] = set()
 
-            def stay(key: tuple[str, int]) -> None:
-                nonlocal protected
-                stayed.add(key)
-                # A collectable value that stays holds its inputs from the next row on,
-                # not only from the next batch.
-                if key in released and key in holds.current:
-                    protected = holds.reachable(released - stayed) | spared
+            def guarded() -> set[tuple[str, int]]:
+                """What stays held: a collectable value that stayed is a current value
+                again, and a version left current by one going is one too."""
+                going = chosen.keys() - stayed
+                return holds.reachable(released - stayed, left_current(going)) | spared
 
-            for position, row in enumerate(ordered):
+            def stay(*keys: tuple[str, int]) -> None:
+                """*keys* stay; their inputs are held from the next row on, not only from
+                the next batch, when that changes what is held: a collectable value is a
+                current value again, or another version is left current."""
+                nonlocal protected
+                left = left_current(chosen.keys() - stayed)
+                stayed.update(keys)
+                if any(key in released and key in holds.current for key in keys) or (
+                    left != left_current(chosen.keys() - stayed)
+                ):
+                    protected = guarded()
+
+            in_batch = 0
+            for group in groups:
                 # Committed in batches: one transaction over a large sweep holds SQLite's write
-                # lock long enough to stall every writer behind it.
-                if position % _GC_DELETE_BATCH == 0:
-                    if position:
+                # lock long enough to stall every writer behind it. A group is never split, so
+                # a long one (every version of an id reading the one before) holds it longer.
+                if not in_batch or in_batch >= _GC_DELETE_BATCH:
+                    if in_batch:
                         conn.commit()
                         collected.extend(pending)
                         pending.clear()
@@ -5584,11 +5672,25 @@ class ArtifactStore:
                     # Reachability again, under the write lock, per batch: a hold landing on
                     # a reader since the selection (a name, a pin) keeps the reader's inputs.
                     # On Postgres the lock serializes sweeps only, so a hold can still land
-                    # between this read and a claim below. A collectable version that
-                    # stayed is a current value again, and holds its inputs.
+                    # between this read and a claim below.
                     self._dialect.begin_write(conn, "__gc__")
                     holds = self._holds(conn, current_values=not collect_latest)
-                    protected = holds.reachable(released - stayed) | spared
+                    results = self._results_of(conn, tracked)
+                    protected = guarded()
+                    in_batch = 0
+                in_batch += len(group)
+                if len(group) > 1:
+                    if self._take_together(conn, group, protected, stayed, namers):
+                        for row in group:
+                            attempt = row["blob_attempt"]
+                            blob_id = attempt_blob_id(row["id"], attempt) if attempt else row["id"]
+                            pending.append((blob_id, row["version"]))
+                            deleted_count += 1
+                            deleted_bytes += row["byte_size"] or 0
+                    else:
+                        stay(*((row["id"], row["version"]) for row in group))
+                    continue
+                [row] = group
                 artifact_id, version, byte_size = row["id"], row["version"], row["byte_size"] or 0
                 if namers.get((artifact_id, version), set()) & stayed:
                     stay((artifact_id, version))
@@ -5614,17 +5716,9 @@ class ArtifactStore:
                 # goes only once no other version of it is left: a lower one that stayed keeps
                 # it, or the next create_artifact would reuse its number.
                 claimed = conn.execute(
-                    """
+                    f"""
                     UPDATE artifact_versions SET state = state
-                    WHERE id = ? AND version = ? AND COALESCE(last_used_at, created_at) <= ?
-                      AND NOT EXISTS (SELECT 1 FROM artifact_names n
-                                      WHERE n.artifact_id = ? AND n.version = ?)
-                      AND NOT EXISTS (SELECT 1 FROM artifact_aliases a
-                                      WHERE a.artifact_id = ? AND a.version = ?)
-                      AND NOT EXISTS (SELECT 1 FROM retention_roots r
-                                      WHERE r.artifact_id = ? AND r.version = ?)
-                      AND NOT EXISTS (SELECT 1 FROM artifact_publications pub
-                                      WHERE pub.artifact_id = ? AND pub.version = ?)
+                    WHERE {_UNHELD_SQL}
                       AND NOT EXISTS (SELECT 1 FROM artifact_versions ptr
                                       WHERE ptr.superseded_by = ?)
                       AND NOT EXISTS (SELECT 1 FROM retention_edges e
@@ -5732,6 +5826,109 @@ class ArtifactStore:
             (artifact_id, version) * 3,
         ).fetchone()
         return row is not None
+
+    @staticmethod
+    def _results_of(conn: StoreConnection, ids: Collection[str]) -> dict[str, list[int]]:
+        """Each of *ids*' ready and superseded versions, newest (its current value) first."""
+        results: dict[str, list[int]] = {}
+        ordered = sorted(ids)
+        for start in range(0, len(ordered), 500):
+            batch = ordered[start : start + 500]
+            marks = ", ".join("?" for _ in batch)
+            for row in conn.execute(
+                f"SELECT id, version FROM artifact_versions WHERE id IN ({marks}) "
+                "AND minted = 0 AND state IN ('ready', 'superseded')",
+                batch,
+            ).fetchall():
+                results.setdefault(row["id"], []).append(row["version"])
+        for numbers in results.values():
+            numbers.sort(reverse=True)
+        return results
+
+    def _take_together(
+        self,
+        conn: StoreConnection,
+        group: Sequence[Any],
+        protected: set[tuple[str, int]],
+        stayed: set[tuple[str, int]],
+        namers: Mapping[tuple[str, int], set[tuple[str, int]]],
+    ) -> bool:
+        """Delete *group*'s rows, which need each other gone first, all or none.
+
+        Each is claimed as a lone row is (not used or held since it was selected), and
+        none may be needed from outside the group: a pointer at it, a requirer of its
+        tenant, a lower version of an id whose top it takes. False, with nothing
+        deleted, when any one stays.
+        """
+        keys = {(row["id"], row["version"]) for row in group}
+        label = ", ".join(f"{a}@v={v}" for a, v in sorted(keys))
+        if any(namers.get(key, set()) & stayed for key in keys):
+            logger.info("garbage_collect: keeping %s, a folder naming one stayed.", label)
+            return False
+        if keys & protected:
+            logger.info("garbage_collect: keeping %s, one held since they were selected.", label)
+            return False
+        conn.execute("SAVEPOINT gc_group")
+        try:
+            taken = all(self._claim_unheld(conn, row) for row in group)
+            taken = taken and not self._needed_outside(conn, keys)
+            if taken:
+                for artifact_id, version in keys:
+                    self._delete_version_children(conn, artifact_id, version)
+                for artifact_id, version in keys:
+                    conn.execute(
+                        "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
+                        (artifact_id, version),
+                    )
+        except self._dialect.integrity_error:
+            # A name or alias pointed at one since the claim: the pointer wins.
+            taken = False
+        if not taken:
+            conn.execute("ROLLBACK TO SAVEPOINT gc_group")
+            logger.info(
+                "garbage_collect: keeping %s, one used or held since they were selected.", label
+            )
+        conn.execute("RELEASE SAVEPOINT gc_group")
+        return taken
+
+    def _claim_unheld(self, conn: StoreConnection, row: Any) -> bool:
+        """Lock *row*'s version if nothing used or held it since it was selected."""
+        artifact_id, version = row["id"], row["version"]
+        claimed = conn.execute(
+            f"UPDATE artifact_versions SET state = state WHERE {_UNHELD_SQL}",
+            (artifact_id, version, row["used"], *(artifact_id, version) * 4),
+        )
+        return claimed.rowcount == 1 and not self._held_now(conn, artifact_id, version)
+
+    @staticmethod
+    def _needed_outside(conn: StoreConnection, keys: set[tuple[str, int]]) -> bool:
+        """Whether a version not in *keys* needs one of them: points at it, requires it
+        within its tenant, or is a version of an id whose top *keys* hold."""
+        for artifact_id, version in keys:
+            pointers = conn.execute(
+                "SELECT id, version FROM artifact_versions WHERE superseded_by = ?",
+                (f"{artifact_id}@v={version}",),
+            ).fetchall()
+            requirers = conn.execute(
+                "SELECT e.from_artifact_id AS id, e.from_version AS version "
+                "FROM retention_edges e JOIN artifact_versions av "
+                "ON av.id = e.to_artifact_id AND av.version = e.to_version "
+                "WHERE av.id = ? AND av.version = ? AND e.tenant = COALESCE(av.tenant, '')",
+                (artifact_id, version),
+            ).fetchall()
+            if any((row["id"], row["version"]) not in keys for row in [*pointers, *requirers]):
+                return True
+        for artifact_id in {key[0] for key in keys}:
+            numbers = {
+                row["version"]
+                for row in conn.execute(
+                    "SELECT version FROM artifact_versions WHERE id = ?", (artifact_id,)
+                ).fetchall()
+            }
+            mine = {version for a, version in keys if a == artifact_id}
+            if max(numbers) in mine and numbers - mine:
+                return True
+        return False
 
     def _with_their_pointers(
         self, conn: StoreConnection, chosen: dict[tuple[str, int], Any], candidates: list

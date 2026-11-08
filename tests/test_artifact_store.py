@@ -2923,12 +2923,15 @@ class TestAHoldAfterTheClaim(_Racing):
 _READS_UP_1 = {"vestigo://artifact/up@v=1": "up@v=1"}
 
 
-def _used_ago(store, artifact_id: str, seconds: float) -> None:
+def _used_ago(store, artifact_id: str, seconds: float, version: int | None = None) -> None:
+    """*artifact_id*'s versions (or its *version*) made and last used *seconds* ago."""
     conn = store._get_connection()
     try:
         conn.execute(
-            "UPDATE artifact_versions SET created_at = ?, last_used_at = ? WHERE id = ?",
-            (time.time() - seconds, time.time() - seconds, artifact_id),
+            "UPDATE artifact_versions SET created_at = ?, last_used_at = ? WHERE id = ?"
+            + ("" if version is None else " AND version = ?"),
+            (time.time() - seconds, time.time() - seconds, artifact_id)
+            + (() if version is None else (version,)),
         )
         conn.commit()
     finally:
@@ -3043,16 +3046,16 @@ class TestACollectableVersionKeptHoldsItsInputs(_Racing):
         assert store.get_artifact(reader, 1) is not None
         assert store.get_artifact("up", 1) is not None
 
-    def test_a_read_that_would_close_a_cycle_is_left_out_of_the_order(self):
-        """``z@1`` read ``a@1``, then ``a@2`` read ``z@1``: the first orders the reader
-        first, the second would close a cycle with ``a``'s versions and is left out."""
-        keys = [("a", 1), ("a", 2), ("z", 1)]
+    def test_rows_that_need_each_other_gone_first_are_one_group(self):
+        """``z@1`` read ``a@1``, then ``a@2`` read ``z@1``: with ``a``'s versions, a cycle
+        no order of single rows can take; ``b@1`` reads none of them and goes alone."""
+        keys = [("a", 1), ("a", 2), ("z", 1), ("b", 1)]
         chosen = {key: {"key": key, "superseded_by": None} for key in keys}
         reads = [(("z", 1), ("a", 1)), (("a", 2), ("z", 1))]
 
-        order = [row["key"] for row in _deletion_order(chosen, [], reads)]
+        groups = [[row["key"] for row in group] for group in _deletion_order(chosen, [], reads)]
 
-        assert order == [("z", 1), ("a", 1), ("a", 2)]
+        assert groups == [[("a", 1), ("z", 1), ("a", 2)], [("b", 1)]]
 
     def test_a_spared_collectable_value_holds_its_inputs(self, store, up):
         _finished(store, "reader", "p-r", input_versions=_READS_UP_1)
@@ -3103,6 +3106,186 @@ _POINTER_WRITERS = {
     "request": lambda s: s.request_alias_change("m", "champion", "set", artifact_id="d", version=1),
     "name": lambda s: s.set_name("n", "d", 1),
 }
+
+
+def _after_choosing(monkeypatch, act) -> list[bool]:
+    """*act*, another process's, once the sweep has chosen, before it claims."""
+    gaps = ArtifactStore._without_version_gaps
+    landed: list[bool] = []
+
+    def acting(conn, chosen):
+        if not landed:
+            landed.append(True)
+            act()
+        return gaps(conn, chosen)
+
+    monkeypatch.setattr(ArtifactStore, "_without_version_gaps", staticmethod(acting))
+    return landed
+
+
+def _read_after_choosing(monkeypatch, competitor, key: tuple[str, int]) -> list[bool]:
+    """A read of *key* by another process once the sweep has chosen, before it claims."""
+    return _after_choosing(monkeypatch, lambda: competitor.read_blob(*key))
+
+
+class TestASweepLeavesNoCurrentValueMissingAnInput(_Racing):
+    """After any sweep, every current value still has what it read and requires: rows
+    that need each other gone first go together or not at all, and the version that a
+    collected current value leaves current holds its inputs (audit of 2026-11-08)."""
+
+    @pytest.fixture(params=["reads-a-lower", "requires-and-reads-lower"])
+    def own_id(self, request, store):
+        """A current value reading (and requiring) lower versions of its own id: the gap
+        rule takes the lower ones first, and the reader wants to go before them."""
+        if request.param == "reads-a-lower":
+            _finished(store, "a", "p1")
+            _finished(store, "a", "p2", input_versions={"vestigo://artifact/a@v=1": "a@v=1"})
+            reader, keys = ("a", 2), [("a", 1), ("a", 2)]
+        else:
+            _finished(store, "a", "p1")
+            _finished(store, "a", "p2")
+            _finished(
+                store,
+                "a",
+                "p3",
+                requires=[("a", 1)],
+                input_versions={"vestigo://artifact/a@v=2": "a@v=2"},
+            )
+            reader, keys = ("a", 3), [("a", 1), ("a", 2), ("a", 3)]
+        _used_ago(store, "a", 86400)
+        return reader, keys
+
+    def test_versions_reading_their_own_id_go_together(self, store, own_id):
+        reader, keys = own_id
+
+        gone = _swept(store, keys, collectable=[reader], keep_superseded=0)
+
+        assert gone == set(keys)
+
+    @pytest.mark.parametrize("batch", [1, None], ids=["row-a-batch", "one-batch"])
+    def test_one_kept_mid_sweep_keeps_what_it_reads(
+        self, store, competitor, own_id, monkeypatch, batch
+    ):
+        reader, keys = own_id
+        if batch:
+            monkeypatch.setattr("vestigo.store._GC_DELETE_BATCH", batch)
+        landed = _read_after_choosing(monkeypatch, competitor, reader)
+
+        result = store.garbage_collect(collectable=[reader], keep_superseded=0)
+        monkeypatch.undo()
+
+        assert landed and result["deleted_count"] == 0
+        assert all(store.get_artifact(*key) is not None for key in keys)
+
+    def test_a_lower_version_kept_mid_sweep_keeps_the_group_holding_its_id_s_top(
+        self, store, competitor, monkeypatch
+    ):
+        """``a@v=3`` read ``a@v=2``, so the two go together; ``a@v=1``, read before its
+        claim, stays, and the top goes only once no lower version is left: else the
+        next ``create_artifact`` would reuse its number."""
+        for provenance in ("p1", "p2"):
+            _finished(store, "a", provenance)
+        _finished(store, "a", "p3", input_versions={"vestigo://artifact/a@v=2": "a@v=2"})
+        _used_ago(store, "a", 86400)
+        landed = _read_after_choosing(monkeypatch, competitor, ("a", 1))
+
+        result = store.garbage_collect(collectable=[("a", 3)], keep_superseded=0)
+        monkeypatch.undo()
+
+        assert landed and result["deleted_count"] == 0
+        assert [store.get_artifact("a", v) is not None for v in (1, 2, 3)] == [True] * 3
+
+    @pytest.fixture
+    def under_a_failed_rebuild(self, store):
+        """``x@v=2`` is x's current value and collectable, ``x@v=3`` a failed rebuild, and
+        ``x@v=1`` read ``y@v=1``: once ``x@v=2`` goes, ``x@v=1`` is what x resolves to."""
+        for provenance in ("y1", "y2", "y3"):
+            _finished(store, "y", provenance)
+        _finished(store, "x", "x1", input_versions={"vestigo://artifact/y@v=1": "y@v=1"})
+        _finished(store, "x", "x2")
+        store.fail_artifact("x", store.create_artifact("x", "x3"))
+        _used_ago(store, "x", 86400)
+        _used_ago(store, "y", 86400)
+        return [("x", 1), ("x", 2), ("y", 1), ("y", 2), ("y", 3)]
+
+    def test_the_version_left_current_holds_its_inputs(self, store, under_a_failed_rebuild):
+        _used_ago(store, "x", 60, version=1)
+
+        gone = _swept(
+            store,
+            under_a_failed_rebuild,
+            collectable=[("x", 2)],
+            keep_superseded=0,
+            min_idle_seconds=3600,
+        )
+
+        assert gone == {("x", 2), ("y", 2)}
+        assert store.get_latest_version("x").version == 1
+
+    def test_a_version_left_current_mid_sweep_holds_its_inputs(
+        self, store, competitor, under_a_failed_rebuild, monkeypatch
+    ):
+        """Chosen as superseded, ``x@v=1`` is read before its claim: it stays, and is x's
+        current value once ``x@v=2`` goes."""
+        _read_after_choosing(monkeypatch, competitor, ("x", 1))
+
+        store.garbage_collect(collectable=[("x", 2)], keep_superseded=0)
+        monkeypatch.undo()
+
+        assert store.get_latest_version("x").version == 1
+        assert store.get_artifact("y", 1) is not None
+
+    def test_the_version_left_current_is_the_one_still_there_when_its_batch_begins(
+        self, store, competitor, monkeypatch
+    ):
+        """``x@v=3`` is x's current value under a failed rebuild, and ``x@v=2`` would be
+        left current, until another process deletes it once the sweep has chosen: then
+        it is ``x@v=1``, which read ``y@v=1``."""
+        for provenance in ("y1", "y2"):
+            _finished(store, "y", provenance)
+        _finished(store, "x", "x1", input_versions={"vestigo://artifact/y@v=1": "y@v=1"})
+        _finished(store, "x", "x2")
+        _finished(store, "x", "x3")
+        store.fail_artifact("x", store.create_artifact("x", "x4"))
+        _used_ago(store, "x", 86400)
+        _used_ago(store, "y", 86400)
+        for version in (1, 2):
+            _used_ago(store, "x", 60, version=version)
+        _after_choosing(monkeypatch, lambda: competitor.delete_artifact("x", 2))
+
+        store.garbage_collect(collectable=[("x", 3)], keep_superseded=0, min_idle_seconds=3600)
+        monkeypatch.undo()
+
+        assert store.get_latest_version("x").version == 1
+        assert store.get_artifact("y", 1) is not None
+
+    def test_a_cycle_of_requirements_through_an_id_s_versions_goes_whole(self, store):
+        """``b@v=1`` requires ``a@v=1`` and ``a@v=2`` requires ``b@v=1``: one at a time,
+        each claim saw another's edge or the gap rule, and nothing ever went."""
+        _finished(store, "a", "a1")
+        _finished(store, "b", "b1", requires=[("a", 1)])
+        _finished(store, "a", "a2", requires=[("b", 1)])
+        for artifact_id in ("a", "b"):
+            _used_ago(store, artifact_id, 86400)
+        keys = [("a", 1), ("a", 2), ("b", 1)]
+
+        gone = _swept(store, keys, collectable=[("a", 2), ("b", 1)], keep_superseded=0)
+
+        assert gone == set(keys)
+
+    def test_a_collected_current_value_takes_no_keep_superseded_slot(self, store):
+        """With ``x@v=3`` taken, ``x@v=2`` is the current value and ``x@v=1`` the one
+        earlier version kept."""
+        for provenance in ("x1", "x2", "x3"):
+            _finished(store, "x", provenance)
+        store.fail_artifact("x", store.create_artifact("x", "x4"))
+        _used_ago(store, "x", 86400)
+
+        gone = _swept(
+            store, [("x", 1), ("x", 2), ("x", 3)], collectable=[("x", 3)], keep_superseded=1
+        )
+
+        assert gone == {("x", 3)}
 
 
 class TestPointersLockTheirTarget(_Racing):
