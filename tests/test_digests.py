@@ -568,18 +568,18 @@ def test_prune_puts_the_walk_s_paths_in_with_one_commit(tmp_path: Path, cache: F
     assert not any(s.startswith("COMMIT") for s in statements[begin : inserts[-1]])
 
 
-def test_on_windows_a_file_opened_is_matched_by_its_size_and_times(
+def test_on_windows_a_file_opened_is_matched_by_which_file_it_is(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """From 3.12 Windows's stat and fstat give one file another volume serial and id:
-    only what both agree on can say the file opened is the one stat'ed."""
-    looked_up = SimpleNamespace(st_dev=2**40, st_ino=2**70, st_size=4, st_mtime_ns=1, st_ctime_ns=2)
-    opened = SimpleNamespace(st_dev=7, st_ino=9, st_size=4, st_mtime_ns=1, st_ctime_ns=2)
-    rewritten = SimpleNamespace(**{**vars(opened), "st_mtime_ns": 3})
+    """A name's times and size there are its directory entry's copy, which can trail the
+    file's own just after a write: only the volume and the file id say it is the one."""
+    looked_up = SimpleNamespace(st_dev=7, st_ino=9, st_size=4, st_mtime_ns=1, st_ctime_ns=2)
+    trailed = SimpleNamespace(**{**vars(looked_up), "st_size": 8, "st_mtime_ns": 3})
+    another = SimpleNamespace(**{**vars(looked_up), "st_ino": 10})
     monkeypatch.setattr(vestigo.digests.os, "name", "nt")
 
-    assert vestigo.digests._same_file(opened, looked_up)
-    assert not vestigo.digests._same_file(rewritten, looked_up)
+    assert vestigo.digests._same_file(trailed, looked_up)
+    assert not vestigo.digests._same_file(another, looked_up)
 
 
 def test_a_missing_file_raises(tmp_path: Path, cache: FileDigests):
@@ -872,20 +872,3 @@ def test_a_file_stamped_past_the_clock_is_not_remembered_and_said_once(
     assert cache.cached_many(files) == [None, None]
     [said] = _warnings(caplog, "later than this machine's clock")
     assert str(files[0]) in said.getMessage()
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="debug: Windows stat against fstat")
-def test_debug_windows_stat_against_fstat(tmp_path: Path):
-    data = tmp_path / "a.csv"
-    data.write_bytes(b"1,2\n")
-    by_name = os.stat(data)
-    fd = os.open(data, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    try:
-        before = os.fstat(fd)
-        os.read(fd, 100)
-        after = os.fstat(fd)
-    finally:
-        os.close(fd)
-    fields = [f for f in dir(by_name) if f.startswith("st_")]
-    rows = [(f, getattr(by_name, f), getattr(before, f), getattr(after, f)) for f in fields]
-    raise AssertionError("\n".join(f"DEBUG {f}: name={a!r} fstat={b!r} after={c!r}" for f, a, b, c in rows))

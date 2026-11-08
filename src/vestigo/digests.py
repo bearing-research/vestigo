@@ -105,11 +105,10 @@ def _stat_key(st: os.stat_result) -> str:
 def _same_file(opened: os.stat_result, looked_up: os.stat_result) -> bool:
     """Whether the file a read opened is, unchanged, the one stat'ed by its name."""
     if os.name == "nt":
-        # From 3.12 Windows's stat names a file by its volume's 64-bit serial and a
-        # 128-bit id, fstat by the 32-bit serial and a 64-bit index; the times and the
-        # size agree (ctime is the creation time there).
-        fields = ("st_size", "st_mtime_ns", "st_ctime_ns")
-        return all(getattr(opened, f) == getattr(looked_up, f) for f in fields)
+        # A name's times and size there are the directory entry's copy, which can trail
+        # the file's own for a moment after a write: only which file it is compares. A
+        # change during the read still shows in the name's stat after it.
+        return (opened.st_dev, opened.st_ino) == (looked_up.st_dev, looked_up.st_ino)
     return _stat_fields(opened) == _stat_fields(looked_up)
 
 
