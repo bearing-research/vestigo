@@ -252,6 +252,13 @@ class SqlDialect(Protocol):
         """
         ...
 
+    def execute_ddl(self, conn: StoreConnection, script: str) -> None:
+        """Run *script*, this package's schema DDL or a consumer's, inside the open
+        transaction, which it never commits: under :meth:`begin_write`, the lock holds
+        from a re-check to the commit. ``executescript`` cannot stand in on SQLite, where
+        it commits whatever is open first."""
+        ...
+
 
 class SqliteDialect:
     """SQLite dialect: the store's PRAGMAs, row factory, timeout and ``BEGIN IMMEDIATE``."""
@@ -330,6 +337,25 @@ class SqliteDialect:
     def begin_write(self, conn: StoreConnection, key: str) -> None:
         # SQLite locks the whole file, so the key is unused.
         conn.execute("BEGIN IMMEDIATE")
+
+    def execute_ddl(self, conn: StoreConnection, script: str) -> None:
+        # Statement by statement, cut where SQLite's own tokenizer says one ends: a ``;``
+        # in a comment, a string or a trigger's body does not end it.
+        statement = ""
+        for piece in script.split(";"):
+            statement += piece + ";"
+            if sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                statement = ""
+        if not statement.strip(" \t\n;"):
+            return
+        # A trailing ``--`` comment swallows the ``;`` put after it; on a line of its own
+        # one ends the script as ``executescript`` would. Only an unended trigger or
+        # string is left incomplete.
+        statement += "\n;"
+        if not sqlite3.complete_statement(statement):
+            raise ValueError(f"an incomplete statement ends the script: {statement!r}")
+        conn.execute(statement)
 
 
 class _Row(Mapping):
@@ -712,39 +738,28 @@ class PostgresDialect:
         """
         conn.execute("SELECT pg_advisory_xact_lock(?)", (advisory_lock_id(key),))
 
-
-def _sqlite_script_locked(conn: StoreConnection, script: str) -> None:
-    """*script* as one write transaction on SQLite.
-
-    Two processes creating one new ledger at once otherwise interleave their DDL, and one
-    can have the other's land between a statement's prepare and its step: "database schema
-    has changed". ``executescript`` commits whatever is open first, so the script takes the
-    file's write lock itself.
-    """
-    conn.executescript(f"BEGIN IMMEDIATE;\n{script}\n;COMMIT;")
+    def execute_ddl(self, conn: StoreConnection, script: str) -> None:
+        # psycopg runs the whole script in the open transaction.
+        conn.executescript(self.adapt_ddl(script))
 
 
 def create_tables(dialect: SqlDialect, table: str, ddl: str) -> None:
     """Create a consumer's own tables beside the ledger's, once per database.
 
     ``table`` is the one whose presence means ``ddl`` already ran, on either backend.
-    CREATE TABLE IF NOT EXISTS races in Postgres when every node runs this at startup,
-    so there creation is serialized under a lock keyed on the table; on SQLite under the
-    file's write lock. Two processes creating at once still need ``IF NOT EXISTS``.
+    CREATE TABLE IF NOT EXISTS races in Postgres when every node runs this at startup, and
+    DDL on SQLite can fail another process's statement mid-step, so creation runs under a
+    lock keyed on the table (SQLite's is the file's write lock), and ``table`` is looked
+    for again under it: ``ddl`` runs once per database.
     """
     conn = dialect.connect()
     try:
         if dialect.schema_exists(conn, table):
             return
-        if dialect.supports_legacy_migration:
-            _sqlite_script_locked(conn, ddl)
-            return
         dialect.begin_write(conn, f"__{table}_schema__")
-        # Another node may have created it while this one waited for the lock.
-        if dialect.schema_exists(conn, table):
-            conn.commit()
-            return
-        conn.executescript(dialect.adapt_ddl(ddl))
+        # Another process may have created it while this one waited for the lock.
+        if not dialect.schema_exists(conn, table):
+            dialect.execute_ddl(conn, ddl)
         conn.commit()
     finally:
         conn.close()

@@ -38,7 +38,6 @@ from vestigo.sql_backend import (
     SqlDialect,
     SqliteDialect,
     StoreConnection,
-    _sqlite_script_locked,
 )
 
 if TYPE_CHECKING:
@@ -1357,6 +1356,12 @@ class ArtifactStore:
         finally:
             conn.close()
 
+    def _names_need_tenant(self, conn: StoreConnection) -> bool:
+        """A legacy ``artifact_names`` without its ``tenant`` key column."""
+        return self._dialect.schema_exists(
+            conn, "artifact_names"
+        ) and not self._dialect.column_exists(conn, "artifact_names", "tenant")
+
     def _init_schema(self) -> None:
         """Create the schema, or migrate an existing database to the latest version."""
         conn = self._boot_connection()
@@ -1377,14 +1382,14 @@ class ArtifactStore:
                 # pg_type_typname_nsp_index, which is exactly a multi-node first boot. Both scripts
                 # share one transaction so the lock covers them.
                 self._dialect.begin_write(conn, "__schema__")
-                conn.executescript(self._dialect.adapt_ddl(_SCHEMA_SQL))
-                conn.executescript(self._dialect.adapt_ddl(_REGISTRY_SCHEMA_SQL))
-                conn.executescript(self._dialect.adapt_ddl(_PUBLICATION_SCHEMA_SQL))
+                self._dialect.execute_ddl(conn, _SCHEMA_SQL)
+                self._dialect.execute_ddl(conn, _REGISTRY_SCHEMA_SQL)
+                self._dialect.execute_ddl(conn, _PUBLICATION_SCHEMA_SQL)
                 conn.execute(_ACTIVE_PUBLICATION_INDEX_SQL)
                 # Created from the constants, which are the latest shape, so it
                 # is already current and must not replay migrations that would
                 # add what it was born with.
-                conn.executescript(self._dialect.adapt_ddl(_SCHEMA_VERSION_SQL))
+                self._dialect.execute_ddl(conn, _SCHEMA_VERSION_SQL)
                 self._stamp_schema_version(conn, _LATEST_SCHEMA_VERSION)
                 conn.commit()
                 return
@@ -1399,12 +1404,15 @@ class ArtifactStore:
                 columns = {row["name"] for row in cursor.fetchall()}
 
                 if "tenant" not in columns:
-                    conn.execute("ALTER TABLE artifact_versions ADD COLUMN tenant TEXT")
-                    conn.execute("ALTER TABLE artifact_versions ADD COLUMN principal TEXT")
-                    conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_versions_tenant "
-                        "ON artifact_versions(tenant)"
-                    )
+                    self._dialect.begin_write(conn, "__schema__")
+                    # Looked at again under the lock: another process may have added it.
+                    if not self._dialect.column_exists(conn, "artifact_versions", "tenant"):
+                        conn.execute("ALTER TABLE artifact_versions ADD COLUMN tenant TEXT")
+                        conn.execute("ALTER TABLE artifact_versions ADD COLUMN principal TEXT")
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_versions_tenant "
+                            "ON artifact_versions(tenant)"
+                        )
                     conn.commit()
 
                 # Normalize tenant storage and (re)build the uniqueness index. Tenantless rows must
@@ -1453,60 +1461,62 @@ class ArtifactStore:
                     )
                 conn.commit()
 
-                cursor = conn.execute("PRAGMA table_info(artifact_names)")
-                name_columns = {row["name"] for row in cursor.fetchall()}
-
-                # Empty while another process's first boot has yet to create the table.
-                if name_columns and "tenant" not in name_columns:
-                    # Recreate the table: SQLite cannot change a primary key.
-                    conn.execute("ALTER TABLE artifact_names RENAME TO artifact_names_old")
-                    conn.execute("""
-                        CREATE TABLE artifact_names (
-                            name TEXT NOT NULL,
-                            artifact_id TEXT NOT NULL,
-                            version INTEGER NOT NULL,
-                            updated_at REAL NOT NULL,
-                            tenant TEXT NOT NULL DEFAULT '',
-                            PRIMARY KEY (tenant, name),
-                            FOREIGN KEY (artifact_id, version)
-                                REFERENCES artifact_versions(id, version)
+                # A database without the table has no names to rebuild.
+                if self._names_need_tenant(conn):
+                    self._dialect.begin_write(conn, "__schema__")
+                    # Looked at again under the lock: another process may have rebuilt it.
+                    if self._names_need_tenant(conn):
+                        # Recreate the table: SQLite cannot change a primary key.
+                        conn.execute("ALTER TABLE artifact_names RENAME TO artifact_names_old")
+                        conn.execute("""
+                            CREATE TABLE artifact_names (
+                                name TEXT NOT NULL,
+                                artifact_id TEXT NOT NULL,
+                                version INTEGER NOT NULL,
+                                updated_at REAL NOT NULL,
+                                tenant TEXT NOT NULL DEFAULT '',
+                                PRIMARY KEY (tenant, name),
+                                FOREIGN KEY (artifact_id, version)
+                                    REFERENCES artifact_versions(id, version)
+                            )
+                        """)
+                        # '' tenant (personal mode), not NULL, so the unique constraint holds.
+                        conn.execute("""
+                            INSERT INTO artifact_names
+                                (name, artifact_id, version, updated_at, tenant)
+                            SELECT name, artifact_id, version, updated_at, ''
+                            FROM artifact_names_old
+                        """)
+                        conn.execute("DROP TABLE artifact_names_old")
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name)"
                         )
-                    """)
-                    # '' tenant (personal mode), not NULL, so the unique constraint holds.
-                    conn.execute("""
-                        INSERT INTO artifact_names
-                            (name, artifact_id, version, updated_at, tenant)
-                        SELECT name, artifact_id, version, updated_at, ''
-                        FROM artifact_names_old
-                    """)
-                    conn.execute("DROP TABLE artifact_names_old")
-                    conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name)"
-                    )
                     conn.commit()
             else:
                 # Born at the latest shape, so it must not replay migrations that would
-                # add what the constants already gave it. Stamped with its tables, in one
-                # transaction: another process that found them without the stamp would
-                # take the store for the baseline.
-                _sqlite_script_locked(
+                # add what the constants already gave it. Every table and the stamp in one
+                # transaction, as on Postgres: another process that found the tables
+                # without the stamp would take the store for the baseline, and a boot
+                # that died part way would leave a store stamped current without what
+                # the rest adds (migration 10's index, which an existing store gets from
+                # the migration, after revoking duplicate active rows).
+                self._dialect.begin_write(conn, "__schema__")
+                self._dialect.execute_ddl(
                     conn,
                     _SCHEMA_SQL
-                    + _SCHEMA_VERSION_SQL
-                    + "INSERT OR IGNORE INTO schema_version (version, applied_at)"
-                    f" VALUES ({_LATEST_SCHEMA_VERSION}, {time.time()!r});",
+                    + _REGISTRY_SCHEMA_SQL
+                    + _PUBLICATION_SCHEMA_SQL
+                    + _ACTIVE_PUBLICATION_INDEX_SQL
+                    + ";"
+                    + _SCHEMA_VERSION_SQL,
                 )
+                self._stamp_schema_version(conn, _LATEST_SCHEMA_VERSION)
+                conn.commit()
 
-            # Registry and publication tables: idempotent, for fresh and existing databases alike.
-            script = _REGISTRY_SCHEMA_SQL + _PUBLICATION_SCHEMA_SQL
-            if not table_exists:
-                # Born current, so migration 10 will not add it. An existing database may
-                # hold duplicate active rows, which that migration revokes first.
-                script += _ACTIVE_PUBLICATION_INDEX_SQL + ";"
-            _sqlite_script_locked(conn, script)
-            if not self._dialect.column_exists(conn, "registry_audit", "from_artifact_id"):
+            if table_exists:
+                # Registry and publication tables, for a database from before them.
                 self._dialect.begin_write(conn, "__schema__")
-                # Looked at again under the lock: another process may have added it.
+                self._dialect.execute_ddl(conn, _REGISTRY_SCHEMA_SQL + _PUBLICATION_SCHEMA_SQL)
                 if not self._dialect.column_exists(conn, "registry_audit", "from_artifact_id"):
                     conn.execute("ALTER TABLE registry_audit ADD COLUMN from_artifact_id TEXT")
                 conn.commit()
@@ -1911,11 +1921,8 @@ class ArtifactStore:
         commit: two processes opening a database together would otherwise both apply
         migration N, and the loser of a non-idempotent one would fail.
         """
-        if self._dialect.supports_legacy_migration:
-            _sqlite_script_locked(conn, _SCHEMA_VERSION_SQL)
-        else:
-            conn.executescript(self._dialect.adapt_ddl(_SCHEMA_VERSION_SQL))
         self._dialect.begin_write(conn, "__schema__")
+        self._dialect.execute_ddl(conn, _SCHEMA_VERSION_SQL)
         row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
         current = row["version"] if row is not None and row["version"] is not None else None
 
