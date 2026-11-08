@@ -2185,7 +2185,8 @@ class Ledger:
             definition=[writer.program],
             computation_key=writer.computation_key,
         )
-        size, digest = archive.stat().st_size, vestigo.digests._read_digest(archive)
+        digest, _ = vestigo.digests._read_digest(archive)
+        size = archive.stat().st_size
         try:
             self.store.publish_blob_from_path(artifact_id, version, archive)
             stored = self.store.finalize_artifact(

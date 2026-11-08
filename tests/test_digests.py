@@ -31,7 +31,7 @@ def reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     seen: list[Path] = []
     real = vestigo.digests._read_digest
 
-    def counted(path: Path) -> str:
+    def counted(path: Path) -> tuple[str, str]:
         seen.append(Path(path))
         return real(path)
 
@@ -41,15 +41,30 @@ def reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 
 @pytest.fixture
 def stats(monkeypatch: pytest.MonkeyPatch) -> dict[Path, SimpleNamespace]:
-    """Stats to report in place of the filesystem's, by path: ctime can't be set."""
+    """Stats to report in place of the filesystem's, by path, for a file stat'ed by its
+    name or once opened: ctime can't be set."""
     fixed: dict[Path, SimpleNamespace] = {}
+    opened: dict[int, Path] = {}
+    real_open, real_fstat = os.open, os.fstat
 
     def stat(path, *args, **kwargs):
         if isinstance(path, (str, os.PathLike)) and Path(path) in fixed:
             return fixed[Path(path)]
         return _REAL_STAT(path, *args, **kwargs)
 
+    def open_(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        opened[fd] = Path(path)
+        return fd
+
+    def fstat(fd):
+        if (path := opened.get(fd)) in fixed:
+            return fixed[path]
+        return real_fstat(fd)
+
     monkeypatch.setattr(vestigo.digests.os, "stat", stat)
+    monkeypatch.setattr(vestigo.digests.os, "open", open_)
+    monkeypatch.setattr(vestigo.digests.os, "fstat", fstat)
     return fixed
 
 
@@ -201,7 +216,7 @@ def test_a_file_written_while_it_is_read_is_unsettled_and_not_kept(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def written_during(path: Path) -> str:
+    def written_during(path: Path) -> tuple[str, str]:
         reads.append(path)
         digest = real(path)
         if len(reads) == 1:
@@ -236,7 +251,7 @@ def test_a_file_is_judged_settled_by_the_clock_before_its_read(
     now = [time.time_ns()]
     real = vestigo.digests._read_digest
 
-    def slow(path: Path) -> str:
+    def slow(path: Path) -> tuple[str, str]:
         now[0] += _LATER_NS
         return real(path)
 
@@ -266,7 +281,7 @@ def test_settled_only_stops_at_the_first_file_that_changed(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def written_during(path: Path) -> str:
+    def written_during(path: Path) -> tuple[str, str]:
         reads.append(Path(path))
         _after_the_stop(reads)
         digest = real(path)
@@ -284,7 +299,7 @@ def test_settled_only_stops_at_the_first_file_that_changed(
     # One worker: the one that changed, and at most the one it took up meanwhile.
     assert len(reads) <= 4
     # What was read before it is not read again.
-    assert cache.cached_many(reads[:2]) == [real(path) for path in reads[:2]]
+    assert cache.cached_many(reads[:2]) == [real(path)[0] for path in reads[:2]]
 
 
 def test_what_was_read_before_a_failed_read_is_remembered(
@@ -296,7 +311,7 @@ def test_what_was_read_before_a_failed_read_is_remembered(
     real = vestigo.digests._read_digest
     reads: list[Path] = []
 
-    def failing_third(path: Path) -> str:
+    def failing_third(path: Path) -> tuple[str, str]:
         reads.append(Path(path))
         _after_the_stop(reads)
         if len(reads) == 3:
@@ -310,7 +325,7 @@ def test_what_was_read_before_a_failed_read_is_remembered(
 
     assert len(reads) <= 4
     # A relaunch after the fix reads what failed and what was not started, no more.
-    assert cache.cached_many(reads[:2]) == [real(path) for path in reads[:2]]
+    assert cache.cached_many(reads[:2]) == [real(path)[0] for path in reads[:2]]
 
 
 @pytest.mark.parametrize("where", ["explicit", "machine"])
@@ -480,6 +495,7 @@ def test_a_closed_cache_refuses_to_be_used(tmp_path: Path, cache: FileDigests):
     cache.close()
 
     for use in (
+        lambda: cache.now(),
         lambda: cache.cached(data),
         lambda: cache.digest(data),
         lambda: cache.prune(tmp_path, [data], walked_at=_walk_begins(cache)),
@@ -629,6 +645,69 @@ def test_a_fifo_is_refused_not_read(tmp_path: Path, cache: FileDigests):
     assert cache.cached(pipe) is None
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs here")
+def test_a_fifo_put_in_a_file_s_place_after_its_stat_is_refused_not_waited_on(
+    tmp_path: Path, cache: FileDigests
+):
+    """A walk's stats are as old as the walk: a FIFO in its place since blocks an open."""
+    data = tmp_path / "a.csv"
+    data.write_bytes(b"1,2\n")
+    walked = os.stat(data)
+    data.unlink()
+    os.mkfifo(data)
+    raised: list[BaseException | None] = []
+
+    def digest() -> None:
+        try:
+            cache.digest_many([data], stats=[walked])
+        except OSError as exc:
+            raised.append(exc)
+        else:
+            raised.append(None)
+
+    reader = threading.Thread(target=digest)
+    reader.start()
+    reader.join(5)
+    blocked = reader.is_alive()
+    if blocked:
+        with open(data, "wb"):  # the writer the blocked open waits for
+            pass
+        reader.join()
+    assert not blocked
+    [error] = raised
+    assert isinstance(error, OSError)
+    assert error.errno == errno.EINVAL
+
+
+def test_bytes_read_from_elsewhere_while_the_name_led_there_are_not_remembered(
+    tmp_path: Path, cache: FileDigests, monkeypatch: pytest.MonkeyPatch
+):
+    """A folder swapped aside for one holding other bytes, and back, during a read (a
+    deploy and its rollback): the file's own stat never moved, so only the file opened
+    shows it."""
+    folder = tmp_path / "data"
+    folder.mkdir()
+    data = folder / "f.bin"
+    data.write_bytes(b"AAAA")
+    real = vestigo.digests._read_digest
+
+    def swapped_while_read(path: Path) -> tuple[str, str]:
+        folder.rename(tmp_path / "aside")
+        folder.mkdir()
+        data.write_bytes(b"BBBB")
+        try:
+            return real(path)
+        finally:
+            data.unlink()
+            folder.rmdir()
+            (tmp_path / "aside").rename(folder)
+
+    monkeypatch.setattr(vestigo.digests, "_read_digest", swapped_while_read)
+
+    assert not cache.digest(data).settled
+    assert cache.cached(data) is None
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows has no read-only folders")
 @pytest.mark.parametrize("where", ["explicit", "machine"])
 def test_a_cache_that_cannot_be_opened_remembers_in_memory(
@@ -740,7 +819,7 @@ def test_a_walk_s_stats_are_not_taken_again(
     tmp_path: Path, cache: FileDigests, monkeypatch: pytest.MonkeyPatch
 ):
     """A caller that just walked has each file's stat: a hit costs no other, and a file
-    changed since the walk comes back unsettled."""
+    changed since the walk comes back unsettled (the file opened shows it)."""
     kept, moved = tmp_path / "kept.csv", tmp_path / "moved.csv"
     for path in (kept, moved):
         path.write_bytes(b"1,2\n")
@@ -759,7 +838,7 @@ def test_a_walk_s_stats_are_not_taken_again(
 
     assert hit == Digest(_sha(b"1,2\n"), settled=True)
     assert not changed.settled
-    assert taken == [moved]
+    assert kept not in taken
 
 
 def test_a_file_stamped_past_the_clock_is_not_remembered_and_said_once(

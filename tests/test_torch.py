@@ -1199,7 +1199,7 @@ def test_a_digest_is_cached_only_for_a_file_settled_before_its_read_began(
     now = [time.time_ns()]
     hashed = vestigo.digests._read_digest
 
-    def slow(path: Path) -> str:
+    def slow(path: Path) -> tuple[str, str]:
         now[0] += 10 * 10**9
         return hashed(path)
 
@@ -1239,7 +1239,7 @@ def test_a_file_written_while_it_is_hashed_is_refused(
 ):
     hashed = vestigo.digests._read_digest
 
-    def raced(path: Path) -> str:
+    def raced(path: Path) -> tuple[str, str]:
         read = hashed(path)
         Path(path).write_bytes(b"rowz")
         return read
@@ -1278,7 +1278,7 @@ def test_the_first_file_written_as_it_is_hashed_stops_the_hashing(
     hashed = vestigo.digests._read_digest
     reads = []
 
-    def raced(path: Path) -> str:
+    def raced(path: Path) -> tuple[str, str]:
         reads.append(path)
         if len(reads) > 1:
             time.sleep(0.2)  # slow, as a real read is: else the worker races ahead

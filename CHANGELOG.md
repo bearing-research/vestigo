@@ -37,6 +37,11 @@ All notable changes to vestigo are recorded here. The format follows
 - `keep_superseded` counts only versions that stay: a collectable current value the
   sweep takes no longer uses a slot, so `keep_superseded=1` keeps one earlier
   version (#76).
+- A digest read while the file's path led elsewhere (a folder swapped aside for one
+  holding other bytes, and back, during the read) is no longer remembered as the
+  file's: the file opened, not only the name, must hold the stat it was looked up
+  by. This holds for `FileDigests` and for verified `Path` inputs. A FIFO put in a
+  file's place after a walk's stat raises `OSError` instead of blocking the read (#75).
 - `ArtifactStore.garbage_collect` with `collectable`: a version the sweep keeps
   anyway (inside `min_idle_seconds`, or by the gap, pointer or folder rules, or
   used or held during the sweep) holds its inputs again, as a current value does,
