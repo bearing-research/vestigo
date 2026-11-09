@@ -466,18 +466,18 @@ class TestGarbageCollection:
         errors: list[BaseException] = []
         take, move = ArtifactStore._take, ArtifactStore._move_alias
 
-        def claiming_once_released(self, *args, **kwargs):
+        def pausing_before_each_claim(self, *args, **kwargs):
             selected.set()
             assert release_sweep.wait(30)
             return take(self, *args, **kwargs)
 
-        def aliasing_once_released(self, conn, **kwargs):
+        def pausing_before_aliasing(self, conn, **kwargs):
             aliasing.set()
             assert release_approval.wait(30)
             return move(self, conn, **kwargs)
 
-        monkeypatch.setattr(ArtifactStore, "_take", claiming_once_released)
-        monkeypatch.setattr(ArtifactStore, "_move_alias", aliasing_once_released)
+        monkeypatch.setattr(ArtifactStore, "_take", pausing_before_each_claim)
+        monkeypatch.setattr(ArtifactStore, "_move_alias", pausing_before_aliasing)
 
         def sweep() -> None:
             try:
