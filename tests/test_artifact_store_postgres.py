@@ -450,6 +450,60 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 
 
 class TestGarbageCollection:
+    def test_a_canonical_a_duplicate_points_at_while_the_claim_waits_stays(
+        self, store, monkeypatch
+    ):
+        """A duplicate's finalize locks its canonical and then points at it. A sweep's
+        claim of the canonical waited for that lock, then judged the pointer from its
+        snapshot from before it, found none, and deleted the canonical under it."""
+        canonical = store.create_artifact("c1", "dup", _spec())
+        store.write_blob("c1", canonical, b"bytes")
+        store.finalize_artifact("c1", canonical, "{}", row_count=0, byte_size=5)
+        duplicate = store.create_artifact("p1", "dup", _spec())
+        store.write_blob("p1", duplicate, b"bytes")
+
+        holding, release = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        supersede = ArtifactStore._supersede_duplicate
+
+        def pointing_once_the_claim_waits(self, conn, *args):
+            holding.set()
+            assert release.wait(30)
+            return supersede(self, conn, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_supersede_duplicate", pointing_once_the_claim_waits)
+
+        def finalize() -> None:
+            try:
+                store.finalize_artifact("p1", duplicate, "{}", row_count=0, byte_size=5)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def sweep() -> None:
+            try:
+                store.garbage_collect(collectable=[("c1", canonical)], collect_latest=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        finalizing = threading.Thread(target=finalize)
+        finalizing.start()
+        assert holding.wait(30)
+        sweeping = threading.Thread(target=sweep)
+        sweeping.start()
+        _until_it_waits(store, sweeping)
+        release.set()
+        finalizing.join()
+        sweeping.join()
+
+        assert errors == []
+        with store._get_connection() as conn:
+            row = conn.execute(
+                "SELECT superseded_by FROM artifact_versions WHERE id = 'p1'"
+            ).fetchone()
+        assert row["superseded_by"] == f"c1@v={canonical}"
+        assert store.get_artifact("c1", canonical) is not None
+        assert store.read_blob("p1", duplicate) == b"bytes"
+
     def test_the_current_value_survives_a_rebuild_in_flight(self, store):
         # The spare-the-current-value clause is a correlated NOT EXISTS; run
         # it on the dialect that has never seen it in a unit test.
