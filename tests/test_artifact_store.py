@@ -1990,7 +1990,8 @@ class TestListArtifactsSortAndSince:
 
 def _as_legacy_nullable_tenant_table(conn) -> None:
     """Rebuild ``artifact_versions`` in the pre-tenant shape: a nullable ``tenant`` and no
-    uniqueness index, as stores written before tenants were normalized have."""
+    uniqueness index, as stores written before tenants were normalized have, and stamped
+    as they were, before any migration."""
     conn.executescript(
         """
         DROP INDEX IF EXISTS idx_tenant_provenance_unique;
@@ -2015,6 +2016,7 @@ def _as_legacy_nullable_tenant_table(conn) -> None:
                tenant, principal
         FROM _av_old;
         DROP TABLE _av_old;
+        DELETE FROM schema_version;
         """
     )
 

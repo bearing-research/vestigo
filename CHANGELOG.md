@@ -12,9 +12,10 @@ All notable changes to vestigo are recorded here. The format follows
   `SqliteDialect.connect` waits out the process making the file, as only
   `ArtifactStore` did (#80).
 - A SQLite ledger whose 0.4.0 first boot was killed part way is repaired on open: the
-  name pointers' table, when the boot died before it, and the index of one active
-  publication per version, when it died after the stamp, revoking all but the oldest
-  live link as migration 10 does (#80).
+  versions' indexes and the name pointers' table, when the boot died inside its first
+  script, and the index of one active publication per version, when it died after the
+  stamp, revoking all but the oldest live link as migration 10 does. A read-only open
+  refuses such a ledger with `StoreSchemaMismatch` (#80).
 
 ## 0.5.0 - 2026-11-08
 

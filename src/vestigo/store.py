@@ -864,6 +864,12 @@ def _one_active_publication(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute(_ACTIVE_PUBLICATION_INDEX_SQL)
 
 
+def _first_boot_missing(conn: StoreConnection) -> frozenset[str]:
+    """What a SQLite first boot makes that this ledger lacks, by name."""
+    present = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+    return _FIRST_BOOT_OBJECTS - present
+
+
 def _nothing(conn: StoreConnection, dialect: SqlDialect) -> None:
     """A step whose work now belongs to a consumer; the version number is kept."""
     del conn, dialect
@@ -1094,10 +1100,8 @@ CREATE INDEX IF NOT EXISTS idx_state ON artifact_versions(state);
 
 -- Index for tenant queries (multi-tenant isolation)
 CREATE INDEX IF NOT EXISTS idx_versions_tenant ON artifact_versions(tenant);
-"""
 
-# Its own script too, for a ledger a killed first boot left without it.
-_NAMES_SCHEMA_SQL = """-- Name pointers: mutable, point to artifact versions
+-- Name pointers: mutable, point to artifact versions
 -- In multi-tenant mode, (tenant, name) is the unique key
 -- Note: tenant uses '' (empty string) instead of NULL for personal mode
 -- because SQLite's PRIMARY KEY doesn't treat NULLs as equal
@@ -1114,8 +1118,10 @@ CREATE TABLE IF NOT EXISTS artifact_names (
 -- Index for name lookup without tenant (personal mode)
 CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name);
 """
-
-_SCHEMA_SQL += _NAMES_SCHEMA_SQL
+# Every table and index _SCHEMA_SQL makes, and the index on active publications.
+_FIRST_BOOT_OBJECTS = frozenset(
+    re.findall(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX) IF NOT EXISTS (\w+)", _SCHEMA_SQL)
+) | {"idx_publications_active"}
 
 # The structural graph (ADR 002 §6): content-addressed nodes and their input ports,
 # under an identity scope derived from the tenant. Written by the application with
@@ -1554,9 +1560,7 @@ class ArtifactStore:
             if table_exists:
                 # Registry and publication tables, for a database from before them.
                 self._dialect.begin_write(conn, "__schema__")
-                self._dialect.execute_ddl(
-                    conn, _NAMES_SCHEMA_SQL + _REGISTRY_SCHEMA_SQL + _PUBLICATION_SCHEMA_SQL
-                )
+                self._dialect.execute_ddl(conn, _REGISTRY_SCHEMA_SQL + _PUBLICATION_SCHEMA_SQL)
                 if not self._dialect.column_exists(conn, "registry_audit", "from_artifact_id"):
                     conn.execute("ALTER TABLE registry_audit ADD COLUMN from_artifact_id TEXT")
                 conn.commit()
@@ -1565,14 +1569,14 @@ class ArtifactStore:
             # Everything from here is portable.
             self._apply_schema_migrations(conn)
 
-            # SQLite again: a v0.4.0 first boot stamped the store current before it made
-            # this index, so one killed in between never gets it from migration 10.
-            index = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE name = 'idx_publications_active'"
-            ).fetchone()
-            if table_exists and index is None:
+            # SQLite again. A v0.4.0 first boot ran its scripts one at a time and stamped
+            # the store current between them, so one killed part way lacks what came
+            # after, which no migration makes.
+            if table_exists and _first_boot_missing(conn):
                 self._dialect.begin_write(conn, "__schema__")
-                _one_active_publication(conn, self._dialect)
+                if _first_boot_missing(conn):  # Looked at again under the lock.
+                    self._dialect.execute_ddl(conn, _SCHEMA_SQL)
+                    _one_active_publication(conn, self._dialect)
                 conn.commit()
         finally:
             conn.close()
@@ -1952,10 +1956,21 @@ class ArtifactStore:
             if self._dialect.schema_exists(conn, "schema_version"):
                 row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
                 current = row["version"] if row is not None else None
+            missing = (
+                _first_boot_missing(conn)
+                if current is not None and self._dialect.supports_legacy_migration
+                else frozenset()
+            )
         finally:
             conn.close()
         if current is not None and current > _LATEST_SCHEMA_VERSION:
             raise _newer_schema_error(current)
+        if missing:
+            raise StoreSchemaMismatch(
+                f"The artifact store lacks {', '.join(sorted(missing))}, which a first boot "
+                "killed part way leaves out. This command only reads, so it does not repair "
+                "it. Back the store up, then open it once with a writer of this version."
+            )
         if current is None or current < _LATEST_SCHEMA_VERSION:
             raise StoreSchemaMismatch(
                 f"The artifact store's schema is version {current or _BASELINE_SCHEMA_VERSION}, "

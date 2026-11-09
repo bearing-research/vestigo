@@ -275,20 +275,23 @@ class SqliteDialect:
         # Handed across threads (acquired on one, closed on another) as on Postgres; never
         # used from two at once.
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
-        deadline = time.monotonic() + _WAL_RETRY_SECONDS
-        while True:
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-                break
-            except sqlite3.OperationalError as exc:
-                # On a file another process is still making, the switch fails at once with
-                # "database is locked", without the busy handler.
-                if "locked" not in str(exc) or time.monotonic() >= deadline:
-                    conn.close()
-                    raise
-                time.sleep(0.01)
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            deadline = time.monotonic() + _WAL_RETRY_SECONDS
+            while True:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    # On a file another process is still making, the switch fails at once
+                    # with SQLITE_BUSY, without the busy handler.
+                    if str(exc) != "database is locked" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            conn.close()
+            raise
         conn.row_factory = sqlite3.Row
         return conn
 

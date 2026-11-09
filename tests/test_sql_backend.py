@@ -26,7 +26,7 @@ from vestigo.sql_backend import (
     create_tables,
     translate_placeholders,
 )
-from vestigo.store import ArtifactStore
+from vestigo.store import _FIRST_BOOT_OBJECTS, ArtifactStore, StoreSchemaMismatch
 
 
 class TestTranslatePlaceholders:
@@ -978,20 +978,27 @@ def _schema_names(db_path: Path) -> set[str]:
         conn.close()
 
 
-def test_a_ledger_a_killed_0_4_first_boot_left_without_names_gets_them(tmp_path: Path):
-    """0.4.0 ran its first boot as several scripts; one killed inside the first left the
-    versions without the name pointers or a stamp, and no later open made them."""
+@pytest.mark.parametrize("stamped", [False, True], ids=["unstamped", "stamped"])
+def test_a_ledger_a_killed_0_4_first_boot_left_part_made_gets_the_rest(
+    tmp_path: Path, stamped: bool
+):
+    """0.4.0 ran its first script statement by statement. One killed inside it left the
+    versions without their later indexes and without the name pointers, and no open made
+    them, whether it found the store unstamped or another 0.4.0 boot had stamped it."""
     store = ArtifactStore(tmp_path / "ledger")
     store.close()
     conn = sqlite3.connect(store.db_path)
     try:
-        conn.executescript("DROP TABLE artifact_names; DROP TABLE schema_version;")
+        conn.executescript(
+            "DROP INDEX idx_provenance; DROP INDEX idx_state; DROP INDEX idx_versions_tenant;"
+            "DROP TABLE artifact_names;" + ("" if stamped else "DROP TABLE schema_version;")
+        )
     finally:
         conn.close()
 
     store = ArtifactStore(tmp_path / "ledger")
     try:
-        assert {"artifact_names", "idx_names_name"} <= _schema_names(store.db_path)
+        assert _FIRST_BOOT_OBJECTS <= _schema_names(store.db_path)
         version = store.create_artifact("x", "p")
         store.write_blob("x", version, b"x")
         store.finalize_artifact("x", version, "{}", None, 1)
@@ -1000,6 +1007,21 @@ def test_a_ledger_a_killed_0_4_first_boot_left_without_names_gets_them(tmp_path:
         assert resolved is not None and resolved.version == version
     finally:
         store.close()
+
+
+def test_a_read_only_open_refuses_a_ledger_stamped_current_but_part_made(tmp_path: Path):
+    """It would pass the stamp and then fail at a name lookup, "no such table"."""
+    ArtifactStore(tmp_path / "ledger").close()
+    conn = sqlite3.connect(tmp_path / "ledger" / "artifacts.sqlite")
+    try:
+        conn.execute("DROP TABLE artifact_names")
+    finally:
+        conn.close()
+
+    with pytest.raises(StoreSchemaMismatch, match="artifact_names"):
+        ArtifactStore(tmp_path / "ledger", read_only=True)
+    ArtifactStore(tmp_path / "ledger").close()
+    ArtifactStore(tmp_path / "ledger", read_only=True).close()
 
 
 def test_a_ledger_a_killed_0_4_first_boot_stamped_without_its_publication_index_gets_it(
@@ -1030,6 +1052,10 @@ def test_a_ledger_a_killed_0_4_first_boot_stamped_without_its_publication_index_
         live = conn.execute(
             "SELECT token FROM artifact_publications WHERE revoked_at IS NULL"
         ).fetchall()
+        withdrawn = conn.execute(
+            "SELECT value FROM registry_audit WHERE action = 'withdraw'"
+        ).fetchall()
     finally:
         conn.close()
     assert live == [("a" * 64,)]
+    assert withdrawn == [("b" * 64,)]
