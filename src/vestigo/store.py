@@ -19,7 +19,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
 from vestigo import uris
 from vestigo.graph import (
@@ -410,7 +410,7 @@ class ArtifactVersion:
         return parse_transform_spec(self.transform_spec)
 
     @property
-    def params(self) -> dict:
+    def params(self) -> dict[str, Any]:
         """The spec's params, or ``{}`` without a readable spec."""
         spec = self.spec
         return spec.params if spec is not None else {}
@@ -441,6 +441,107 @@ _VERSION_COLUMNS_AV = ", ".join("av." + field for field in _VERSION_FIELDS)
 def _version_from_row(row: Any) -> ArtifactVersion:
     """An ``ArtifactVersion`` from a row holding ``_VERSION_FIELDS``, by name."""
     return ArtifactVersion(**{field: row[field] for field in _VERSION_FIELDS})
+
+
+class AuditEntry(TypedDict):
+    """A ``registry_audit`` row: what :meth:`ArtifactStore.read_audit` and
+    :meth:`~ArtifactStore.read_events` return."""
+
+    seq: int
+    at: float
+    actor: str | None
+    action: str
+    name: str | None
+    alias: str | None
+    artifact_id: str | None
+    from_artifact_id: str | None
+    from_version: int | None
+    to_version: int | None
+    key: str | None
+    value: str | None
+    tenant: str
+
+
+class AliasChange(TypedDict):
+    """A protected alias's change, as approving or rejecting it returns it."""
+
+    name: str
+    alias: str
+    action: str  # "set" or "delete"
+    artifact_id: str | None
+    version: int | None
+    requested_by: str | None
+
+
+class PendingChange(AliasChange):
+    """A change waiting for approval, as :meth:`ArtifactStore.list_pending_changes` lists it."""
+
+    requested_at: float
+    tenant: str
+
+
+class RetentionRoot(TypedDict):
+    """A retention root: what :meth:`ArtifactStore.retain` made, or
+    :meth:`~ArtifactStore.retention_roots` lists."""
+
+    artifact_id: str
+    version: int
+    kind: str
+    holder: str
+    tenant: str
+    created_by: str | None
+    created_at: float
+
+
+class CollectedVersion(TypedDict):
+    """A version a dry run would collect."""
+
+    artifact_id: str
+    version: int
+    byte_size: int
+    last_used_at: float | None
+
+
+class GcResult(TypedDict):
+    """What :meth:`ArtifactStore.garbage_collect` did, or with ``dry_run`` would do."""
+
+    deleted_count: int
+    deleted_bytes: int
+    store_bytes: int
+    dry_run: bool
+    collected: NotRequired[list[CollectedVersion]]  # with dry_run only
+
+
+class StoreStats(TypedDict):
+    """Version counts by state, bytes, rows and names: :meth:`ArtifactStore.stats`."""
+
+    total_versions: int
+    ready_versions: int
+    building_versions: int
+    superseded_versions: int
+    failed_versions: int
+    total_bytes: int
+    total_rows: int
+    name_count: int
+
+
+class StoreUsage(StoreStats):
+    """:meth:`ArtifactStore.get_usage`: the stats, ids, unnamed versions and the span."""
+
+    unique_artifacts: int
+    unreferenced_count: int
+    oldest_artifact: float | None
+    newest_artifact: float | None
+
+
+class VerifyFinding(TypedDict):
+    """A version :meth:`ArtifactStore.verify_artifacts` found wrong."""
+
+    artifact_id: str
+    version: int
+    state: str
+    problem: str  # missing_blob, invalid_stream, row_count_mismatch or digest_mismatch
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -4285,7 +4386,7 @@ class ArtifactStore:
         artifact_id: str | None = None,
         limit: int = 100,
         tenant: object = _AUDIT_ALL_TENANTS,
-    ) -> list[dict]:
+    ) -> list[AuditEntry]:
         """Read registry audit entries, newest first; filters are ANDed.
 
         ``tenant`` defaults to ``ALL_TENANTS`` for the CLI and admin views.
@@ -4315,7 +4416,7 @@ class ArtifactStore:
             query += " ORDER BY seq DESC LIMIT ?"
             params.append(limit)
             cursor = conn.execute(query, params)
-            return [dict(row) for row in cursor.fetchall()]
+            return [cast(AuditEntry, dict(row)) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -4324,7 +4425,7 @@ class ArtifactStore:
         since: int = 0,
         limit: int = 100,
         tenant: object = _AUDIT_ALL_TENANTS,
-    ) -> list[dict]:
+    ) -> list[AuditEntry]:
         """Audit entries after ``since``, oldest first, for a follower.
 
         A follower pages by passing the last ``seq`` it saw; ``tenant`` scopes as in
@@ -4343,7 +4444,7 @@ class ArtifactStore:
                 params.append(tenant if tenant is not None else "")
             query += " ORDER BY seq ASC LIMIT ?"
             params.append(limit)
-            return [dict(row) for row in conn.execute(query, params).fetchall()]
+            return [cast(AuditEntry, dict(row)) for row in conn.execute(query, params).fetchall()]
         finally:
             conn.close()
 
@@ -4421,7 +4522,7 @@ class ArtifactStore:
         finally:
             conn.close()
 
-    def list_pending_changes(self, tenant: str | None = None) -> list[dict]:
+    def list_pending_changes(self, tenant: str | None = None) -> list[PendingChange]:
         """List alias changes awaiting approval (oldest first)."""
         conn = self._get_connection()
         try:
@@ -4432,7 +4533,7 @@ class ArtifactStore:
                 "WHERE tenant = ? ORDER BY requested_at",
                 (effective_tenant,),
             )
-            return [dict(row) for row in cursor.fetchall()]
+            return [cast(PendingChange, dict(row)) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -4443,7 +4544,7 @@ class ArtifactStore:
         tenant: str | None = None,
         actor: str | None = None,
         require_distinct_approver: bool = False,
-    ) -> dict:
+    ) -> AliasChange:
         """Apply a pending alias change (audited with the approver as actor) and return it.
 
         ``require_distinct_approver`` forbids the requester approving their own change.
@@ -4467,7 +4568,7 @@ class ArtifactStore:
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
-            entry = dict(pending)
+            entry = cast(AliasChange, dict(pending))
 
             if require_distinct_approver and actor is not None and entry["requested_by"] == actor:
                 conn.rollback()
@@ -4578,7 +4679,7 @@ class ArtifactStore:
         alias: str,
         tenant: str | None = None,
         actor: str | None = None,
-    ) -> dict:
+    ) -> AliasChange:
         """Discard a pending alias change (audited).
 
         Raises:
@@ -4612,7 +4713,7 @@ class ArtifactStore:
                 tenant=tenant,
             )
             conn.commit()
-            return dict(pending)
+            return cast(AliasChange, dict(pending))
         finally:
             conn.close()
 
@@ -5279,7 +5380,7 @@ class ArtifactStore:
         holder: str,
         tenant: str | None = None,
         created_by: str | None = None,
-    ) -> dict:
+    ) -> RetentionRoot:
         """Hold a version, its chain and what it requires against garbage collection.
 
         *kind* says what the holder is (``pin``); *holder* which one (a pin's reason).
@@ -5360,7 +5461,7 @@ class ArtifactStore:
         *,
         kind: str | None = None,
         tenant: str | None = None,
-    ) -> list[dict]:
+    ) -> list[RetentionRoot]:
         """Roots, oldest first, optionally for one version, one kind and one tenant."""
         clauses: list[str] = []
         params: list[Any] = []
@@ -5382,7 +5483,7 @@ class ArtifactStore:
         sql += " ORDER BY created_at ASC"
         conn = self._get_connection()
         try:
-            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+            return [cast(RetentionRoot, dict(row)) for row in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 
@@ -5400,7 +5501,7 @@ class ArtifactStore:
         exempt: Callable[[str], bool] | None = None,
         spare: Collection[tuple[str, int]] = (),
         dry_run: bool = False,
-    ) -> dict:
+    ) -> GcResult:
         """Collect the versions nothing needs, least recently used first.
 
         A candidate has no name or alias, is not in any protected chain
@@ -6061,7 +6162,9 @@ class ArtifactStore:
             and not (key[1] == tops[key[0]][0] and by_id[key[0]] < tops[key[0]][1])
         }
 
-    def get_usage(self, tenant: str | None = None, *, include_tenantless: bool = True) -> dict:
+    def get_usage(
+        self, tenant: str | None = None, *, include_tenantless: bool = True
+    ) -> StoreUsage:
         """Get artifact store usage statistics, optionally for one tenant.
 
         ``include_tenantless`` counts legacy tenantless rows as the tenant's: right
@@ -6188,7 +6291,7 @@ class ArtifactStore:
         finally:
             conn.close()
 
-    def verify_artifacts(self, tenant: str | None = None) -> list[dict]:
+    def verify_artifacts(self, tenant: str | None = None) -> list[VerifyFinding]:
         """Check every ready or superseded artifact's blob against its metadata.
 
         The blob must exist and match its recorded digest. A blob whose declared content
@@ -6216,7 +6319,7 @@ class ArtifactStore:
         finally:
             conn.close()
 
-        findings: list[dict] = []
+        findings: list[VerifyFinding] = []
         for row in rows:
             artifact_id, version = row["id"], row["version"]
             # A version a duplicate build overtook reads its canonical's bytes.
@@ -6366,7 +6469,7 @@ class ArtifactStore:
         *,
         include_tenantless: bool = True,
         exclude_id_prefix: str | None = None,
-    ) -> dict:
+    ) -> StoreStats:
         """Get artifact store statistics; ``include_tenantless`` as for :meth:`get_usage`.
 
         ``exclude_id_prefix`` leaves versions out of the version totals as

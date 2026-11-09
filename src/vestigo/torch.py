@@ -110,10 +110,18 @@ from vestigo.store import (
     ArtifactStore,
     ArtifactVersion,
     BuildLeaseLost,
+    GcResult,
     StagedVersion,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CollectResult(GcResult):
+    """What :meth:`Ledger.collect` did: the store's sweep, and the orphans it found."""
+
+    orphaned: int
+
 
 EXECUTOR = "vestigo.torch/train@v1"
 DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
@@ -1913,7 +1921,9 @@ class Ledger:
 
     # --- Retention ---
 
-    def collect(self, *, keep: int, min_idle_seconds: float = 0.0, dry_run: bool = False) -> dict:
+    def collect(
+        self, *, keep: int, min_idle_seconds: float = 0.0, dry_run: bool = False
+    ) -> CollectResult:
         """Delete the checkpoints no execution needs any more; ``garbage_collect``'s counts.
 
         Kept: of each unfinished execution, its newest *keep* checkpoints and the one

@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from vestigo.sql_backend import (
     SqlDialect,
@@ -114,6 +114,33 @@ CREATE TABLE IF NOT EXISTS build_console_chunks (
 """
 
 
+class BuildRecord(TypedDict):
+    """A build as :meth:`BuildState.to_dict` gives it for an API response."""
+
+    build_id: str
+    artifact_id: str
+    version: int
+    state: str
+    executor_ref: str
+    created_at: float
+    started_at: float | None
+    completed_at: float | None
+    error_message: str | None
+    error_code: str | None
+    input_byte_count: int | None
+    output_byte_count: int | None
+
+
+class BuildStats(TypedDict):
+    """Builds by state: :meth:`BuildStore.get_stats`."""
+
+    total: int
+    pending: int
+    building: int
+    ready: int
+    failed: int
+
+
 @dataclass
 class BuildState:
     """One build row. Timestamps are Unix seconds; ``input_uris`` and ``params`` serve pull mode."""
@@ -150,7 +177,7 @@ class BuildState:
         """Alias for tenant_id."""
         return self.tenant_id
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> BuildRecord:
         """Return the API response shape."""
         return {
             "build_id": self.build_id,
@@ -1320,7 +1347,7 @@ class BuildStore:
         finally:
             conn.close()
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> BuildStats:
         """Return build counts, total and by state."""
         conn = self._get_connection()
         try:
