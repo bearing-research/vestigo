@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-08
+
 ### Changed
 
 - The README is an overview: what vestigo does, a first example that counts a
@@ -22,7 +24,8 @@ All notable changes to vestigo are recorded here. The format follows
   Lookups go in batches, a file named twice is read once, prune compares in SQLite,
   and a closed instance refuses use. `prune(root, seen, walked_at=)` keeps a row
   remembered since the walk began (`walked_at` is the instance's `now()`, read
-  before it), as another launch on the same root writes. Verified `Path` inputs use it, as Strata's notebook will (#70, #72, #74).
+  before it), as another launch on the same root writes. Verified `Path` inputs
+  use it, as Strata's notebook will (#70, #72, #74).
 - `SqlDialect.execute_ddl(conn, script)` runs a schema script inside the open
   transaction, never committing it, on either backend: on SQLite `executescript`
   commits first, so `begin_write` before it held nothing. A dialect of one's own
