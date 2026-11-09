@@ -5859,12 +5859,20 @@ class ArtifactStore:
 
     @staticmethod
     def _held_now(conn: StoreConnection, artifact_id: str, version: int) -> bool:
-        """Whether a root, a publication or an alias names the version (names have a key)."""
+        """Whether a root, a publication, an alias or a pending alias change names the
+        version (names have a key).
+
+        An approval consumes its pending change and writes the alias in one commit, so
+        this sees one or the other; a request comes after the claim only by waiting on
+        its row lock, and then finds the version gone.
+        """
         row = conn.execute(
             "SELECT 1 FROM retention_roots WHERE artifact_id = ? AND version = ? "
             "UNION ALL SELECT 1 FROM artifact_publications WHERE artifact_id = ? AND version = ? "
-            "UNION ALL SELECT 1 FROM artifact_aliases WHERE artifact_id = ? AND version = ?",
-            (artifact_id, version) * 3,
+            "UNION ALL SELECT 1 FROM artifact_aliases WHERE artifact_id = ? AND version = ? "
+            "UNION ALL SELECT 1 FROM registry_pending "
+            "WHERE action = 'set' AND artifact_id = ? AND version = ?",
+            (artifact_id, version) * 4,
         ).fetchone()
         return row is not None
 
