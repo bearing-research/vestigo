@@ -5929,11 +5929,11 @@ class ArtifactStore:
         # the batch's commit would then silently roll back every row.
         conn.execute("SAVEPOINT gc_group")
         try:
-            if len(group) == 1:
-                taken = self._claim_alone(conn, group[0])
-            else:
-                taken = all(self._claim_unheld(conn, row) for row in group)
-                taken = taken and not self._needed_outside(conn, keys)
+            # The needs are read after every claim, not in it: on Postgres a claim
+            # judges its subqueries from a snapshot older than its wait for the row
+            # lock, and a pointer committed during that wait shows only in a later read.
+            taken = all(self._claim_unheld(conn, row) for row in group)
+            taken = taken and not self._needed_outside(conn, keys)
             if taken:
                 for artifact_id, version in keys:
                     self._delete_version_children(conn, artifact_id, version)
@@ -5952,45 +5952,6 @@ class ArtifactStore:
             )
         conn.execute("RELEASE SAVEPOINT gc_group")
         return taken
-
-    def _claim_alone(self, conn: StoreConnection, row: StoreRow) -> bool:
-        """``_claim_unheld`` and ``_needed_outside`` for one row, in one statement: the
-        sweep's common case."""
-        artifact_id, version = row["id"], row["version"]
-        # An edge into it from its tenant is a requirer created since the selection, or
-        # one that stayed. An id's top version goes only once no other version of it is
-        # left: a lower one that stayed keeps it, or the next create_artifact would reuse
-        # its number.
-        claimed = conn.execute(
-            f"""
-            UPDATE artifact_versions SET state = state
-            WHERE {_UNHELD_SQL}
-              AND NOT EXISTS (SELECT 1 FROM artifact_versions ptr
-                              WHERE ptr.superseded_by = ?)
-              AND NOT EXISTS (SELECT 1 FROM retention_edges e
-                              WHERE e.to_artifact_id = ? AND e.to_version = ?
-                                AND e.tenant = COALESCE(artifact_versions.tenant, ''))
-              AND (? < (SELECT MAX(o.version) FROM artifact_versions o WHERE o.id = ?)
-                   OR NOT EXISTS (SELECT 1 FROM artifact_versions o
-                                  WHERE o.id = ? AND o.version < ?))
-            """,
-            (
-                artifact_id,
-                version,
-                row["used"],
-                *(artifact_id, version) * 4,
-                f"{artifact_id}@v={version}",
-                artifact_id,
-                version,
-                version,
-                artifact_id,
-                artifact_id,
-                version,
-            ),
-        )
-        # On Postgres the claim read the holds from a snapshot older than its wait for
-        # the row lock; a hold that committed during the wait shows in a later read.
-        return claimed.rowcount == 1 and not self._held_now(conn, artifact_id, version)
 
     def _claim_unheld(self, conn: StoreConnection, row: StoreRow) -> bool:
         """Lock *row*'s version if nothing used or held it since it was selected."""
