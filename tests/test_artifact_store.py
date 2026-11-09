@@ -2272,6 +2272,19 @@ class TestTenantNormalization:
             store.set_tag("owned", 1, "k", "v", tenant="globex")
         assert "acme" not in str(excinfo.value)
 
+    def test_publish_answers_another_tenant_s_version_as_missing(self, store):
+        """publish_artifact named the owner of a ready version, and the state of a building
+        one, to a caller of another tenant."""
+        store.create_artifact("owned", "p", tenant="acme")
+        store.finalize_artifact("owned", 1, "{}", 1, 10)
+        store.create_artifact("building", "q", tenant="acme")  # still 'building'
+        for artifact_id in ("owned", "building", "nothing"):
+            with pytest.raises(ArtifactNotFoundError, match="not found") as excinfo:
+                store.publish_artifact(artifact_id, 1, tenant="globex")
+            assert "acme" not in str(excinfo.value)
+        with pytest.raises(ValueError, match="not readable"):
+            store.publish_artifact("building", 1, tenant="acme")
+
     def test_set_tag_rejects_non_readable(self, store):
         """Tags are only allowed on readable (ready/superseded) artifacts."""
         store.create_artifact("building", "p")  # still 'building'

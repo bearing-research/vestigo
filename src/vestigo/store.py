@@ -3865,25 +3865,22 @@ class ArtifactStore:
         revocation always withdraws the artifact.
 
         Raises:
-            ValueError: If the artifact does not exist, is not readable, or belongs
-                to a different tenant.
+            ArtifactNotFoundError: The artifact does not exist or belongs to another
+                tenant; one error for both.
+            ValueError: The artifact is not readable.
         """
         effective_tenant = tenant if tenant is not None else ""
         conn = self._get_connection()
         try:
             # Locked, so the version cannot be swept or deleted under the new link.
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
-            if row is None:
-                raise ValueError(f"Artifact {artifact_id}@v={version} not found")
+            # Only the tenant's own versions, tenantless ones only tenantless, and before
+            # the state, which would otherwise describe another tenant's artifact.
+            if row is None or (row["tenant"] or "") != effective_tenant:
+                raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
             if row["state"] not in _RESULT_STATES:
                 raise ValueError(
                     f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                )
-            artifact_tenant = row["tenant"] or ""
-            if artifact_tenant != effective_tenant:
-                raise ValueError(
-                    f"Artifact {artifact_id}@v={version} belongs to tenant "
-                    f"{artifact_tenant!r}, cannot publish in tenant {effective_tenant!r}"
                 )
 
             existing = conn.execute(
