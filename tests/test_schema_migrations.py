@@ -196,6 +196,25 @@ class TestAReadOnlyOpen:
         assert _version(db_path) == 8
         assert _schema(db_path) == before
 
+    def test_a_store_one_migration_behind_is_refused_as_older_not_part_made(self, tmp_path):
+        """The newest migration's index is missing because the migration has not run,
+        not because a first boot died: the refusal says the store is older."""
+        db_path = ArtifactStore(tmp_path / "old").db_path
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP INDEX idx_versions_superseded_by")
+        conn.execute("UPDATE schema_version SET version = ?", (_LATEST_SCHEMA_VERSION - 1,))
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(
+            StoreSchemaMismatch, match=f"version {_LATEST_SCHEMA_VERSION - 1}, older"
+        ):
+            ArtifactStore(tmp_path / "old", read_only=True)
+
+        ArtifactStore(tmp_path / "old").close()
+        ArtifactStore(tmp_path / "old", read_only=True).close()
+        assert ("idx_versions_superseded_by",) in {(n,) for n, _ in _schema(db_path)}
+
     def test_a_missing_store_is_refused_before_anything_is_created(self, tmp_path):
         target = tmp_path / "nope" / "artifacts"
 
