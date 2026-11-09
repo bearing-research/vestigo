@@ -475,7 +475,6 @@ class S3BlobStore(BlobStore):
 
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self._anonymous = anonymous
         self.staging_dir = staging_dir
 
         session: dict[str, Any] = {}
@@ -723,7 +722,7 @@ class GCSBlobStore(BlobStore):
     """Google Cloud Storage blob storage through google-cloud-storage.
 
     Keys are ``{prefix}/{artifact_id}@v={version}.arrow``. The one client reads, writes
-    and signs, on a service-account key, Application Default Credentials, or none.
+    and signs, on a credentials file, Application Default Credentials, or none.
     """
 
     def __init__(
@@ -737,9 +736,10 @@ class GCSBlobStore(BlobStore):
     ):
         """Initialize the GCS store.
 
-        ``credentials_json`` is a service-account key: a file path, or the key's JSON
-        itself, which is what a container's environment holds. ``endpoint_override``
-        is an emulator's URL. ``staging_dir`` is ``BlobStore.staging_dir``.
+        ``credentials_json`` is any credentials file ``GOOGLE_APPLICATION_CREDENTIALS``
+        accepts: its path, or its JSON itself, which is what a container's environment
+        holds. ``endpoint_override`` is an emulator's URL. ``staging_dir`` is
+        ``BlobStore.staging_dir``.
 
         Raises:
             google.auth.exceptions.DefaultCredentialsError: see ``_gcs_credentials``.

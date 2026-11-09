@@ -156,8 +156,9 @@ def _ancestor_of(input_uri: str, recorded: object) -> tuple[str, int] | None:
     """The ``(id, version)`` an input edge names, or None if it is not one.
 
     Edges are ``{input_uri: recorded_version}``: the uri may be an artifact or a
-    name, the value is the version that answered. Must resolve the same way as the
-    lineage walk in ``services.artifact``, or retention and lineage disagree.
+    name, the value is the version that answered. Retention (``_Holds.read_by``) and
+    lineage (``ancestor_transform_specs``) both resolve edges here; a walk that resolved
+    them otherwise would let the two disagree.
     """
     if not isinstance(recorded, str):
         return None
@@ -390,7 +391,7 @@ class ArtifactVersion:
 
     id: str
     version: int
-    state: str  # "building" | "ready" | "failed"
+    state: str  # "building" | "ready" | "superseded" | "failed"
     provenance_hash: str
     schema_json: str | None = None
     row_count: int | None = None
@@ -1384,8 +1385,8 @@ CREATE TABLE IF NOT EXISTS store_upgrades (
 -- Bytes uploaded ahead of the import that names them (PUT
 -- /v1/artifacts/import/blobs/{sha256}). Per tenant: a digest is no proof of
 -- holding the bytes, since a publication's page prints it, so one tenant's
--- upload must never satisfy another's import. The blob stores cannot list
--- keys, so this is also how an upload that is never imported is found again.
+-- upload must never satisfy another's import. The BlobStore interface lists
+-- no keys, so this is also how an upload that is never imported is found again.
 CREATE TABLE IF NOT EXISTS import_staging (
     tenant TEXT NOT NULL DEFAULT '',
     content_sha256 TEXT NOT NULL,
@@ -1395,11 +1396,10 @@ CREATE TABLE IF NOT EXISTS import_staging (
 );
 """
 
-# Legacy migration: tenant columns for existing tables.
-# Bound on finalize_canonical_together's retry. A conflict means a competing
-# writer committed a ready row with our provenance; one retry supersedes it
-# and wins. More than two rounds means sustained contention on a single
-# provenance, where failing loudly beats spinning.
+# Bound on the retry of finalize_canonical_together and finalize_and_set_name. A
+# conflict means a competing writer committed a ready row with our provenance; one
+# retry supersedes it and wins. More than two rounds means sustained contention on
+# a single provenance, where failing loudly beats spinning.
 _CANONICAL_PROMOTE_ATTEMPTS = 3
 
 
@@ -2984,8 +2984,9 @@ class ArtifactStore:
         """On Postgres, hold the audit lock until commit, so ``seq`` order is commit order.
 
         A ``BIGSERIAL`` is drawn at insert, so without it two writers can commit out of order and a
-        follower of ``read_events`` skips the earlier one for good. Take it before a transaction's
-        first write: waiting for it while holding a row lock can deadlock. SQLite already
+        follower of ``read_events`` skips the earlier one for good. Lock order is version rows,
+        then this lock, then name rows, as ``delete_artifact`` and ``_lock_target`` take them: a
+        writer taking them in another order can deadlock against one of those. SQLite already
         serializes writers.
         """
         if self._dialect.name != "sqlite":
@@ -4892,17 +4893,12 @@ class ArtifactStore:
                 artifact = _version_from_row(row)
 
                 input_version_used = f"{artifact_id}@v={version}"
-                if artifact.input_versions:
-                    try:
-                        input_vers = json.loads(artifact.input_versions)
-                        exact_uri = uris.artifact_uri(artifact_id, version)
-                        # Match the exact dependency entry instead of substring prefixes.
-                        for uri, ver in input_vers.items():
-                            if uri == exact_uri or ver == input_version_used or ver == exact_uri:
-                                input_version_used = ver
-                                break
-                    except json.JSONDecodeError:
-                        pass
+                exact_uri = uris.artifact_uri(artifact_id, version)
+                # Match the exact dependency entry instead of substring prefixes.
+                for uri, ver in json.loads(row["input_versions"]).items():
+                    if uri == exact_uri or ver == input_version_used or ver == exact_uri:
+                        input_version_used = ver
+                        break
 
                 results.append((artifact, input_version_used))
 
@@ -6346,11 +6342,7 @@ class ArtifactStore:
             owner_id, owner_version = blob_owner or (artifact_id, version)
             attempt = attempts.get((owner_id, owner_version))
             blob_id = attempt_blob_id(owner_id, attempt) if attempt else owner_id
-            try:
-                content_type = _declared_content_type(row["transform_spec"])
-            except ValueError:
-                # An unreadable spec declares nothing; one bad row must not end the sweep.
-                content_type = ""
+            content_type = _declared_content_type(row["transform_spec"])
             validate = _VALIDATORS.get(content_type)
             recorded = row["content_sha256"]
             data: bytes | None = None

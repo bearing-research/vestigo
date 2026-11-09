@@ -171,7 +171,7 @@ def one(cursor: StoreCursor) -> StoreRow:
 
 
 class StoreConnection(Protocol):
-    """The connection surface ``artifact_store`` uses, shaped like ``sqlite3.Connection``.
+    """The connection surface ``store`` uses, shaped like ``sqlite3.Connection``.
 
     :class:`_PostgresConnection` adapts psycopg to it, so the store's call sites stay unchanged.
     """
@@ -189,7 +189,7 @@ class StoreConnection(Protocol):
 
 
 class SqlDialect(Protocol):
-    """The parts of ``artifact_store`` that differ between databases.
+    """The parts of ``store`` that differ between databases.
 
     Each member has a concrete divergence behind it; everything else is portable SQL.
     """
@@ -289,9 +289,10 @@ class SqlDialect(Protocol):
     def begin_write(self, conn: StoreConnection, key: str) -> None:
         """Open a transaction that serializes writers contending on ``key``.
 
-        Used where a read-modify-write must not race: ``create_artifact`` computing
-        ``MAX(version)+1``, and ``finalize_canonical_together``. ``key`` lets a backend
-        lock narrowly rather than globally.
+        Opened by any write whose read-modify-write must not race: the store's version
+        and name writes, the build store's lease and attempt writes, releases, and
+        schema init. ``key`` names what the write contends on, so a backend can lock
+        narrowly rather than globally.
         """
         ...
 
