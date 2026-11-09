@@ -2603,11 +2603,14 @@ class ArtifactStore:
                     INSERT INTO artifact_versions
                         (id, version, state, provenance_hash, created_at,
                          transform_spec, input_versions, tenant, principal, minted,
-                         computation_key)
-                    VALUES (?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?)
+                         computation_key, definition_id)
+                    VALUES (?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?,
+                        (SELECT definition_id FROM artifact_versions
+                         WHERE id = ? AND version = ?))
                     """,
                     # No release_id: a promote is no release, and readers of one (its
                     # bundle, the checkpoints a sweep may collect) would count the copy.
+                    # The node that produced the source produced the copy.
                     (
                         artifact_id,
                         new_version,
@@ -2619,6 +2622,8 @@ class ArtifactStore:
                         source.principal,
                         row["was_minted"],
                         source.computation_key,
+                        artifact_id,
+                        version,
                     ),
                 )
                 # What the source requires (a folder's files), the copy requires: retention
@@ -2944,16 +2949,25 @@ class ArtifactStore:
                         ),
                     )
                     if cursor.rowcount == 0:
-                        # Another process may have finalized it.
+                        # Another process finalized it, perhaps into a pointer: answer as a
+                        # retry would, the canonical named. A row never returns to
+                        # building, so the retry does not come back here.
                         conn.rollback()
                         if fence is not None:
                             raise BuildLeaseLost(
                                 f"{artifact_id}@v={version} was finalized by another attempt"
                             )
-                        artifact = self.get_artifact(artifact_id, version)
-                        if artifact and artifact.state == "ready" and name:
-                            self.set_name(name, artifact_id, version, tenant)
-                        return artifact
+                        return self.finalize_and_set_name(
+                            artifact_id,
+                            version,
+                            schema_json,
+                            row_count,
+                            byte_size,
+                            name,
+                            tenant,
+                            content_sha256=digest,
+                            blob_attempt=blob_attempt,
+                        )
 
                     if name:
                         self._set_name_in_connection(conn, name, artifact_id, version, tenant)
