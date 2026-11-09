@@ -7,6 +7,7 @@ is proven by behaviour rather than rendered SQL. Requires Docker and the ``postg
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 import threading
@@ -19,7 +20,9 @@ import pytest
 
 from vestigo.build_store import BuildStore
 from vestigo.graph import Edge, NodeSpec, Traversal
+from vestigo.operations import AuditEvent, InsertAuditEvent
 from vestigo.provenance import TransformSpec
+from vestigo.releases import ReleaseStore
 from vestigo.sql_backend import SERVER_THREAD_LIMIT, PostgresDialect, advisory_lock_id
 from vestigo.store import (
     _LATEST_SCHEMA_VERSION,
@@ -430,7 +433,77 @@ class TestFindReadyAndSetName:
         assert store.get_artifact("a1", first).state == "superseded"
 
 
+def _until_it_waits(store, thread: threading.Thread) -> None:
+    """Return once *thread* waits on a lock another session holds, or has ended."""
+    probe = store._get_connection()
+    deadline = time.monotonic() + 30
+    try:
+        while thread.is_alive():
+            assert time.monotonic() < deadline, "it never came to wait on the lock"
+            row = probe.execute("SELECT count(*) AS n FROM pg_locks WHERE NOT granted").fetchone()
+            probe.commit()
+            if row["n"]:
+                return
+            thread.join(timeout=0.05)
+    finally:
+        probe.close()
+
+
 class TestGarbageCollection:
+    def test_a_canonical_a_duplicate_points_at_while_the_claim_waits_stays(
+        self, store, monkeypatch
+    ):
+        """A duplicate's finalize locks its canonical and then points at it. A sweep's
+        claim of the canonical waited for that lock, then judged the pointer from its
+        snapshot from before it, found none, and deleted the canonical under it."""
+        canonical = store.create_artifact("c1", "dup", _spec())
+        store.write_blob("c1", canonical, b"bytes")
+        store.finalize_artifact("c1", canonical, "{}", row_count=0, byte_size=5)
+        duplicate = store.create_artifact("p1", "dup", _spec())
+        store.write_blob("p1", duplicate, b"bytes")
+
+        holding, release = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        supersede = ArtifactStore._supersede_duplicate
+
+        def pointing_once_the_claim_waits(self, conn, *args):
+            holding.set()
+            assert release.wait(30)
+            return supersede(self, conn, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_supersede_duplicate", pointing_once_the_claim_waits)
+
+        def finalize() -> None:
+            try:
+                store.finalize_artifact("p1", duplicate, "{}", row_count=0, byte_size=5)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def sweep() -> None:
+            try:
+                store.garbage_collect(collectable=[("c1", canonical)], collect_latest=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        finalizing = threading.Thread(target=finalize)
+        finalizing.start()
+        assert holding.wait(30)
+        sweeping = threading.Thread(target=sweep)
+        sweeping.start()
+        _until_it_waits(store, sweeping)
+        release.set()
+        finalizing.join()
+        sweeping.join()
+
+        assert errors == []
+        with store._get_connection() as conn:
+            row = conn.execute(
+                "SELECT superseded_by FROM artifact_versions WHERE id = 'p1'"
+            ).fetchone()
+        assert row["superseded_by"] == f"c1@v={canonical}"
+        assert store.get_artifact("c1", canonical) is not None
+        assert store.read_blob("p1", duplicate) == b"bytes"
+
     def test_the_current_value_survives_a_rebuild_in_flight(self, store):
         # The spare-the-current-value clause is a correlated NOT EXISTS; run
         # it on the dialect that has never seen it in a unit test.
@@ -1421,6 +1494,122 @@ class TestWriterSerialization:
         assert errors == []
         assert store.get_artifact("h1", version) is None
 
+    def test_accepting_a_release_while_a_hit_names_its_holder_does_not_deadlock(
+        self, store, monkeypatch
+    ):
+        """A hit holds the holder's row and then takes the audit lock to name it; an audited
+        acceptance took the audit lock and then superseded the holder. Each waited on the
+        other and Postgres aborted one."""
+        held = store.create_artifact("held", "prov-out", _spec())
+        store.finalize_artifact("held", held, "{}", row_count=0, byte_size=0)
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "checkpoint")
+        out = store.create_artifact("out", "prov-out", _spec(), release_id=release.release_id)
+        store.write_blob("out", out, b"w")
+        staged = StagedVersion("out", out, "{}", None, 1, hashlib.sha256(b"w").hexdigest())
+
+        holding_row, release_hit = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        set_name = store._set_name_in_connection
+
+        def naming_after_the_row_lock(conn, *args, **kwargs):
+            holding_row.set()
+            assert release_hit.wait(30)
+            return set_name(conn, *args, **kwargs)
+
+        monkeypatch.setattr(store, "_set_name_in_connection", naming_after_the_row_lock)
+
+        def hit() -> None:
+            try:
+                store.find_ready_and_set_name("prov-out", "latest")
+            except BaseException as exc:
+                errors.append(exc)
+
+        def accept() -> None:
+            try:
+                releases.accept(
+                    release.release_id,
+                    [staged],
+                    [InsertAuditEvent(AuditEvent("release.accept", "alice"))],
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        hitting = threading.Thread(target=hit)
+        hitting.start()
+        assert holding_row.wait(30)
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        _until_it_waits(store, accepting)
+        release_hit.set()
+        hitting.join()
+        accepting.join()
+
+        assert errors == []
+        assert store.get_artifact("held", held).state == "superseded"
+        assert releases.get(release.release_id).state == "accepted"
+
+    def test_a_final_release_failing_its_placeholder_while_it_is_deleted_does_not_deadlock(
+        self, store, monkeypatch
+    ):
+        """A final release with no outputs fails its build's placeholder row. It did so
+        after an audited operation took the audit lock, while a delete of the placeholder
+        holds its row and then waits for that lock."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+
+        audited, release_accept = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        run = releases._run
+
+        def pausing_after_the_audit_lock(*args, **kwargs):
+            run(*args, **kwargs)
+            audited.set()
+            assert release_accept.wait(30)
+
+        monkeypatch.setattr(releases, "_run", pausing_after_the_audit_lock)
+
+        def accept() -> None:
+            try:
+                releases.accept(
+                    release.release_id,
+                    [],
+                    [InsertAuditEvent(AuditEvent("release.accept", "alice"))],
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def delete() -> None:
+            try:
+                store.delete_artifact("target", target)
+            except BaseException as exc:
+                errors.append(exc)
+
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        assert audited.wait(30)
+        deleting = threading.Thread(target=delete)
+        deleting.start()
+        _until_it_waits(store, deleting)
+        release_accept.set()
+        accepting.join()
+        deleting.join()
+
+        assert errors == []
+        assert releases.get(release.release_id).state == "accepted"
+
     def test_duplicate_provenance_finalize_is_idempotent(self, store):
         # The second finalize finds the first by provenance before it writes and
         # returns it; the index's rejection is TestProvenanceRaces' case.
@@ -1433,6 +1622,56 @@ class TestWriterSerialization:
         assert result is not None
         found = store.find_by_provenance("same-prov")
         assert found is not None
+
+    def test_an_abandon_during_an_acceptance_waits_for_it(self, store, monkeypatch):
+        """An acceptance read the release unsettled under the build's key; an abandon,
+        under none, settled it and answered True, and the acceptance then overwrote it."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+
+        checking, release_accept = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        abandoned: list[bool] = []
+        check_outputs = releases._check_outputs
+
+        def pausing_under_the_build_key(*args, **kwargs):
+            checking.set()
+            assert release_accept.wait(30)
+            return check_outputs(*args, **kwargs)
+
+        monkeypatch.setattr(releases, "_check_outputs", pausing_under_the_build_key)
+
+        def accept() -> None:
+            try:
+                releases.accept(release.release_id, [], [])
+            except BaseException as exc:
+                errors.append(exc)
+
+        def abandon() -> None:
+            try:
+                abandoned.append(releases.abandon(release.release_id, "a1"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        assert checking.wait(30)
+        abandoning = threading.Thread(target=abandon)
+        abandoning.start()
+        _until_it_waits(store, abandoning)
+        release_accept.set()
+        accepting.join()
+        abandoning.join()
+
+        assert errors == []
+        assert releases.get(release.release_id).state == "accepted"
+        assert abandoned == [False]
 
 
 class TestSchemaMigrations:

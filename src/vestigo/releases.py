@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 KINDS = ("checkpoint", "final")
 UNSETTLED = ("preparing", "prepared")
+_UNSETTLED_SQL = f"state IN ({', '.join(f"'{state}'" for state in UNSETTLED)})"
 HEAD_ROOT_KIND = "head"
 """The retention root kind a reference holds its release's outputs under."""
 
@@ -359,7 +360,7 @@ class ReleaseStore:
             earlier = one(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM build_releases WHERE build_id = ? AND kind = ? "
-                    "AND sequence < ? AND state IN ('preparing', 'prepared')",
+                    f"AND sequence < ? AND {_UNSETTLED_SQL}",
                     (release.build_id, release.kind, release.sequence),
                 )
             )
@@ -371,14 +372,9 @@ class ReleaseStore:
                 )
             self._check_outputs(conn, release, staged, sizes)
             try:
-                self._run(
-                    conn,
-                    operations,
-                    release.tenant,
-                    release.release_id,
-                    now,
-                    accepting=release.release_id,
-                )
+                # Version rows before the audit lock an audited operation takes, as the
+                # store orders them: a hit holding a holder's row while it waits for that
+                # lock would otherwise deadlock with this supersede of the holder.
                 self._artifacts._promote_staged(conn, list(staged), now)
                 if release.kind == "final":
                     target = one(
@@ -387,25 +383,11 @@ class ReleaseStore:
                             (release.build_id,),
                         )
                     )
-                    if not self._builds.complete_attempt_within(
-                        conn,
-                        release.build_id,
-                        release.attempt,
-                        artifact_id=staged[0].artifact_id if staged else None,
-                        version=staged[0].version if staged else None,
-                        now=now,
-                    ):
-                        # Every build writer here takes the build's key, but a consumer's
-                        # own transaction need not: the release must not outlive the build.
-                        conn.rollback()
-                        self._settle(release_id, "rejected")
-                        raise ReleaseRejected(
-                            f"build {release.build_id} is no longer building under attempt "
-                            f"{release.attempt}"
-                        )
                     # A build made before its outputs existed targets a placeholder row;
                     # once the build points at a real output (or ends with none) the
                     # placeholder is a failed row for GC, not a building one forever.
+                    # A version row too: before the audit lock, which a delete of the
+                    # placeholder takes after its row.
                     if not staged or (target["artifact_id"], target["version"]) != (
                         staged[0].artifact_id,
                         staged[0].version,
@@ -415,6 +397,30 @@ class ReleaseStore:
                             "WHERE id = ? AND version = ? AND state = 'building'",
                             (target["artifact_id"], target["version"]),
                         )
+                self._run(
+                    conn,
+                    operations,
+                    release.tenant,
+                    release.release_id,
+                    now,
+                    accepting=release.release_id,
+                )
+                if release.kind == "final" and not self._builds.complete_attempt_within(
+                    conn,
+                    release.build_id,
+                    release.attempt,
+                    artifact_id=staged[0].artifact_id if staged else None,
+                    version=staged[0].version if staged else None,
+                    now=now,
+                ):
+                    # Every build writer here takes the build's key, but a consumer's
+                    # own transaction need not: the release must not outlive the build.
+                    conn.rollback()
+                    self._settle(release_id, "rejected")
+                    raise ReleaseRejected(
+                        f"build {release.build_id} is no longer building under attempt "
+                        f"{release.attempt}"
+                    )
                 conn.execute(
                     "UPDATE build_releases SET state = 'accepted', settled_at = ? "
                     "WHERE release_id = ?",
@@ -441,14 +447,13 @@ class ReleaseStore:
         """
         conn = self._connect()
         try:
-            self._own(conn, release_id, attempt)
-            cursor = conn.execute(
-                "UPDATE build_releases SET state = 'abandoned', settled_at = ? "
-                "WHERE release_id = ? AND state IN ('preparing', 'prepared')",
-                (self._clock(), release_id),
-            )
+            release = self._own(conn, release_id, attempt)
+            # The build's key, as an acceptance holds it from its read of the release to
+            # its commit: unheld, this settled a release the acceptance then overwrote.
+            self._dialect.begin_write(conn, release.build_id)
+            settled = self._settle_on(conn, release_id, "abandoned")
             conn.commit()
-            return cursor.rowcount > 0
+            return settled
         finally:
             conn.close()
 
@@ -492,7 +497,7 @@ class ReleaseStore:
             unsettled = one(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM build_releases "
-                    "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
+                    f"WHERE build_id = ? AND attempt <> ? AND {_UNSETTLED_SQL}",
                     (build_id, attempt),
                 )
             )["n"]
@@ -735,14 +740,19 @@ class ReleaseStore:
         """Settle an unsettled release; one a retry settled meanwhile is left as it is."""
         conn = self._connect()
         try:
-            conn.execute(
-                "UPDATE build_releases SET state = ?, settled_at = ? "
-                "WHERE release_id = ? AND state IN ('preparing', 'prepared')",
-                (state, self._clock(), release_id),
-            )
+            self._settle_on(conn, release_id, state)
             conn.commit()
         finally:
             conn.close()
+
+    def _settle_on(self, conn: StoreConnection, release_id: str, state: str) -> bool:
+        """``_settle`` on the caller's transaction; whether the release was unsettled."""
+        cursor = conn.execute(
+            "UPDATE build_releases SET state = ?, settled_at = ? "
+            f"WHERE release_id = ? AND {_UNSETTLED_SQL}",
+            (state, self._clock(), release_id),
+        )
+        return cursor.rowcount > 0
 
     def _sizes(self, staged: Sequence[StagedVersion]) -> dict[tuple[str, int], int | None]:
         """Each output's stored size, None where it has no bytes."""
@@ -809,7 +819,8 @@ class ReleaseStore:
         name before it is accepted.
         """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
-            # Before the transaction's first write, as the audit lock requires.
+            # Before the operations' own writes; after any version rows, as the store
+            # takes them (an acceptance promotes first).
             self._artifacts._serialize_audit(conn)
         asserted: dict[str, int] = {}
         for op in operations:

@@ -435,12 +435,53 @@ def _s3_absent(exc: BaseException) -> bool:
     return response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
 
 
-class S3BlobStore(BlobStore):
+class _ObjectBlobStore(BlobStore):
+    """What the object-store backends share: keys under ``prefix``, and writes staged
+    locally whole, so a failed write never uploads."""
+
+    prefix: str
+    _staging_prefix: str
+
+    def _object_key(self, artifact_id: str, version: int) -> str:
+        blob_key = self._blob_key(artifact_id, version)
+        return f"{self.prefix}/{blob_key}" if self.prefix else blob_key
+
+    @abstractmethod
+    def _upload_from_path(self, key: str, source_path: Path) -> None:
+        """Upload *source_path* whole to *key*."""
+        ...
+
+    def open_blob_writer(self, artifact_id: str, version: int) -> AbstractContextManager[BinaryIO]:
+        """Open a streaming writer, staged locally so a failed write never uploads: the
+        SDKs upload from a file, not from a stream the caller writes."""
+        key = self._object_key(artifact_id, version)
+        return self._staged_local_writer(
+            lambda staged: self._upload_from_path(key, staged),
+            prefix=self._staging_prefix,
+            staging_dir=self.staging_dir,
+        )
+
+    def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
+        """Stream ``source_path`` straight to the object, skipping the local staging copy."""
+        self._upload_from_path(self._object_key(artifact_id, version), source_path)
+
+    def blob_exists(self, artifact_id: str, version: int) -> bool:
+        """Whether the object exists; a backend error propagates.
+
+        Not an SDK's ``exists()``: Azure's answers False to any 404, a missing
+        container's included, which must be an error here as it is on S3.
+        """
+        return self.blob_size(artifact_id, version) is not None
+
+
+class S3BlobStore(_ObjectBlobStore):
     """S3 or S3-compatible (MinIO, LocalStack) blob storage through boto3.
 
     Keys are ``{prefix}/{artifact_id}@v={version}.arrow``. The one client reads, writes
     and signs, so a role is resolved once and its session token signs the URLs.
     """
+
+    _staging_prefix = "vestigo_s3_blob_"
 
     def __init__(
         self,
@@ -496,10 +537,6 @@ class S3BlobStore(BlobStore):
         # miss, an instance-metadata probe included, and presigning asks per URL.
         self._signs = not anonymous and self._session.get_credentials() is not None
 
-    def _object_key(self, artifact_id: str, version: int) -> str:
-        blob_key = self._blob_key(artifact_id, version)
-        return f"{self.prefix}/{blob_key}" if self.prefix else blob_key
-
     def presign_get(self, artifact_id: str, version: int, ttl_seconds: int) -> str | None:
         if not self._signs:
             return None
@@ -542,23 +579,6 @@ class S3BlobStore(BlobStore):
         """
         with open(source_path, "rb") as src, _object_store_call("put"):
             self._client.upload_fileobj(src, self.bucket, key)
-
-    def open_blob_writer(self, artifact_id: str, version: int) -> AbstractContextManager[BinaryIO]:
-        """Open a streaming writer for an S3 blob, staged locally so failed writes never upload."""
-        key = self._object_key(artifact_id, version)
-        return self._staged_local_writer(
-            lambda staged: self._upload_from_path(key, staged),
-            prefix="vestigo_s3_blob_",
-            staging_dir=self.staging_dir,
-        )
-
-    def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
-        """Stream ``source_path`` straight to S3, skipping the local staging copy."""
-        self._upload_from_path(self._object_key(artifact_id, version), source_path)
-
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in S3; a backend error propagates."""
-        return self.blob_size(artifact_id, version) is not None
 
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from S3 object metadata; a backend error propagates."""
@@ -718,12 +738,14 @@ def _gcs_credentials_from_info(info: dict[str, Any]) -> Any:
     raise ValueError(f"Unsupported GCS credentials type {kind!r}")
 
 
-class GCSBlobStore(BlobStore):
+class GCSBlobStore(_ObjectBlobStore):
     """Google Cloud Storage blob storage through google-cloud-storage.
 
     Keys are ``{prefix}/{artifact_id}@v={version}.arrow``. The one client reads, writes
     and signs, on a credentials file, Application Default Credentials, or none.
     """
+
+    _staging_prefix = "vestigo_gcs_blob_"
 
     def __init__(
         self,
@@ -763,10 +785,6 @@ class GCSBlobStore(BlobStore):
             client_options=options,
         )
 
-    def _object_name(self, artifact_id: str, version: int) -> str:
-        blob_key = self._blob_key(artifact_id, version)
-        return f"{self.prefix}/{blob_key}" if self.prefix else blob_key
-
     def _blob(self, name: str) -> Any:
         return self._client.bucket(self.bucket).blob(name)
 
@@ -797,7 +815,7 @@ class GCSBlobStore(BlobStore):
         signing = self._signing_kwargs()
         if signing is None:
             return None
-        return self._blob(self._object_name(artifact_id, version)).generate_signed_url(
+        return self._blob(self._object_key(artifact_id, version)).generate_signed_url(
             version="v4", expiration=timedelta(seconds=int(ttl_seconds)), method="GET", **signing
         )
 
@@ -811,7 +829,7 @@ class GCSBlobStore(BlobStore):
             return None
         policy = self._client.generate_signed_post_policy_v4(
             self.bucket,
-            self._object_name(artifact_id, version),
+            self._object_key(artifact_id, version),
             expiration=timedelta(seconds=int(ttl_seconds)),
             conditions=[["content-length-range", 0, int(max_bytes)]],
             **signing,
@@ -826,7 +844,7 @@ class GCSBlobStore(BlobStore):
         The metadata read first answers absence and pins the reader to one generation.
         The reader fetches ``GCS_READ_CHUNK_BYTES`` at a time, whatever the caller reads.
         """
-        blob = self._blob(self._object_name(artifact_id, version))
+        blob = self._blob(self._object_key(artifact_id, version))
         try:
             with _object_store_call("get", _gcs_absent):
                 blob.reload()
@@ -834,8 +852,8 @@ class GCSBlobStore(BlobStore):
             return None
         return io.BufferedReader(_CountedReader(blob.open("rb", chunk_size=GCS_READ_CHUNK_BYTES)))
 
-    def _upload_from_path(self, name: str, source_path: Path) -> None:
-        """Upload a local file to ``name``: one request to 8 MiB, resumable past it.
+    def _upload_from_path(self, key: str, source_path: Path) -> None:
+        """Upload a local file to ``key``: one request to 8 MiB, resumable past it.
 
         The size is given, or the SDK opens a resumable session for every blob. A failure
         leaves the name as it was: an unfinished resumable upload is nothing. Retried on
@@ -845,29 +863,11 @@ class GCSBlobStore(BlobStore):
 
         size = source_path.stat().st_size
         with open(source_path, "rb") as src, _object_store_call("put"):
-            self._blob(name).upload_from_file(src, size=size, retry=DEFAULT_RETRY)
-
-    def open_blob_writer(self, artifact_id: str, version: int) -> AbstractContextManager[BinaryIO]:
-        """Open a streaming writer for a GCS blob, staged locally so failed writes never upload."""
-        name = self._object_name(artifact_id, version)
-        return self._staged_local_writer(
-            lambda staged: self._upload_from_path(name, staged),
-            prefix="vestigo_gcs_blob_",
-            staging_dir=self.staging_dir,
-        )
-
-    def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
-        """Stream ``source_path`` straight to GCS, skipping the local staging copy."""
-        self._upload_from_path(self._object_name(artifact_id, version), source_path)
-
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in GCS; a backend error propagates."""
-        with _object_store_call("head"):
-            return bool(self._blob(self._object_name(artifact_id, version)).exists())
+            self._blob(key).upload_from_file(src, size=size, retry=DEFAULT_RETRY)
 
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from GCS object metadata; a backend error propagates."""
-        blob = self._blob(self._object_name(artifact_id, version))
+        blob = self._blob(self._object_key(artifact_id, version))
         try:
             with _object_store_call("head", _gcs_absent):
                 blob.reload()
@@ -906,7 +906,7 @@ class GCSBlobStore(BlobStore):
         """Delete blob from GCS; False when it was not there, and a backend error propagates."""
         try:
             with _object_store_call("delete", _gcs_absent):
-                self._blob(self._object_name(artifact_id, version)).delete()
+                self._blob(self._object_key(artifact_id, version)).delete()
         except FileNotFoundError:
             return False
         return True
@@ -977,13 +977,15 @@ class _AzureDownloadReader(io.RawIOBase):
         return b"".join(rest)
 
 
-class AzureBlobStore(BlobStore):
+class AzureBlobStore(_ObjectBlobStore):
     """Azure Blob Storage backend.
 
     Keys are ``{prefix}/{artifact_id}@v={version}.arrow``. Authenticates with a
     connection string, account key, SAS token, or DefaultAzureCredential. Requires
     the ``azure`` extra.
     """
+
+    _staging_prefix = "vestigo_azure_blob_"
 
     def __init__(
         self,
@@ -1027,40 +1029,23 @@ class AzureBlobStore(BlobStore):
                 conn_str=connection_string,
                 container_name=container_name,
             )
-        elif use_default_credential:
-            from azure.identity import DefaultAzureCredential
+        elif use_default_credential or sas_token or account_key:
+            if use_default_credential:
+                from azure.identity import DefaultAzureCredential
 
-            credential = DefaultAzureCredential()
+                credential = DefaultAzureCredential()
+            else:
+                credential = sas_token or account_key
             self._client = ContainerClient(
                 account_url=self._account_url,
                 container_name=container_name,
                 credential=credential,
-            )
-        elif sas_token:
-            # SAS token can be passed as credential
-            self._client = ContainerClient(
-                account_url=self._account_url,
-                container_name=container_name,
-                credential=sas_token,
-            )
-        elif account_key:
-            self._client = ContainerClient(
-                account_url=self._account_url,
-                container_name=container_name,
-                credential=account_key,
             )
         else:
             raise ValueError(
                 "Azure Blob Storage requires one of: connection_string, account_key, "
                 "sas_token, or use_default_credential=True"
             )
-
-    def _azure_key(self, artifact_id: str, version: int) -> str:
-        """Get full Azure blob key."""
-        blob_key = self._blob_key(artifact_id, version)
-        if self.prefix:
-            return f"{self.prefix}/{blob_key}"
-        return blob_key
 
     def _sas_signing(self, ttl_seconds: int) -> dict[str, Any] | None:
         """Key material for a blob SAS: the account key, a user delegation key, or ``None``.
@@ -1098,7 +1083,7 @@ class AzureBlobStore(BlobStore):
         signing = self._sas_signing(int(ttl_seconds))
         if signing is None:
             return None
-        key = self._azure_key(artifact_id, version)
+        key = self._object_key(artifact_id, version)
         sas = generate_blob_sas(
             account_name=self._client.account_name or self.account_name,
             container_name=self.container_name,
@@ -1128,7 +1113,7 @@ class AzureBlobStore(BlobStore):
         self, artifact_id: str, version: int
     ) -> AbstractContextManager[BinaryIO] | None:
         """Open a streaming reader for an Azure blob."""
-        key = self._azure_key(artifact_id, version)
+        key = self._object_key(artifact_id, version)
         blob_client = self._client.get_blob_client(key)
         try:
             with _object_store_call("get", _azure_absent):
@@ -1152,42 +1137,9 @@ class AzureBlobStore(BlobStore):
         with open(source_path, "rb") as src, _object_store_call("put"):
             blob_client.upload_blob(src, overwrite=True)
 
-    def open_blob_writer(self, artifact_id: str, version: int) -> AbstractContextManager[BinaryIO]:
-        """Open a streaming writer for an Azure blob, uploaded on clean exit.
-
-        Staged through a local tempfile because the SDK streams uploads from a file
-        handle, not from a caller-written stream.
-        """
-        key = self._azure_key(artifact_id, version)
-        return self._staged_local_writer(
-            lambda staged: self._upload_from_path(key, staged),
-            prefix="vestigo_azure_blob_",
-            staging_dir=self.staging_dir,
-        )
-
-    def publish_blob_from_path(self, artifact_id: str, version: int, source_path: Path) -> None:
-        """Stream ``source_path`` straight to Azure, skipping the local staging copy."""
-        key = self._azure_key(artifact_id, version)
-        self._upload_from_path(key, source_path)
-
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in Azure Blob Storage.
-
-        Not the SDK's ``exists()``: that answers False to any 404, a missing container's
-        included, which must be an error here as it is on S3.
-        """
-        key = self._azure_key(artifact_id, version)
-        blob_client = self._client.get_blob_client(key)
-        try:
-            with _object_store_call("head", _azure_absent):
-                blob_client.get_blob_properties()
-        except FileNotFoundError:
-            return False
-        return True
-
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from Azure Blob Storage metadata."""
-        key = self._azure_key(artifact_id, version)
+        key = self._object_key(artifact_id, version)
         blob_client = self._client.get_blob_client(key)
         try:
             with _object_store_call("head", _azure_absent):
@@ -1230,7 +1182,7 @@ class AzureBlobStore(BlobStore):
 
     def delete_blob(self, artifact_id: str, version: int) -> bool:
         """Delete blob from Azure Blob Storage."""
-        key = self._azure_key(artifact_id, version)
+        key = self._object_key(artifact_id, version)
         blob_client = self._client.get_blob_client(key)
         try:
             with _object_store_call("delete", _azure_absent):

@@ -335,27 +335,19 @@ class BuildStore:
             # under the schema lock: CREATE TABLE IF NOT EXISTS races in Postgres, and every
             # node runs this at startup.
             if not self._dialect.supports_legacy_migration:
-                if not self._dialect.schema_exists(conn, "artifact_builds"):
-                    self._dialect.begin_write(conn, "__build_schema__")
-                    self._dialect.execute_ddl(conn, _BUILD_SCHEMA_SQL)
-                    conn.commit()
-                if not self._dialect.schema_exists(conn, "build_attempts"):
-                    self._dialect.begin_write(conn, "__build_schema__")
-                    self._dialect.execute_ddl(conn, _ATTEMPT_SCHEMA_SQL)
-                    for statement in _LINEAGE_INDEXES:
-                        conn.execute(statement)
-                    conn.commit()
-                if not self._dialect.schema_exists(conn, "build_console_chunks"):
-                    self._dialect.begin_write(conn, "__build_schema__")
-                    self._dialect.execute_ddl(conn, _CONSOLE_SCHEMA_SQL)
-                    conn.commit()
+                for table, script in (
+                    ("artifact_builds", _BUILD_SCHEMA_SQL),
+                    ("build_attempts", _ATTEMPT_SCHEMA_SQL + ";\n".join(_LINEAGE_INDEXES) + ";"),
+                    ("build_console_chunks", _CONSOLE_SCHEMA_SQL),
+                ):
+                    if not self._dialect.schema_exists(conn, table):
+                        self._dialect.begin_write(conn, "__build_schema__")
+                        self._dialect.execute_ddl(conn, script)
+                        conn.commit()
                 self._add_release_columns(conn)
                 return
 
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_builds'"
-            )
-            table_exists = cursor.fetchone() is not None
+            table_exists = self._dialect.schema_exists(conn, "artifact_builds")
 
             if table_exists and self._missing_legacy_columns(conn):
                 self._dialect.begin_write(conn, "__build_schema__")
