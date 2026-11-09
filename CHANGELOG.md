@@ -7,9 +7,9 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Changed
 
-- The README is an overview: what vestigo does, a first example (which the suite
-  runs), install and the documentation. Every module and its exports moved to
-  `docs/api.md` (#77).
+- The README is an overview: what vestigo does, a first example that counts a
+  file's words once (the suite runs it), install and the documentation. Every
+  module and its exports moved to `docs/api.md` (#77, #79).
 
 ### Added
 
