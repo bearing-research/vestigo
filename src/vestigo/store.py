@@ -727,6 +727,35 @@ def _add_content_sha256(conn: StoreConnection, dialect: SqlDialect) -> None:
         conn.execute("ALTER TABLE artifact_versions ADD COLUMN content_sha256 TEXT")
 
 
+def _in_tenant(column: str, include_tenantless: bool) -> str:
+    """A condition on *column* for one tenant's rows (its one parameter), with the legacy
+    tenantless rows when *include_tenantless*."""
+    if include_tenantless:
+        return f"({column} = ? OR {column} = '' OR {column} IS NULL)"
+    return f"{column} = ?"
+
+
+def _name_from_row(row: StoreRow) -> ArtifactName:
+    return ArtifactName(
+        name=row["name"],
+        artifact_id=row["artifact_id"],
+        version=row["version"],
+        updated_at=row["updated_at"],
+        tenant=row["tenant"] or None,
+    )
+
+
+def _alias_from_row(row: StoreRow) -> ArtifactAlias:
+    return ArtifactAlias(
+        name=row["name"],
+        alias=row["alias"],
+        artifact_id=row["artifact_id"],
+        version=row["version"],
+        updated_at=row["updated_at"],
+        tenant=row["tenant"] or None,
+    )
+
+
 def _json_entries(raw: str | None) -> tuple[dict[str, str], ...]:
     """A stored JSON list back into entries, or empty for anything else.
 
@@ -1745,23 +1774,7 @@ class ArtifactStore:
         reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
-            # Serialize writers so the MAX(version)+1 read can't race a concurrent create for the
-            # same id into a primary-key collision. The key names what is contended so a backend can
-            # lock narrowly; SQLite ignores it and locks the file.
-            self._dialect.begin_write(conn, artifact_id)
-            if self._held_by_another_tenant(conn, artifact_id, tenant):
-                conn.rollback()
-                raise ArtifactIdTaken(f"{artifact_id} already exists under another tenant")
-            row = one(
-                conn.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
-                    "COALESCE(MAX(minted), 0) AS was_minted "
-                    "FROM artifact_versions WHERE id = ?",
-                    (artifact_id,),
-                )
-            )
-            # By name: a Postgres row unpacks to its column names, not values.
-            version, was_minted = int(row["next_version"]), row["was_minted"]
+            version, was_minted = self._next_version(conn, artifact_id, tenant)
 
             input_versions_json = json.dumps(input_versions) if input_versions else None
             definition_id = (
@@ -1798,6 +1811,33 @@ class ArtifactStore:
             return version
         finally:
             conn.close()
+
+    def _next_version(
+        self, conn: StoreConnection, artifact_id: str, tenant: str | None
+    ) -> tuple[int, int]:
+        """The id's next version number, and whether any version of it was minted, on a
+        transaction opened here that serializes writers to the id.
+
+        Raises:
+            ArtifactIdTaken: a version of the id belongs to another tenant.
+        """
+        # So the MAX(version)+1 read can't race a concurrent create for the same id into a
+        # primary-key collision. The key names what is contended so a backend can lock
+        # narrowly; SQLite ignores it and locks the file.
+        self._dialect.begin_write(conn, artifact_id)
+        if self._held_by_another_tenant(conn, artifact_id, tenant):
+            conn.rollback()
+            raise ArtifactIdTaken(f"{artifact_id} already exists under another tenant")
+        row = one(
+            conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
+                "COALESCE(MAX(minted), 0) AS was_minted "
+                "FROM artifact_versions WHERE id = ?",
+                (artifact_id,),
+            )
+        )
+        # By name: a Postgres row unpacks to its column names, not values.
+        return int(row["next_version"]), row["was_minted"]
 
     @staticmethod
     def _write_requirements(
@@ -2567,7 +2607,7 @@ class ArtifactStore:
         source = self.get_artifact(artifact_id, version)
         if source is None:
             return None
-        if source.state not in ("ready", "superseded"):
+        if source.state not in _RESULT_STATES:
             # A building row may be a partial or abandoned write and a failed
             # one was rejected on purpose; neither is a result to make current.
             return None
@@ -2583,21 +2623,7 @@ class ArtifactStore:
         with reader_cm as reader:
             conn = self._get_connection()
             try:
-                # Same write serialization as create_artifact: MAX(version)+1 must
-                # not race a concurrent create for this id.
-                self._dialect.begin_write(conn, artifact_id)
-                if self._held_by_another_tenant(conn, artifact_id, tenant):
-                    conn.rollback()
-                    raise ArtifactIdTaken(f"{artifact_id} already exists under another tenant")
-                row = one(
-                    conn.execute(
-                        "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
-                        "COALESCE(MAX(minted), 0) AS was_minted "
-                        "FROM artifact_versions WHERE id = ?",
-                        (artifact_id,),
-                    )
-                )
-                new_version = int(row["next_version"])
+                new_version, was_minted = self._next_version(conn, artifact_id, tenant)
                 conn.execute(
                     """
                     INSERT INTO artifact_versions
@@ -2620,7 +2646,7 @@ class ArtifactStore:
                         source.input_versions,
                         source.tenant if source.tenant is not None else "",
                         source.principal,
-                        row["was_minted"],
+                        was_minted,
                         source.computation_key,
                         artifact_id,
                         version,
@@ -3528,6 +3554,19 @@ class ArtifactStore:
             raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
         return row
 
+    def _lock_readable_target(
+        self, conn: StoreConnection, artifact_id: str, version: int, tenant: str | None
+    ) -> None:
+        """Lock the version a pointer is about to name (``_lock_target``), refusing one
+        *tenant* may not use (:class:`ArtifactNotFoundError`) or that is not readable
+        (``ValueError``)."""
+        row = self._lock_target(conn, artifact_id, version)
+        row = self._require_writable_target(row, artifact_id, version, tenant)
+        if row["state"] not in _RESULT_STATES:
+            raise ValueError(
+                f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
+            )
+
     def _lock_target(
         self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
     ):
@@ -3583,12 +3622,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
-            row = self._lock_target(conn, artifact_id, version)
-            row = self._require_writable_target(row, artifact_id, version, tenant)
-            if row["state"] not in ("ready", "superseded"):
-                raise ValueError(
-                    f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                )
+            self._lock_readable_target(conn, artifact_id, version, tenant)
 
             # Upsert + audit in one transaction (shared with the finalize paths).
             try:
@@ -3696,14 +3730,7 @@ class ArtifactStore:
             row = cursor.fetchone()
             if row is None:
                 return None
-            returned_tenant = row["tenant"] if row["tenant"] else None
-            return ArtifactName(
-                name=row["name"],
-                artifact_id=row["artifact_id"],
-                version=row["version"],
-                updated_at=row["updated_at"],
-                tenant=returned_tenant,
-            )
+            return _name_from_row(row)
         finally:
             conn.close()
 
@@ -3753,16 +3780,7 @@ class ArtifactStore:
                 ORDER BY name
                 """
             )
-            return [
-                ArtifactName(
-                    name=row["name"],
-                    artifact_id=row["artifact_id"],
-                    version=row["version"],
-                    updated_at=row["updated_at"],
-                    tenant=row["tenant"] if row["tenant"] else None,
-                )
-                for row in cursor.fetchall()
-            ]
+            return [_name_from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -3857,7 +3875,7 @@ class ArtifactStore:
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
             if row is None:
                 raise ValueError(f"Artifact {artifact_id}@v={version} not found")
-            if row["state"] not in ("ready", "superseded"):
+            if row["state"] not in _RESULT_STATES:
                 raise ValueError(
                     f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
                 )
@@ -4104,12 +4122,7 @@ class ArtifactStore:
         try:
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
-            row = self._lock_target(conn, artifact_id, version)
-            row = self._require_writable_target(row, artifact_id, version, tenant)
-            if row["state"] not in ("ready", "superseded"):
-                raise ValueError(
-                    f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                )
+            self._lock_readable_target(conn, artifact_id, version, tenant)
 
             effective_tenant = tenant if tenant is not None else ""
             cursor = conn.execute(
@@ -4124,34 +4137,59 @@ class ArtifactStore:
                 and previous["version"] == version
             ):
                 return False  # Already points here: idempotent no-op
-            self._audit_in_connection(
+            self._move_alias(
                 conn,
-                action="alias_set",
                 name=name,
                 alias=alias,
                 artifact_id=artifact_id,
-                from_artifact_id=previous["artifact_id"] if previous else None,
-                from_version=previous["version"] if previous else None,
-                to_version=version,
-                actor=actor,
+                version=version,
+                previous=previous,
                 tenant=tenant,
-            )
-            conn.execute(
-                """
-                INSERT INTO artifact_aliases
-                    (name, alias, artifact_id, version, updated_at, tenant)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant, name, alias) DO UPDATE SET
-                    artifact_id = excluded.artifact_id,
-                    version = excluded.version,
-                    updated_at = excluded.updated_at
-                """,
-                (name, alias, artifact_id, version, time.time(), effective_tenant),
+                actor=actor,
             )
             conn.commit()
             return True
         finally:
             conn.close()
+
+    def _move_alias(
+        self,
+        conn: StoreConnection,
+        *,
+        name: str,
+        alias: str,
+        artifact_id: str,
+        version: int,
+        previous: StoreRow | None,
+        tenant: str | None,
+        actor: str | None,
+    ) -> None:
+        """Point ``name @ alias`` at the version on the caller's transaction, audited as a
+        move from *previous* (its row before, if any)."""
+        self._audit_in_connection(
+            conn,
+            action="alias_set",
+            name=name,
+            alias=alias,
+            artifact_id=artifact_id,
+            from_artifact_id=previous["artifact_id"] if previous else None,
+            from_version=previous["version"] if previous else None,
+            to_version=version,
+            actor=actor,
+            tenant=tenant,
+        )
+        conn.execute(
+            """
+            INSERT INTO artifact_aliases
+                (name, alias, artifact_id, version, updated_at, tenant)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant, name, alias) DO UPDATE SET
+                artifact_id = excluded.artifact_id,
+                version = excluded.version,
+                updated_at = excluded.updated_at
+            """,
+            (name, alias, artifact_id, version, time.time(), tenant if tenant is not None else ""),
+        )
 
     def resolve_alias(
         self,
@@ -4196,17 +4234,7 @@ class ArtifactStore:
                     "FROM artifact_aliases WHERE tenant = ? ORDER BY name, alias",
                     (effective_tenant,),
                 )
-            return [
-                ArtifactAlias(
-                    name=row["name"],
-                    alias=row["alias"],
-                    artifact_id=row["artifact_id"],
-                    version=row["version"],
-                    updated_at=row["updated_at"],
-                    tenant=row["tenant"] if row["tenant"] else None,
-                )
-                for row in cursor.fetchall()
-            ]
+            return [_alias_from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -4218,17 +4246,7 @@ class ArtifactStore:
                 "SELECT name, alias, artifact_id, version, updated_at, tenant "
                 "FROM artifact_aliases ORDER BY name, alias"
             )
-            return [
-                ArtifactAlias(
-                    name=row["name"],
-                    alias=row["alias"],
-                    artifact_id=row["artifact_id"],
-                    version=row["version"],
-                    updated_at=row["updated_at"],
-                    tenant=row["tenant"] if row["tenant"] else None,
-                )
-                for row in cursor.fetchall()
-            ]
+            return [_alias_from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -4285,12 +4303,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
-            row = self._lock_target(conn, artifact_id, version)
-            row = self._require_writable_target(row, artifact_id, version, tenant)
-            if row["state"] not in ("ready", "superseded"):
-                raise ValueError(
-                    f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                )
+            self._lock_readable_target(conn, artifact_id, version, tenant)
 
             effective_tenant = tenant if tenant is not None else ""
             self._audit_in_connection(
@@ -4502,12 +4515,7 @@ class ArtifactStore:
             if action == "set":
                 if artifact_id is None or version is None:
                     raise ValueError("alias 'set' request requires artifact_id and version")
-                row = self._lock_target(conn, artifact_id, version)
-                row = self._require_writable_target(row, artifact_id, version, tenant)
-                if row["state"] not in ("ready", "superseded"):
-                    raise ValueError(
-                        f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                    )
+                self._lock_readable_target(conn, artifact_id, version, tenant)
 
             effective_tenant = tenant if tenant is not None else ""
             if action == "set":
@@ -4620,7 +4628,7 @@ class ArtifactStore:
                     (entry["artifact_id"], entry["version"]),
                 )
                 target = cursor.fetchone()
-                if target is None or target["state"] not in ("ready", "superseded"):
+                if target is None or target["state"] not in _RESULT_STATES:
                     conn.rollback()
                     state = target["state"] if target else "deleted"
                     raise ValueError(
@@ -4651,36 +4659,16 @@ class ArtifactStore:
             )
             previous = cursor.fetchone()
             if entry["action"] == "set":
-                self._audit_in_connection(
+                assert entry["artifact_id"] is not None and entry["version"] is not None
+                self._move_alias(
                     conn,
-                    action="alias_set",
                     name=name,
                     alias=alias,
                     artifact_id=entry["artifact_id"],
-                    from_artifact_id=previous["artifact_id"] if previous else None,
-                    from_version=previous["version"] if previous else None,
-                    to_version=entry["version"],
-                    actor=actor,
+                    version=entry["version"],
+                    previous=previous,
                     tenant=tenant,
-                )
-                conn.execute(
-                    """
-                    INSERT INTO artifact_aliases
-                        (name, alias, artifact_id, version, updated_at, tenant)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(tenant, name, alias) DO UPDATE SET
-                        artifact_id = excluded.artifact_id,
-                        version = excluded.version,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        name,
-                        alias,
-                        entry["artifact_id"],
-                        entry["version"],
-                        time.time(),
-                        effective_tenant,
-                    ),
+                    actor=actor,
                 )
             else:
                 if previous is not None:
@@ -4762,16 +4750,7 @@ class ArtifactStore:
                 """,
                 (effective_tenant,),
             )
-            return [
-                ArtifactName(
-                    name=row["name"],
-                    artifact_id=row["artifact_id"],
-                    version=row["version"],
-                    updated_at=row["updated_at"],
-                    tenant=row["tenant"] if row["tenant"] else None,
-                )
-                for row in cursor.fetchall()
-            ]
+            return [_name_from_row(row) for row in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -6095,89 +6074,39 @@ class ArtifactStore:
     def get_usage(
         self, tenant: str | None = None, *, include_tenantless: bool = True
     ) -> StoreUsage:
-        """Get artifact store usage statistics, optionally for one tenant.
+        """Get artifact store usage statistics, optionally for one tenant: :meth:`stats`,
+        with the ids, the versions no name points at, and the span.
 
         ``include_tenantless`` counts legacy tenantless rows as the tenant's: right
         for visibility, wrong for metering.
         """
         conn = self._get_connection()
         try:
-            # total_bytes is what versions still own, as a sweep measures the store: older
-            # superseded versions count, a pointer reading another's bytes (superseded_by) never.
-            usage_query = """
-                SELECT
-                    COUNT(DISTINCT id) as unique_artifacts,
-                    COUNT(*) as total_versions,
-                    COUNT(CASE WHEN state = 'ready' THEN 1 END) as ready_versions,
-                    COUNT(CASE WHEN state = 'building' THEN 1 END) as building_versions,
-                    COUNT(CASE WHEN state = 'superseded' THEN 1 END) as superseded_versions,
-                    COUNT(CASE WHEN state = 'failed' THEN 1 END) as failed_versions,
-                    COALESCE(SUM(CASE WHEN state IN ('ready', 'superseded')
-                                       AND superseded_by IS NULL
-                                      THEN byte_size END), 0) as total_bytes,
-                    COALESCE(SUM(CASE WHEN state = 'ready' THEN row_count END), 0) as total_rows,
-                    MIN(created_at) as oldest_artifact,
-                    MAX(created_at) as newest_artifact
-                FROM artifact_versions
-            """
-            usage_params: list[str] = []
-            if tenant is not None:
-                usage_query += (
-                    " WHERE tenant = ? OR tenant = '' OR tenant IS NULL"
-                    if include_tenantless
-                    else " WHERE tenant = ?"
+            stats, row = self._stats_on(conn, tenant, include_tenantless, with_span=True)
+            scope = (
+                f" AND {_in_tenant('av.tenant', include_tenantless)}" if tenant is not None else ""
+            )
+            unreferenced = one(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) as count
+                    FROM artifact_versions av
+                    LEFT JOIN artifact_names an
+                        ON av.id = an.artifact_id AND av.version = an.version
+                    WHERE an.name IS NULL AND av.state = 'ready'{scope}
+                    """,
+                    [tenant] if tenant is not None else [],
                 )
-                usage_params.append(tenant)
-
-            cursor = conn.execute(usage_query, usage_params)
-            row = one(cursor)
-
-            if tenant is not None:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) as count FROM artifact_names WHERE tenant = ?"
-                    + (" OR tenant = ''" if include_tenantless else ""),
-                    (tenant,),
-                )
-            else:
-                cursor = conn.execute("SELECT COUNT(*) as count FROM artifact_names")
-            names_count = one(cursor)["count"]
-
-            unreferenced_query = """
-                SELECT COUNT(*) as count
-                FROM artifact_versions av
-                LEFT JOIN artifact_names an ON av.id = an.artifact_id AND av.version = an.version
-                WHERE an.name IS NULL AND av.state = 'ready'
-            """
-            unreferenced_params: list[str] = []
-            if tenant is not None:
-                unreferenced_query += (
-                    " AND (av.tenant = ? OR av.tenant = '' OR av.tenant IS NULL)"
-                    if include_tenantless
-                    else " AND av.tenant = ?"
-                )
-                unreferenced_params.append(tenant)
-            cursor = conn.execute(unreferenced_query, unreferenced_params)
-            unreferenced_count = one(cursor)["count"]
-
-            return {
-                "unique_artifacts": row["unique_artifacts"],
-                "total_versions": row["total_versions"],
-                "ready_versions": row["ready_versions"],
-                "building_versions": row["building_versions"],
-                "superseded_versions": row["superseded_versions"],
-                "failed_versions": row["failed_versions"],
-                # int(): SUM over a BIGINT column is numeric in Postgres and
-                # arrives as Decimal, which breaks arithmetic like
-                # total_bytes / 1024**3 for in-process callers.
-                "total_bytes": int(row["total_bytes"]),
-                "total_rows": int(row["total_rows"]),
-                "name_count": names_count,
-                "unreferenced_count": unreferenced_count,
-                "oldest_artifact": row["oldest_artifact"],
-                "newest_artifact": row["newest_artifact"],
-            }
+            )
         finally:
             conn.close()
+        return {
+            **stats,
+            "unique_artifacts": row["unique_artifacts"],
+            "unreferenced_count": unreferenced["count"],
+            "oldest_artifact": row["oldest_artifact"],
+            "newest_artifact": row["newest_artifact"],
+        }
 
     # --- Maintenance (legacy) ---
 
@@ -6405,89 +6334,106 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
-            stats_query = """
-                SELECT
-                    COUNT(*) as total_versions,
-                    COUNT(CASE WHEN state = 'ready' THEN 1 END) as ready_versions,
-                    COUNT(CASE WHEN state = 'building' THEN 1 END) as building_versions,
-                    COUNT(CASE WHEN state = 'superseded' THEN 1 END) as superseded_versions,
-                    COUNT(CASE WHEN state = 'failed' THEN 1 END) as failed_versions,
-                    COALESCE(SUM(CASE WHEN state IN ('ready', 'superseded')
-                                       AND superseded_by IS NULL
-                                      THEN byte_size END), 0) as total_bytes,
-                    COALESCE(SUM(CASE WHEN state = 'ready' THEN row_count END), 0) as total_rows
-                FROM artifact_versions
-            """
-
-            def in_tenant(alias: str) -> str:
-                column = f"{alias}tenant"
-                if include_tenantless:
-                    return f"({column} = ? OR {column} = '' OR {column} IS NULL)"
-                return f"{column} = ?"
-
-            stats_params: list[str] = []
-            conditions: list[str] = []
-            if tenant is not None:
-                conditions.append(in_tenant(""))
-                stats_params.append(tenant)
-            if exclude_id_prefix:
-                conditions.append(f"NOT {_starts_with('id')}")
-                stats_params.extend([exclude_id_prefix, exclude_id_prefix])
-            if conditions:
-                stats_query += " WHERE " + " AND ".join(conditions)
-
-            cursor = conn.execute(stats_query, stats_params)
-            row = one(cursor)
-            total_bytes = row["total_bytes"]
-            if exclude_id_prefix:
-                # An included pointer reads its canonical's bytes, which may be excluded.
-                scoped = tenant is not None
-                held = one(
-                    conn.execute(
-                        f"""
-                    SELECT COALESCE(SUM(c.byte_size), 0) AS held
-                    FROM artifact_versions c
-                    WHERE c.state IN ('ready', 'superseded') AND c.superseded_by IS NULL
-                      AND {_starts_with("c.id")}{f" AND {in_tenant('c.')}" if scoped else ""}
-                      AND EXISTS (SELECT 1 FROM artifact_versions p
-                                  WHERE p.superseded_by = c.id || '@v=' || c.version
-                                    AND p.state IN ('ready', 'superseded')
-                                    AND NOT {_starts_with("p.id")}
-                                    {f"AND {in_tenant('p.')}" if scoped else ""})
-                    """,
-                        [exclude_id_prefix] * 2
-                        + ([tenant] if scoped else [])
-                        + [exclude_id_prefix] * 2
-                        + ([tenant] if scoped else []),
-                    )
-                )
-                total_bytes += held["held"]
-
-            if tenant is not None:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) as count FROM artifact_names WHERE tenant = ?"
-                    + (" OR tenant = ''" if include_tenantless else ""),
-                    (tenant,),
-                )
-            else:
-                cursor = conn.execute("SELECT COUNT(*) as count FROM artifact_names")
-            names_count = one(cursor)["count"]
-
-            return {
-                "total_versions": row["total_versions"],
-                "ready_versions": row["ready_versions"],
-                "building_versions": row["building_versions"],
-                "superseded_versions": row["superseded_versions"],
-                "failed_versions": row["failed_versions"],
-                # int(): SUM over a BIGINT column is numeric in Postgres and
-                # arrives as Decimal, which breaks arithmetic like
-                # total_bytes / 1024**3 for in-process callers.
-                "total_bytes": int(total_bytes),
-                "total_rows": int(row["total_rows"]),
-                "name_count": names_count,
-            }
+            return self._stats_on(conn, tenant, include_tenantless, exclude_id_prefix)[0]
         finally:
             conn.close()
+
+    @staticmethod
+    def _stats_on(
+        conn: StoreConnection,
+        tenant: str | None,
+        include_tenantless: bool,
+        exclude_id_prefix: str | None = None,
+        with_span: bool = False,
+    ) -> tuple[StoreStats, StoreRow]:
+        """:meth:`stats` on the caller's connection, and the row of its version totals,
+        which with *with_span* also holds ``unique_artifacts``, ``oldest_artifact`` and
+        ``newest_artifact``."""
+        span = (
+            ", COUNT(DISTINCT id) AS unique_artifacts, "
+            "MIN(created_at) AS oldest_artifact, MAX(created_at) AS newest_artifact"
+            if with_span
+            else ""
+        )
+        # total_bytes is what versions still own, as a sweep measures the store: older
+        # superseded versions count, a pointer reading another's bytes (superseded_by) never.
+        stats_query = f"""
+            SELECT
+                COUNT(*) as total_versions,
+                COUNT(CASE WHEN state = 'ready' THEN 1 END) as ready_versions,
+                COUNT(CASE WHEN state = 'building' THEN 1 END) as building_versions,
+                COUNT(CASE WHEN state = 'superseded' THEN 1 END) as superseded_versions,
+                COUNT(CASE WHEN state = 'failed' THEN 1 END) as failed_versions,
+                COALESCE(SUM(CASE WHEN state IN ('ready', 'superseded')
+                                   AND superseded_by IS NULL
+                                  THEN byte_size END), 0) as total_bytes,
+                COALESCE(SUM(CASE WHEN state = 'ready' THEN row_count END), 0) as total_rows
+                {span}
+            FROM artifact_versions
+        """
+        stats_params: list[str] = []
+        conditions: list[str] = []
+        if tenant is not None:
+            conditions.append(_in_tenant("tenant", include_tenantless))
+            stats_params.append(tenant)
+        if exclude_id_prefix:
+            conditions.append(f"NOT {_starts_with('id')}")
+            stats_params.extend([exclude_id_prefix, exclude_id_prefix])
+        if conditions:
+            stats_query += " WHERE " + " AND ".join(conditions)
+
+        row = one(conn.execute(stats_query, stats_params))
+        total_bytes = row["total_bytes"]
+        if exclude_id_prefix:
+            # An included pointer reads its canonical's bytes, which may be excluded.
+            scoped = tenant is not None
+            in_c = f" AND {_in_tenant('c.tenant', include_tenantless)}" if scoped else ""
+            in_p = f"AND {_in_tenant('p.tenant', include_tenantless)}" if scoped else ""
+            held = one(
+                conn.execute(
+                    f"""
+                SELECT COALESCE(SUM(c.byte_size), 0) AS held
+                FROM artifact_versions c
+                WHERE c.state IN ('ready', 'superseded') AND c.superseded_by IS NULL
+                  AND {_starts_with("c.id")}{in_c}
+                  AND EXISTS (SELECT 1 FROM artifact_versions p
+                              WHERE p.superseded_by = c.id || '@v=' || c.version
+                                AND p.state IN ('ready', 'superseded')
+                                AND NOT {_starts_with("p.id")}
+                                {in_p})
+                """,
+                    [exclude_id_prefix] * 2
+                    + ([tenant] if scoped else [])
+                    + [exclude_id_prefix] * 2
+                    + ([tenant] if scoped else []),
+                )
+            )
+            total_bytes += held["held"]
+
+        if tenant is not None:
+            cursor = conn.execute(
+                "SELECT COUNT(*) as count FROM artifact_names WHERE "
+                + _in_tenant("tenant", include_tenantless),
+                (tenant,),
+            )
+        else:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM artifact_names")
+        names_count = one(cursor)["count"]
+
+        stats: StoreStats = {
+            "total_versions": row["total_versions"],
+            "ready_versions": row["ready_versions"],
+            "building_versions": row["building_versions"],
+            "superseded_versions": row["superseded_versions"],
+            "failed_versions": row["failed_versions"],
+            # int(): SUM over a BIGINT column is numeric in Postgres and
+            # arrives as Decimal, which breaks arithmetic like
+            # total_bytes / 1024**3 for in-process callers.
+            "total_bytes": int(total_bytes),
+            "total_rows": int(row["total_rows"]),
+            "name_count": names_count,
+        }
+        return stats, row
 
 
 # --- Module-level singleton (initialized lazily) ---
