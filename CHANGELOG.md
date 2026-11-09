@@ -5,6 +5,17 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- Migration 18 indexes `artifact_versions.superseded_by`. A sweep looked up each row's
+  pointers by scanning every version: 20000 versions of one id, each reading the one
+  before, held the write lock for 29 s in one go, and 1.7 s with the index; 20000 lone
+  versions took 15 s, and 6.4 s. The first writer of this version to open a store
+  builds the index under the schema lock, so writes to `artifact_versions` wait for
+  it. Afterwards a 0.5.0 process refuses the store as newer, so upgrade every process
+  together; until a writer has opened it, a read-only open refuses a store at schema
+  17 as older (#81).
+
 ### Fixed
 
 - Several processes opening a new SQLite ledger together through `BuildStore` or

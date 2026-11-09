@@ -970,6 +970,18 @@ def _reorder_link_target_index(conn: StoreConnection, dialect: SqlDialect) -> No
     conn.execute(dialect.adapt_ddl(LINK_TARGET_INDEX))
 
 
+# The versions reading a canonical's bytes, which a delete or a sweep asks per row.
+_POINTER_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_versions_superseded_by "
+    "ON artifact_versions(superseded_by) WHERE superseded_by IS NOT NULL"
+)
+
+
+def _index_pointers(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """``superseded_by`` indexed: a sweep asked each row's pointers by scanning every version."""
+    conn.execute(_POINTER_INDEX_SQL)
+
+
 _ROOTS_KEY = "tenant, kind, holder, artifact_id, version"
 
 
@@ -1031,6 +1043,7 @@ _MIGRATIONS: list[_Migration] = [
         16, "idx_node_links_target on (scope, target_node_id, relation)", _reorder_link_target_index
     ),
     _Migration(17, "retention_roots keyed by tenant", _key_roots_by_tenant),
+    _Migration(18, "idx_versions_superseded_by", _index_pointers),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1118,7 +1131,10 @@ CREATE TABLE IF NOT EXISTS artifact_names (
 -- Index for name lookup without tenant (personal mode)
 CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name);
 """
-# Every table and index _SCHEMA_SQL makes, and the index on active publications.
+_SCHEMA_SQL += _POINTER_INDEX_SQL + ";\n"
+
+# Every table and index _SCHEMA_SQL makes, and the index on active publications. Looked
+# for only in a store stamped current: in one behind, the newest are the migrations' to make.
 _FIRST_BOOT_OBJECTS = frozenset(
     re.findall(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX) IF NOT EXISTS (\w+)", _SCHEMA_SQL)
 ) | {"idx_publications_active"}
@@ -1958,7 +1974,7 @@ class ArtifactStore:
                 current = row["version"] if row is not None else None
             missing = (
                 _first_boot_missing(conn)
-                if current is not None and self._dialect.supports_legacy_migration
+                if current == _LATEST_SCHEMA_VERSION and self._dialect.supports_legacy_migration
                 else frozenset()
             )
         finally:
