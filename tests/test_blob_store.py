@@ -795,12 +795,12 @@ class TestGCSBlobStore:
     def test_object_name_format(self):
         store = GCSBlobStore(bucket="test-bucket", prefix="artifacts", anonymous=True)
 
-        assert store._object_name("abc123", 5) == "artifacts/abc123@v=5.arrow"
+        assert store._object_key("abc123", 5) == "artifacts/abc123@v=5.arrow"
 
     def test_object_name_without_prefix(self):
         store = GCSBlobStore(bucket="test-bucket", prefix="", anonymous=True)
 
-        assert store._object_name("abc123", 5) == "abc123@v=5.arrow"
+        assert store._object_key("abc123", 5) == "abc123@v=5.arrow"
 
     def test_an_emulator_endpoint_is_a_url(self):
         store = GCSBlobStore(bucket="b", anonymous=True, endpoint_override="localhost:4443")
@@ -1196,7 +1196,7 @@ class TestAzureBlobStore:
             connection_string="DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=dGVzdGtleQ==;EndpointSuffix=core.windows.net",
         )
 
-        key = store._azure_key("abc123", 5)
+        key = store._object_key("abc123", 5)
 
         assert key == "artifacts/abc123@v=5.arrow"
 
@@ -1208,7 +1208,7 @@ class TestAzureBlobStore:
             connection_string="DefaultEndpointsProtocol=https;AccountName=testaccount;AccountKey=dGVzdGtleQ==;EndpointSuffix=core.windows.net",
         )
 
-        key = store._azure_key("abc123", 5)
+        key = store._object_key("abc123", 5)
 
         assert key == "abc123@v=5.arrow"
 
