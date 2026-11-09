@@ -5,6 +5,21 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- Types for what the public API takes and returns (#82):
+  - `vestigo.torch`'s signatures name torch's types: a model is a
+    `torch.nn.Module`, an optimizer a `torch.optim.Optimizer`, `checkpointing` a
+    `CheckpointManager.Config`.
+  - Every public method that returned a bare `dict` returns a `TypedDict`, such
+    as `GcResult`, `StoreUsage`, `AuditEntry` or `Ledger.collect`'s `CollectResult`.
+  - The whole-store reads take `tenant: str | AllTenants | None`, and
+    `ALL_TENANTS`, their default, can be passed.
+  - `StoreConnection.execute` binds `SqlValue`s and returns a `StoreCursor` of
+    `StoreRow`s.
+  - `one(cursor)` returns the row a query must return, and raises `LookupError`
+    without one.
+
 ### Changed
 
 - Migration 18 indexes `artifact_versions.superseded_by`. A sweep looked up each row's
