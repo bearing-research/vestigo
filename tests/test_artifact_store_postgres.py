@@ -450,6 +450,64 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 
 
 class TestGarbageCollection:
+    def test_a_version_an_approval_aliases_after_the_sweep_selected_it_stays(
+        self, store, monkeypatch
+    ):
+        """A sweep selected an unheld version; a change was then requested and approved
+        for it. The claim's re-check read no pending change and could not see the
+        approval's uncommitted alias, so it deleted the version the approval then
+        aliased."""
+        version = store.create_artifact("c1", "prov-c1", _spec())
+        store.write_blob("c1", version, b"bytes")
+        store.finalize_artifact("c1", version, "{}", row_count=0, byte_size=5)
+
+        selected, release_sweep = threading.Event(), threading.Event()
+        aliasing, release_approval = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        take, move = ArtifactStore._take, ArtifactStore._move_alias
+
+        def claiming_once_released(self, *args, **kwargs):
+            selected.set()
+            assert release_sweep.wait(30)
+            return take(self, *args, **kwargs)
+
+        def aliasing_once_released(self, conn, **kwargs):
+            aliasing.set()
+            assert release_approval.wait(30)
+            return move(self, conn, **kwargs)
+
+        monkeypatch.setattr(ArtifactStore, "_take", claiming_once_released)
+        monkeypatch.setattr(ArtifactStore, "_move_alias", aliasing_once_released)
+
+        def sweep() -> None:
+            try:
+                store.garbage_collect(collectable=[("c1", version)], collect_latest=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def approve() -> None:
+            try:
+                store.approve_alias_change("model", "prod", actor="bob")
+            except BaseException as exc:
+                errors.append(exc)
+
+        sweeping = threading.Thread(target=sweep)
+        sweeping.start()
+        assert selected.wait(30)
+        assert store.request_alias_change("model", "prod", "set", "c1", version, actor="alice")
+        approving = threading.Thread(target=approve)
+        approving.start()
+        assert aliasing.wait(30)
+        release_sweep.set()
+        _until_it_waits(store, sweeping)
+        release_approval.set()
+        approving.join()
+        sweeping.join()
+
+        assert errors == []
+        assert store.get_artifact("c1", version) is not None
+        assert store.resolve_alias("model", "prod") is not None
+
     def test_a_canonical_a_duplicate_points_at_while_the_claim_waits_stays(
         self, store, monkeypatch
     ):

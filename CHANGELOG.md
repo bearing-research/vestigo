@@ -67,6 +67,10 @@ All notable changes to vestigo are recorded here. The format follows
 - On Postgres, `ReleaseStore.abandon` during an acceptance of the same release waits
   for it and answers False: it took no lock, settled the release the acceptance had
   read unsettled, answered True, and the acceptance then overwrote it as accepted (#89).
+- On Postgres a sweep no longer deletes a version an alias change approved after the
+  sweep selected it: the claim's re-check read no pending change and could not see the
+  approval's uncommitted alias, and left the alias naming nothing. The re-check reads
+  pending alias changes too.
 
 ## 0.5.0 - 2026-11-08
 
