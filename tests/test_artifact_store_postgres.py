@@ -433,6 +433,22 @@ class TestFindReadyAndSetName:
         assert store.get_artifact("a1", first).state == "superseded"
 
 
+def _until_it_waits(store, thread: threading.Thread) -> None:
+    """Return once *thread* waits on a lock another session holds, or has ended."""
+    probe = store._get_connection()
+    deadline = time.monotonic() + 30
+    try:
+        while thread.is_alive():
+            assert time.monotonic() < deadline, "it never came to wait on the lock"
+            row = probe.execute("SELECT count(*) AS n FROM pg_locks WHERE NOT granted").fetchone()
+            probe.commit()
+            if row["n"]:
+                return
+            thread.join(timeout=0.05)
+    finally:
+        probe.close()
+
+
 class TestGarbageCollection:
     def test_the_current_value_survives_a_rebuild_in_flight(self, store):
         # The spare-the-current-value clause is a correlated NOT EXISTS; run
@@ -1476,25 +1492,68 @@ class TestWriterSerialization:
         assert holding_row.wait(30)
         accepting = threading.Thread(target=accept)
         accepting.start()
-        probe = store._get_connection()
-        try:
-            # Until the acceptance waits on a lock the hit holds.
-            while accepting.is_alive():
-                row = probe.execute(
-                    "SELECT count(*) AS n FROM pg_locks WHERE NOT granted"
-                ).fetchone()
-                probe.commit()
-                if row["n"]:
-                    break
-                accepting.join(timeout=0.05)
-        finally:
-            probe.close()
+        _until_it_waits(store, accepting)
         release_hit.set()
         hitting.join()
         accepting.join()
 
         assert errors == []
         assert store.get_artifact("held", held).state == "superseded"
+        assert releases.get(release.release_id).state == "accepted"
+
+    def test_a_final_release_failing_its_placeholder_while_it_is_deleted_does_not_deadlock(
+        self, store, monkeypatch
+    ):
+        """A final release with no outputs fails its build's placeholder row. It did so
+        after an audited operation took the audit lock, while a delete of the placeholder
+        holds its row and then waits for that lock."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+
+        audited, release_accept = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        run = releases._run
+
+        def pausing_after_the_audit_lock(*args, **kwargs):
+            run(*args, **kwargs)
+            audited.set()
+            assert release_accept.wait(30)
+
+        monkeypatch.setattr(releases, "_run", pausing_after_the_audit_lock)
+
+        def accept() -> None:
+            try:
+                releases.accept(
+                    release.release_id,
+                    [],
+                    [InsertAuditEvent(AuditEvent("release.accept", "alice"))],
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        def delete() -> None:
+            try:
+                store.delete_artifact("target", target)
+            except BaseException as exc:
+                errors.append(exc)
+
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        assert audited.wait(30)
+        deleting = threading.Thread(target=delete)
+        deleting.start()
+        _until_it_waits(store, deleting)
+        release_accept.set()
+        accepting.join()
+        deleting.join()
+
+        assert errors == []
         assert releases.get(release.release_id).state == "accepted"
 
     def test_duplicate_provenance_finalize_is_idempotent(self, store):

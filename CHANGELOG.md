@@ -57,7 +57,9 @@ All notable changes to vestigo are recorded here. The format follows
   (`find_ready_and_set_name`, `set_name`, `set_alias`, `set_tag`) named the version
   the release supersedes could deadlock, and Postgres aborted one of them:
   `ReleaseStore.accept` took the audit lock before the version rows, the reverse of
-  the store's order. It now promotes the outputs before it runs the operations (#86).
+  the store's order. It now promotes the outputs, and fails a final release's
+  placeholder row (which a `delete_artifact` of the placeholder deadlocked against the
+  same way), before it runs the operations (#86).
 
 ## 0.5.0 - 2026-11-08
 
