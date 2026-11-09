@@ -20,6 +20,7 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,6 +28,8 @@ from typing import Any, Protocol
 # Mirrors ``sqlite3.connect(timeout=30.0)``: a contended writer gives up, not blocks forever.
 _LOCK_TIMEOUT_MS = 30_000
 _CONNECT_TIMEOUT_SECONDS = 10
+# How long a SQLite open waits out another process making the same new file.
+_WAL_RETRY_SECONDS = 30.0
 
 # Worker threads that may call the store at once: the server sets anyio's default thread
 # limiter to this, and every store offload and sync route borrows a token from it.
@@ -272,9 +275,23 @@ class SqliteDialect:
         # Handed across threads (acquired on one, closed on another) as on Postgres; never
         # used from two at once.
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            deadline = time.monotonic() + _WAL_RETRY_SECONDS
+            while True:
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    # On a file another process is still making, the switch fails at once
+                    # with SQLITE_BUSY, without the busy handler.
+                    if str(exc) != "database is locked" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            conn.close()
+            raise
         conn.row_factory = sqlite3.Row
         return conn
 

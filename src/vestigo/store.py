@@ -864,6 +864,12 @@ def _one_active_publication(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute(_ACTIVE_PUBLICATION_INDEX_SQL)
 
 
+def _first_boot_missing(conn: StoreConnection) -> frozenset[str]:
+    """What a SQLite first boot makes that this ledger lacks, by name."""
+    present = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master")}
+    return _FIRST_BOOT_OBJECTS - present
+
+
 def _nothing(conn: StoreConnection, dialect: SqlDialect) -> None:
     """A step whose work now belongs to a consumer; the version number is kept."""
     del conn, dialect
@@ -1112,6 +1118,10 @@ CREATE TABLE IF NOT EXISTS artifact_names (
 -- Index for name lookup without tenant (personal mode)
 CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name);
 """
+# Every table and index _SCHEMA_SQL makes, and the index on active publications.
+_FIRST_BOOT_OBJECTS = frozenset(
+    re.findall(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX) IF NOT EXISTS (\w+)", _SCHEMA_SQL)
+) | {"idx_publications_active"}
 
 # The structural graph (ADR 002 §6): content-addressed nodes and their input ports,
 # under an identity scope derived from the tenant. Written by the application with
@@ -1277,9 +1287,6 @@ _CANONICAL_PROMOTE_ATTEMPTS = 3
 # None, which normalizes to the '' default tenant.
 _AUDIT_ALL_TENANTS = object()
 
-# How long a boot waits for another process's first boot of the same SQLite file.
-_BOOT_RETRY_SECONDS = 30.0
-
 
 class ArtifactStore:
     """Artifact metadata (SQLite or Postgres) over a pluggable blob store.
@@ -1370,21 +1377,6 @@ class ArtifactStore:
         """Open a connection configured by the active dialect (see ``SqliteDialect.connect``)."""
         return self._dialect.connect()
 
-    def _boot_connection(self) -> StoreConnection:
-        """The connection an open uses; on SQLite it waits out another process's first boot.
-
-        ``PRAGMA journal_mode=WAL`` on a file another process is still creating fails
-        with "database is locked" at once, without the busy handler, so it is retried.
-        """
-        deadline = time.monotonic() + _BOOT_RETRY_SECONDS
-        while True:
-            try:
-                return self._get_connection()
-            except self._dialect.operational_error as exc:
-                if "locked" not in str(exc) or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.01)
-
     @property
     def dialect(self) -> SqlDialect:
         """The metadata backend this store is using.
@@ -1416,7 +1408,7 @@ class ArtifactStore:
 
     def _init_schema(self) -> None:
         """Create the schema, or migrate an existing database to the latest version."""
-        conn = self._boot_connection()
+        conn = self._get_connection()
         try:
             # The migration below upgrades databases from older versions in SQLite's own
             # vocabulary (sqlite_master, PRAGMA, rowid). A newer backend has no such history and
@@ -1576,6 +1568,16 @@ class ArtifactStore:
             # After the SQLite-only steps above brought a legacy database to the baseline.
             # Everything from here is portable.
             self._apply_schema_migrations(conn)
+
+            # SQLite again. A v0.4.0 first boot ran its scripts one at a time and stamped
+            # the store current between them, so one killed part way lacks what came
+            # after, which no migration makes.
+            if table_exists and _first_boot_missing(conn):
+                self._dialect.begin_write(conn, "__schema__")
+                if _first_boot_missing(conn):  # Looked at again under the lock.
+                    self._dialect.execute_ddl(conn, _SCHEMA_SQL)
+                    _one_active_publication(conn, self._dialect)
+                conn.commit()
         finally:
             conn.close()
 
@@ -1948,16 +1950,27 @@ class ArtifactStore:
 
     def _require_current_schema(self) -> None:
         """Refuse a store this release would migrate, without touching it."""
-        conn = self._boot_connection()
+        conn = self._get_connection()
         try:
             current = None
             if self._dialect.schema_exists(conn, "schema_version"):
                 row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
                 current = row["version"] if row is not None else None
+            missing = (
+                _first_boot_missing(conn)
+                if current is not None and self._dialect.supports_legacy_migration
+                else frozenset()
+            )
         finally:
             conn.close()
         if current is not None and current > _LATEST_SCHEMA_VERSION:
             raise _newer_schema_error(current)
+        if missing:
+            raise StoreSchemaMismatch(
+                f"The artifact store lacks {', '.join(sorted(missing))}, which a first boot "
+                "killed part way leaves out. This command only reads, so it does not repair "
+                "it. Back the store up, then open it once with a writer of this version."
+            )
         if current is None or current < _LATEST_SCHEMA_VERSION:
             raise StoreSchemaMismatch(
                 f"The artifact store's schema is version {current or _BASELINE_SCHEMA_VERSION}, "
