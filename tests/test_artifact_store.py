@@ -2285,6 +2285,36 @@ class TestTenantNormalization:
         with pytest.raises(ValueError, match="not readable"):
             store.publish_artifact("building", 1, tenant="acme")
 
+    def test_publish_refuses_a_version_the_caller_sees_but_whose_tenant_is_another(self, store):
+        """A tenantless version is visible to every tenant, which may name it; a link is one
+        tenant's, so it is refused, but not as missing."""
+        store.create_artifact("shared", "p")
+        store.finalize_artifact("shared", 1, "{}", 1, 10)
+        assert store.set_tag("shared", 1, "k", "v", tenant="acme") is None
+        with pytest.raises(ValueError, match="publish it from that tenant") as excinfo:
+            store.publish_artifact("shared", 1, tenant="acme")
+        assert not isinstance(excinfo.value, ArtifactNotFoundError)
+        assert store.publish_artifact("shared", 1).artifact_id == "shared"
+
+    def test_finalize_naming_another_tenant_s_version_answers_it_as_missing(self, store):
+        """finalize_and_set_name told another tenant's version (building or ready)
+        from a missing one: "belongs to another tenant" against "not found"."""
+        store.create_artifact("owned", "p", tenant="acme")
+        store.write_blob("owned", 1, _ipc_bytes(1))
+        store.create_artifact("done", "q", tenant="acme")
+        store.write_blob("done", 1, _ipc_bytes(1))
+        store.finalize_artifact("done", 1, "{}", 1, 10)
+        for artifact_id in ("owned", "done", "nothing"):
+            with pytest.raises(ArtifactNotFoundError, match="not found"):
+                store.finalize_and_set_name(artifact_id, 1, "{}", 1, 10, "n", tenant="globex")
+
+    def test_retain_answers_another_tenant_s_version_as_missing(self, store):
+        store.create_artifact("owned", "p", tenant="acme")
+        store.finalize_artifact("owned", 1, "{}", 1, 10)
+        for artifact_id in ("owned", "nothing"):
+            with pytest.raises(ArtifactNotFoundError, match="not found"):
+                store.retain(artifact_id, 1, kind="pin", holder="h", tenant="globex")
+
     def test_set_tag_rejects_non_readable(self, store):
         """Tags are only allowed on readable (ready/superseded) artifacts."""
         store.create_artifact("building", "p")  # still 'building'

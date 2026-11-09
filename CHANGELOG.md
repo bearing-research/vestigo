@@ -67,10 +67,14 @@ All notable changes to vestigo are recorded here. The format follows
 - On Postgres, `ReleaseStore.abandon` during an acceptance of the same release waits
   for it and answers False: it took no lock, settled the release the acceptance had
   read unsettled, answered True, and the acceptance then overwrote it as accepted (#89).
-- `publish_artifact` answers another tenant's version as missing, with
-  `ArtifactNotFoundError` (a `ValueError`), as `set_name`, `set_alias` and `set_tag`
-  do. It named a ready version's owning tenant, and a building one's state, to a
-  caller of another tenant (#92).
+- `publish_artifact`, `finalize_and_set_name` and `retain` answer a version the caller
+  cannot write in as missing, with `ArtifactNotFoundError` (a `ValueError`), as
+  `set_name`, `set_alias` and `set_tag` do. `publish_artifact` named a ready version's
+  owning tenant, and a building one's state, to a caller of another tenant;
+  `finalize_and_set_name` with a name answered "belongs to another tenant" where a
+  missing version is "not found". A version the caller may name but not publish (a
+  tenantless one from a tenant) is still refused with a `ValueError`, not as missing
+  (#92).
 
 ## 0.5.0 - 2026-11-08
 
