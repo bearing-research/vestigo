@@ -64,6 +64,9 @@ All notable changes to vestigo are recorded here. The format follows
   at while the sweep waits for its row: the claim judged pointers and requirers from a
   snapshot taken before that wait, and the duplicate then read bytes that were gone. A
   lone version is claimed as a group is, its needs read after the claim (#87).
+- On Postgres, `ReleaseStore.abandon` during an acceptance of the same release waits
+  for it and answers False: it took no lock, settled the release the acceptance had
+  read unsettled, answered True, and the acceptance then overwrote it as accepted (#89).
 
 ## 0.5.0 - 2026-11-08
 

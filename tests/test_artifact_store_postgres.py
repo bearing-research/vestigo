@@ -1623,6 +1623,56 @@ class TestWriterSerialization:
         found = store.find_by_provenance("same-prov")
         assert found is not None
 
+    def test_an_abandon_during_an_acceptance_waits_for_it(self, store, monkeypatch):
+        """An acceptance read the release unsettled under the build's key; an abandon,
+        under none, settled it and answered True, and the acceptance then overwrote it."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+
+        checking, release_accept = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        abandoned: list[bool] = []
+        check_outputs = releases._check_outputs
+
+        def pausing_under_the_build_key(*args, **kwargs):
+            checking.set()
+            assert release_accept.wait(30)
+            return check_outputs(*args, **kwargs)
+
+        monkeypatch.setattr(releases, "_check_outputs", pausing_under_the_build_key)
+
+        def accept() -> None:
+            try:
+                releases.accept(release.release_id, [], [])
+            except BaseException as exc:
+                errors.append(exc)
+
+        def abandon() -> None:
+            try:
+                abandoned.append(releases.abandon(release.release_id, "a1"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        assert checking.wait(30)
+        abandoning = threading.Thread(target=abandon)
+        abandoning.start()
+        _until_it_waits(store, abandoning)
+        release_accept.set()
+        accepting.join()
+        abandoning.join()
+
+        assert errors == []
+        assert releases.get(release.release_id).state == "accepted"
+        assert abandoned == [False]
+
 
 class TestSchemaMigrations:
     """Evolving a Postgres store that already holds data.
