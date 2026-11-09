@@ -77,10 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_build_artifact ON artifact_builds(artifact_id, ve
 CREATE INDEX IF NOT EXISTS idx_build_lease_expires ON artifact_builds(state, lease_expires_at);
 """
 
-# Every blob key a build attempt may write. Blob stores cannot list keys, so
-# this is the only way to find an attempt that is never promoted (lost its lease,
-# or uploaded and never finalized). Kept apart from artifact_builds so existing
-# databases gain it too.
+# Every blob key a build attempt may write. The BlobStore interface lists no keys
+# (only the object stores have objects()), so this is the only way to find an
+# attempt that is never promoted (lost its lease, or uploaded and never finalized).
+# Kept apart from artifact_builds so existing databases gain it too.
 _ATTEMPT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS build_attempts (
     build_id TEXT NOT NULL,
@@ -1202,7 +1202,7 @@ class BuildStore:
         lease_owner: str | None = None,
         lease_expires_at: float | None = None,
     ) -> bool:
-        """Mark a build failed (building -> failed).
+        """Mark a build failed (pending or building -> failed).
 
         Args:
             lease_owner: When given, apply only if this owner still holds the lease,
@@ -1211,7 +1211,7 @@ class BuildStore:
                 ``complete_within``.
 
         Returns:
-            False if not found, not building, or the lease is held by someone else.
+            False if not found, not pending or building, or the lease is someone else's.
         """
         conn = self._get_connection()
         try:

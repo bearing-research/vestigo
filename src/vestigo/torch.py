@@ -1487,9 +1487,8 @@ class Ledger:
     ) -> Run:
         # Before the lease is taken: a build of another executor is no execution.
         build = self._build(execution_id)
-        if build.computation_key is None:
-            raise ValueError(f"execution {execution_id} does not exist")
-        params = build.params or {}
+        assert build.computation_key is not None, "an execution's build holds its key"
+        params = _params(build)
         recorded = params.get("inputs", {})
         if inputs is None and any(isinstance(value, dict) for value in recorded.values()):
             raise ValueError(
@@ -2835,8 +2834,8 @@ class Run:
             ValueError: *step* is not after every step this attempt has accepted.
             ReleaseRejected: this attempt no longer holds the execution, or its write
                 window closed.
-            InputChanged: a ``Path`` input's bytes changed since the run resolved
-                it, on any rank (from rank 0's future, for an asynchronous save);
+            InputChanged: a ``Path`` or ``Remote`` input's bytes changed since the run
+                resolved it, on any rank (from rank 0's future, for an asynchronous save);
                 nothing is released, and the attempt gives up its lease.
         """
         # Before anything is staged: a step again would be dropped for the one accepted,
@@ -2949,8 +2948,8 @@ class Run:
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
-            InputChanged: a ``Path`` input's bytes changed since the run resolved
-                it, on any rank; the attempt gives up its lease.
+            InputChanged: a ``Path`` or ``Remote`` input's bytes changed since the run
+                resolved it, on any rank; the attempt gives up its lease.
         """
         error: BaseException | None = None
         try:

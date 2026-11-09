@@ -25,25 +25,36 @@ The package exports nothing at its top level; a consumer imports each module.
   `PostgresDialect(dsn)`, passed as `dialect=` to the stores; `SqlDialect` and
   `StoreConnection`, the protocols they satisfy, whose `execute` binds `SqlValue`s
   and returns a `StoreCursor` of `StoreRow`s; `one(cursor)`, the row a query
-  returns without fail.
+  returns without fail; `create_tables(dialect, table, ddl)`, a consumer's own
+  tables beside the ledger's, created once per database under a lock keyed on
+  `table`.
 - `vestigo.blob_store`: `BlobSettings`, `LocalBlobStore`, `S3BlobStore`,
   `GCSBlobStore`, `AzureBlobStore`; each object store's `objects(path)` lists a
   key, or a prefix ending in `/`, of its bucket (not under the store's prefix) as
   each object's key, size and a name for its bytes, which `vestigo.torch` pins a
   `Remote` input to.
-- `vestigo.build_store`: `BuildStore(db_path, dialect=None)`, the builds with
-  their leases and attempts (`create_build`, `open_attempt` with the attempt's
-  `principal`, `renew_lease`, `lapse_lease`,
+- `vestigo.build_store`: `BuildStore(db_path, dialect=None, clock=time.time)`,
+  the builds with their leases and attempts (`create_build`, `open_attempt` with
+  the attempt's `principal`, `open_attempt_within`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `complete_attempt_within`, `list_runnable_builds` for the
   builds whose `dispatch` is `runner`; the lineage reads `builds_of(executor_ref)`,
-  `attempts_of(build_id)` and `attempts_resumed_from(release_id)`); `BuildState`
+  `attempts_of(build_id)` and `attempts_resumed_from(release_id)`); a runner's
+  steps (`claim_build`, `start_build`, `update_build_output`, `complete_build`,
+  `complete_within`, `fail_build`, `reclaim_expired_build`, `list_expired_leases`)
+  and console output (`append_console_chunk`, `take_console_chunks`,
+  `delete_console_chunks`); the blob keys an attempt may write (`record_attempt`,
+  `settled_attempts`, `forget_attempt`); `get_build`, `get_attempt`,
+  `list_builds_by_tenant`, `cleanup_old_builds` and `get_stats`; `BuildState`
   (`to_dict()` a `BuildRecord`), `AttemptState`, `BuildStats`, `DISPATCHES`;
   `get_build_store` and `reset_build_store` for the process-wide instance.
-- `vestigo.releases`: `ReleaseStore(artifacts, builds)`, a build's checkpoint
-  and final releases (`prepare`, `attach`, `accept`, `abandon`, `resume`,
-  `latest_accepted`, `bundles_of`, `collectable_checkpoints` with its `keep`
-  bound, `reference`, `authority`); `Release`, `ReleaseBundle` and the
-  `ReleaseError` family.
+- `vestigo.releases`: `ReleaseStore(artifacts, builds, clock=time.time)`, a
+  build's checkpoint and final releases (`prepare`, `attach`, `mark_prepared`,
+  `accept`, `abandon`, `resume`, `apply` for operations between releases, fenced
+  as an acceptance is; `get`, `bundle`, `releases_of`, `latest_accepted`,
+  `bundles_of`, `collectable_checkpoints` with its `keep` bound, `reference`,
+  `authority`); `lease_held(conn, build_id, attempt, now)`, the fence on a
+  transaction of the caller's; `Release`, `ReleaseBundle` and the `ReleaseError`
+  family.
 - `vestigo.operations`: the typed operations a release runs in its transaction
   (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`,
   `AdvanceReference`, `InsertAuditEvent`), with `to_json` and `from_json`.
