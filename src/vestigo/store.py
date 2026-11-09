@@ -17,6 +17,7 @@ import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
@@ -1399,10 +1400,15 @@ CREATE TABLE IF NOT EXISTS import_staging (
 _CANONICAL_PROMOTE_ATTEMPTS = 3
 
 
-# Sentinel for the tenant param of the whole-store reads (read_audit, find_dependents,
-# list_name_reads): "no tenant filter at all" (the CLI / admin view), distinct from an explicit
-# None, which normalizes to the '' default tenant.
-_AUDIT_ALL_TENANTS = object()
+class AllTenants(Enum):
+    """The tenant of the whole-store reads (``read_audit``, ``read_events``,
+    ``find_dependents``, ``list_name_reads``) by default: no tenant filter at all, for
+    the CLI and admin views; distinct from ``None``, the ``''`` default tenant."""
+
+    ALL = "all"
+
+
+ALL_TENANTS = AllTenants.ALL
 
 
 class ArtifactStore:
@@ -4385,7 +4391,7 @@ class ArtifactStore:
         name: str | None = None,
         artifact_id: str | None = None,
         limit: int = 100,
-        tenant: object = _AUDIT_ALL_TENANTS,
+        tenant: str | AllTenants | None = ALL_TENANTS,
     ) -> list[AuditEntry]:
         """Read registry audit entries, newest first; filters are ANDed.
 
@@ -4408,7 +4414,7 @@ class ArtifactStore:
             if artifact_id is not None:
                 clauses.append("artifact_id = ?")
                 params.append(artifact_id)
-            if tenant is not _AUDIT_ALL_TENANTS:
+            if tenant is not ALL_TENANTS:
                 clauses.append("tenant = ?")
                 params.append(tenant if tenant is not None else "")
             if clauses:
@@ -4424,7 +4430,7 @@ class ArtifactStore:
         self,
         since: int = 0,
         limit: int = 100,
-        tenant: object = _AUDIT_ALL_TENANTS,
+        tenant: str | AllTenants | None = ALL_TENANTS,
     ) -> list[AuditEntry]:
         """Audit entries after ``since``, oldest first, for a follower.
 
@@ -4439,7 +4445,7 @@ class ArtifactStore:
                 "FROM registry_audit WHERE seq > ?"
             )
             params: list = [since]
-            if tenant is not _AUDIT_ALL_TENANTS:
+            if tenant is not ALL_TENANTS:
                 query += " AND tenant = ?"
                 params.append(tenant if tenant is not None else "")
             query += " ORDER BY seq ASC LIMIT ?"
@@ -4826,7 +4832,7 @@ class ArtifactStore:
         self,
         artifact_id: str,
         version: int,
-        tenant: object = _AUDIT_ALL_TENANTS,
+        tenant: str | AllTenants | None = ALL_TENANTS,
     ) -> list[tuple[ArtifactVersion, str]]:
         """Find artifacts whose ``input_versions`` reference this artifact version.
 
@@ -4840,7 +4846,7 @@ class ArtifactStore:
 
         conn = self._get_connection()
         try:
-            if tenant is not _AUDIT_ALL_TENANTS:
+            if tenant is not ALL_TENANTS:
                 cursor = conn.execute(
                     f"""
                     SELECT {_VERSION_COLUMNS}
@@ -4895,7 +4901,7 @@ class ArtifactStore:
             conn.close()
 
     def list_name_reads(
-        self, tenant: object = _AUDIT_ALL_TENANTS
+        self, tenant: str | AllTenants | None = ALL_TENANTS
     ) -> list[tuple[str | None, str, str]]:
         """Return ``(tenant, artifact_id, reference)`` for each ready artifact that read a name.
 
@@ -4910,7 +4916,7 @@ class ArtifactStore:
             "WHERE state = 'ready' AND input_versions LIKE ?"
         )
         params: tuple = (f"%{prefix}%",)
-        if tenant is not _AUDIT_ALL_TENANTS:
+        if tenant is not ALL_TENANTS:
             query += " AND tenant = ?"
             params += (tenant if tenant is not None else "",)
         conn = self._get_connection()

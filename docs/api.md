@@ -16,7 +16,8 @@ The package exports nothing at its top level; a consumer imports each module.
   `finalize_canonical_together` for the `StagedVersion` records (a `building`
   version whose bytes are written) that a release's `accept` also takes;
   `register_validator(content_type, validate)`; the
-  `ArtifactVersion` record; the results as `TypedDict`s (`AuditEntry`,
+  `ArtifactVersion` record; `ALL_TENANTS` (an `AllTenants`), the whole-store
+  reads' default tenant; the results as `TypedDict`s (`AuditEntry`,
   `AliasChange` and `PendingChange`, `RetentionRoot`, `GcResult` with its
   `CollectedVersion`s, `StoreStats` and `StoreUsage`, `VerifyFinding`);
   `get_artifact_store` and `reset_artifact_store` for the process-wide instance.
