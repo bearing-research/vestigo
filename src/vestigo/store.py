@@ -4137,7 +4137,16 @@ class ArtifactStore:
                 and previous["version"] == version
             ):
                 return False  # Already points here: idempotent no-op
-            self._move_alias(conn, name, alias, artifact_id, version, previous, tenant, actor)
+            self._move_alias(
+                conn,
+                name=name,
+                alias=alias,
+                artifact_id=artifact_id,
+                version=version,
+                previous=previous,
+                tenant=tenant,
+                actor=actor,
+            )
             conn.commit()
             return True
         finally:
@@ -4146,6 +4155,7 @@ class ArtifactStore:
     def _move_alias(
         self,
         conn: StoreConnection,
+        *,
         name: str,
         alias: str,
         artifact_id: str,
@@ -4652,13 +4662,13 @@ class ArtifactStore:
                 assert entry["artifact_id"] is not None and entry["version"] is not None
                 self._move_alias(
                     conn,
-                    name,
-                    alias,
-                    entry["artifact_id"],
-                    entry["version"],
-                    previous,
-                    tenant,
-                    actor,
+                    name=name,
+                    alias=alias,
+                    artifact_id=entry["artifact_id"],
+                    version=entry["version"],
+                    previous=previous,
+                    tenant=tenant,
+                    actor=actor,
                 )
             else:
                 if previous is not None:
@@ -6171,13 +6181,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
-            stats, row = self._stats_on(
-                conn,
-                tenant,
-                include_tenantless,
-                columns=", COUNT(DISTINCT id) AS unique_artifacts, "
-                "MIN(created_at) AS oldest_artifact, MAX(created_at) AS newest_artifact",
-            )
+            stats, row = self._stats_on(conn, tenant, include_tenantless, with_span=True)
             scope = (
                 f" AND {_in_tenant('av.tenant', include_tenantless)}" if tenant is not None else ""
             )
@@ -6439,10 +6443,19 @@ class ArtifactStore:
         tenant: str | None,
         include_tenantless: bool,
         exclude_id_prefix: str | None = None,
-        columns: str = "",
+        with_span: bool = False,
     ) -> tuple[StoreStats, StoreRow]:
         """:meth:`stats` on the caller's connection, and the row of its version totals,
-        which holds *columns* too (more aggregates over the same versions)."""
+        which with *with_span* also holds ``unique_artifacts``, ``oldest_artifact`` and
+        ``newest_artifact``."""
+        span = (
+            ", COUNT(DISTINCT id) AS unique_artifacts, "
+            "MIN(created_at) AS oldest_artifact, MAX(created_at) AS newest_artifact"
+            if with_span
+            else ""
+        )
+        # total_bytes is what versions still own, as a sweep measures the store: older
+        # superseded versions count, a pointer reading another's bytes (superseded_by) never.
         stats_query = f"""
             SELECT
                 COUNT(*) as total_versions,
@@ -6454,7 +6467,7 @@ class ArtifactStore:
                                    AND superseded_by IS NULL
                                   THEN byte_size END), 0) as total_bytes,
                 COALESCE(SUM(CASE WHEN state = 'ready' THEN row_count END), 0) as total_rows
-                {columns}
+                {span}
             FROM artifact_versions
         """
         stats_params: list[str] = []

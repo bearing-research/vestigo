@@ -2464,9 +2464,11 @@ class TestTenantlessArtifactsAreVisibleToScopedQueries:
         assert store.get_usage(tenant="team-a")["total_versions"] >= 2
         assert store.stats(tenant="team-a")["total_versions"] >= 2
 
-    def test_usage_counts_the_tenant_s_unnamed_versions_and_ids(self, store):
+    def test_usage_counts_the_tenant_s_unnamed_versions_and_ids(self, backend_store):
+        store = backend_store
         self._seed(store)
         store.create_artifact("elsewhere", "prov-elsewhere", tenant="team-b")
+        store.write_blob("elsewhere", 1, _ipc_bytes(1))
         store.finalize_artifact("elsewhere", 1, "{}", 1, 10)
         store.set_name("named", "scoped", 1, tenant="team-a")
 
