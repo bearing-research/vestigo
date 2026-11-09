@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 KINDS = ("checkpoint", "final")
 UNSETTLED = ("preparing", "prepared")
+_UNSETTLED_SQL = f"state IN ({', '.join(f"'{state}'" for state in UNSETTLED)})"
 HEAD_ROOT_KIND = "head"
 """The retention root kind a reference holds its release's outputs under."""
 
@@ -359,7 +360,7 @@ class ReleaseStore:
             earlier = one(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM build_releases WHERE build_id = ? AND kind = ? "
-                    "AND sequence < ? AND state IN ('preparing', 'prepared')",
+                    f"AND sequence < ? AND {_UNSETTLED_SQL}",
                     (release.build_id, release.kind, release.sequence),
                 )
             )
@@ -442,13 +443,9 @@ class ReleaseStore:
         conn = self._connect()
         try:
             self._own(conn, release_id, attempt)
-            cursor = conn.execute(
-                "UPDATE build_releases SET state = 'abandoned', settled_at = ? "
-                "WHERE release_id = ? AND state IN ('preparing', 'prepared')",
-                (self._clock(), release_id),
-            )
+            settled = self._settle_on(conn, release_id, "abandoned")
             conn.commit()
-            return cursor.rowcount > 0
+            return settled
         finally:
             conn.close()
 
@@ -492,7 +489,7 @@ class ReleaseStore:
             unsettled = one(
                 conn.execute(
                     "SELECT COUNT(*) AS n FROM build_releases "
-                    "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
+                    f"WHERE build_id = ? AND attempt <> ? AND {_UNSETTLED_SQL}",
                     (build_id, attempt),
                 )
             )["n"]
@@ -735,14 +732,19 @@ class ReleaseStore:
         """Settle an unsettled release; one a retry settled meanwhile is left as it is."""
         conn = self._connect()
         try:
-            conn.execute(
-                "UPDATE build_releases SET state = ?, settled_at = ? "
-                "WHERE release_id = ? AND state IN ('preparing', 'prepared')",
-                (state, self._clock(), release_id),
-            )
+            self._settle_on(conn, release_id, state)
             conn.commit()
         finally:
             conn.close()
+
+    def _settle_on(self, conn: StoreConnection, release_id: str, state: str) -> bool:
+        """``_settle`` on the caller's transaction; whether the release was unsettled."""
+        cursor = conn.execute(
+            f"UPDATE build_releases SET state = ?, settled_at = ? "
+            f"WHERE release_id = ? AND {_UNSETTLED_SQL}",
+            (state, self._clock(), release_id),
+        )
+        return cursor.rowcount > 0
 
     def _sizes(self, staged: Sequence[StagedVersion]) -> dict[tuple[str, int], int | None]:
         """Each output's stored size, None where it has no bytes."""
