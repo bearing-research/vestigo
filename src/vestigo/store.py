@@ -5704,7 +5704,7 @@ class ArtifactStore:
                             continue
                         chosen[key] = row
 
-                chosen = self._with_their_pointers(conn, chosen, candidates)
+                chosen = self._with_their_pointers(conn, chosen, candidates, holds.canonical)
                 # The gap and pointer rules can keep a manifest; its files stay with it.
                 held: set[tuple[str, int]] = set()
                 while broken := split(chosen):
@@ -5713,6 +5713,7 @@ class ArtifactStore:
                         conn,
                         {key: row for key, row in chosen.items() if key not in held},
                         [row for row in candidates if (row["id"], row["version"]) not in held],
+                        holds.canonical,
                     )
                 return chosen
 
@@ -5778,17 +5779,9 @@ class ArtifactStore:
             # Pointers before their canonicals, so a canonical goes only once nothing reads it;
             # folder files after their manifests, so a file goes only once its folders did;
             # an id's lower versions before its top, which goes only once they did. A failed
-            # file is in no folder, but the claim below still sees its manifest's edge.
-            edges = [
-                (
-                    (row["from_artifact_id"], row["from_version"]),
-                    (row["to_artifact_id"], row["to_version"]),
-                )
-                for row in conn.execute(
-                    "SELECT from_artifact_id, from_version, to_artifact_id, to_version "
-                    "FROM retention_edges"
-                )
-            ]
+            # file is in no folder, but the claim below still sees its manifest's edge. The
+            # edges as the selection read them: an order only, as each claim checks them again.
+            edges = [(key, to) for key, required in holds.required.items() for to in required]
             reads = [(key, read) for key in chosen for read in holds.read_by(key)]
             groups = _deletion_order(chosen, edges, reads)
             stayed: set[tuple[str, int]] = set()
@@ -5835,109 +5828,15 @@ class ArtifactStore:
                     protected = guarded()
                     in_batch = 0
                 in_batch += len(group)
-                if len(group) > 1:
-                    if self._take_together(conn, group, protected, stayed, namers):
-                        for row in group:
-                            attempt = row["blob_attempt"]
-                            blob_id = attempt_blob_id(row["id"], attempt) if attempt else row["id"]
-                            pending.append((blob_id, row["version"]))
-                            deleted_count += 1
-                            deleted_bytes += row["byte_size"] or 0
-                    else:
-                        stay(*((row["id"], row["version"]) for row in group))
+                if not self._take(conn, group, protected, stayed, namers):
+                    stay(*((row["id"], row["version"]) for row in group))
                     continue
-                [row] = group
-                artifact_id, version, byte_size = row["id"], row["version"], row["byte_size"] or 0
-                if namers.get((artifact_id, version), set()) & stayed:
-                    stay((artifact_id, version))
-                    logger.info(
-                        "garbage_collect: keeping %s@v=%d, a folder naming it stayed.",
-                        artifact_id,
-                        version,
-                    )
-                    continue
-                if (artifact_id, version) in protected:
-                    stay((artifact_id, version))
-                    logger.info(
-                        "garbage_collect: keeping %s@v=%d, held since it was selected.",
-                        artifact_id,
-                        version,
-                    )
-                    continue
-
-                # Re-checked here, not trusted from the SELECT: a hit or a new hold during the
-                # sweep keeps the version. The no-op UPDATE also locks the row, so a use cannot
-                # land between this check and the DELETE. An edge into it from its tenant is a
-                # requirer created since the selection, or one that stayed. An id's top version
-                # goes only once no other version of it is left: a lower one that stayed keeps
-                # it, or the next create_artifact would reuse its number.
-                claimed = conn.execute(
-                    f"""
-                    UPDATE artifact_versions SET state = state
-                    WHERE {_UNHELD_SQL}
-                      AND NOT EXISTS (SELECT 1 FROM artifact_versions ptr
-                                      WHERE ptr.superseded_by = ?)
-                      AND NOT EXISTS (SELECT 1 FROM retention_edges e
-                                      WHERE e.to_artifact_id = ? AND e.to_version = ?
-                                        AND e.tenant = COALESCE(artifact_versions.tenant, ''))
-                      AND (? < (SELECT MAX(o.version) FROM artifact_versions o WHERE o.id = ?)
-                           OR NOT EXISTS (SELECT 1 FROM artifact_versions o
-                                          WHERE o.id = ? AND o.version < ?))
-                    """,
-                    (
-                        artifact_id,
-                        version,
-                        row["used"],
-                        *(artifact_id, version) * 4,
-                        f"{artifact_id}@v={version}",
-                        artifact_id,
-                        version,
-                        version,
-                        artifact_id,
-                        artifact_id,
-                        version,
-                    ),
-                )
-                # On Postgres the claim read the holds from a snapshot older than its wait for
-                # the row lock; a hold that committed during the wait shows in a later read.
-                if claimed.rowcount == 0 or self._held_now(conn, artifact_id, version):
-                    stay((artifact_id, version))
-                    logger.info(
-                        "garbage_collect: keeping %s@v=%d, used or held since it was selected.",
-                        artifact_id,
-                        version,
-                    )
-                    continue
-
-                # A savepoint per row: on Postgres a failed statement aborts the whole
-                # transaction, and the closing commit would then silently roll back every row.
-                conn.execute("SAVEPOINT gc_row")
-                try:
-                    self._delete_version_children(conn, artifact_id, version)
-                    conn.execute(
-                        "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
-                        (artifact_id, version),
-                    )
-                except self._dialect.integrity_error:
-                    # A name or alias was pointed at this version since the SELECT above; the
-                    # pointer wins. Skip it (uncounted, blob untouched) rather than fail the whole
-                    # sweep on one race.
-                    conn.execute("ROLLBACK TO SAVEPOINT gc_row")
-                    stay((artifact_id, version))
-                    logger.info(
-                        "garbage_collect: skipping %s@v=%d, something referenced "
-                        "it after it was selected.",
-                        artifact_id,
-                        version,
-                    )
-                    continue
-                conn.execute("RELEASE SAVEPOINT gc_row")
-
-                attempt = row["blob_attempt"]
-                blob_id = attempt_blob_id(artifact_id, attempt) if attempt else artifact_id
-                pending.append((blob_id, version))
-                deleted_count += 1
-                deleted_bytes += byte_size
+                for row in group:
+                    attempt = row["blob_attempt"]
+                    blob_id = attempt_blob_id(row["id"], attempt) if attempt else row["id"]
+                    pending.append((blob_id, row["version"]))
+                    deleted_count += 1
+                    deleted_bytes += row["byte_size"] or 0
 
             conn.commit()
             # Only rows whose delete committed lose their bytes.
@@ -6001,7 +5900,7 @@ class ArtifactStore:
             numbers.sort(reverse=True)
         return results
 
-    def _take_together(
+    def _take(
         self,
         conn: StoreConnection,
         group: Sequence[StoreRow],
@@ -6009,12 +5908,14 @@ class ArtifactStore:
         stayed: set[tuple[str, int]],
         namers: Mapping[tuple[str, int], set[tuple[str, int]]],
     ) -> bool:
-        """Delete *group*'s rows, which need each other gone first, all or none.
+        """Delete *group*'s rows, one or several that need each other gone first, all or
+        none.
 
-        Each is claimed as a lone row is (not used or held since it was selected), and
-        none may be needed from outside the group: a pointer at it, a requirer of its
-        tenant, a lower version of an id whose top it takes. False, with nothing
-        deleted, when any one stays.
+        Re-checked here, not trusted from the selection: each row is claimed only if
+        nothing used or held it since, and none may be needed from outside the group: a
+        pointer at it, a requirer of its tenant, a lower version of an id whose top it
+        takes. The claim's no-op UPDATE locks the row, so a use cannot land between it
+        and the DELETE. False, with nothing deleted, when any one stays.
         """
         keys = {(row["id"], row["version"]) for row in group}
         label = ", ".join(f"{a}@v={v}" for a, v in sorted(keys))
@@ -6024,8 +5925,13 @@ class ArtifactStore:
         if keys & protected:
             logger.info("garbage_collect: keeping %s, one held since they were selected.", label)
             return False
+        # A savepoint: on Postgres a failed statement aborts the whole transaction, and
+        # the batch's commit would then silently roll back every row.
         conn.execute("SAVEPOINT gc_group")
         try:
+            # The needs are read after every claim, not in it: on Postgres a claim
+            # judges its subqueries from a snapshot older than its wait for the row
+            # lock, and a pointer committed during that wait shows only in a later read.
             taken = all(self._claim_unheld(conn, row) for row in group)
             taken = taken and not self._needed_outside(conn, keys)
             if taken:
@@ -6091,20 +5997,15 @@ class ArtifactStore:
         conn: StoreConnection,
         chosen: dict[tuple[str, int], StoreRow],
         candidates: list[StoreRow],
+        pointers: dict[tuple[str, int], tuple[str, int]],
     ) -> dict[tuple[str, int], StoreRow]:
         """``chosen`` without version gaps, with each chosen canonical's pointers.
 
         A version overtaken by a duplicate reads its canonical's bytes, so it goes with
         the canonical; a canonical whose pointer must stay (held, recently used, or the
-        top of its id) stays too.
+        top of its id) stays too. *pointers* is ``_Holds.canonical``: one made since is
+        a reader the claim of its canonical finds.
         """
-        pointers = {
-            (row["id"], row["version"]): _split_ref(row["superseded_by"])
-            for row in conn.execute(
-                "SELECT id, version, superseded_by FROM artifact_versions "
-                "WHERE superseded_by IS NOT NULL"
-            ).fetchall()
-        }
         by_key = {(row["id"], row["version"]): row for row in candidates}
         # A pointer the gap rule dropped is never offered again, so this ends.
         dropped: set[tuple[str, int]] = set()
