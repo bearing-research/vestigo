@@ -526,6 +526,76 @@ def test_create_tables_runs_its_ddl_once_per_database(backend_store):
             conn.close()
 
 
+def _audit_seqs(conn) -> list[int]:
+    return [row["seq"] for row in conn.execute("SELECT seq FROM registry_audit ORDER BY seq")]
+
+
+def test_after_a_copy_with_explicit_keys_the_next_insert_follows_the_largest(backend_store):
+    # A migration copies rows with their own keys; a Postgres sequence does not see them.
+    dialect = backend_store._dialect
+    conn = dialect.connect()
+    try:
+        for seq in (1, 7):
+            conn.execute(
+                "INSERT INTO registry_audit (seq, at, action) VALUES (?, 0, 'copied')", (seq,)
+            )
+        # Twice: a resumed migration resyncs again, and must land on the same value.
+        dialect.resync_autoincrement(conn, "registry_audit", "seq")
+        dialect.resync_autoincrement(conn, "registry_audit", "seq")
+        conn.commit()
+
+        conn.execute("INSERT INTO registry_audit (at, action) VALUES (0, 'new')")
+        conn.commit()
+
+        assert _audit_seqs(conn) == [1, 7, 8]
+    finally:
+        conn.close()
+
+
+def test_a_duplicate_key_is_rejectable(backend_store):
+    dialect = backend_store._dialect
+    insert = "INSERT INTO registry_audit (seq, at, action) VALUES (1, 0, 'copied')"
+    conn = dialect.connect()
+    try:
+        conn.execute(insert)
+        with pytest.raises(dialect.rejectable_errors):
+            conn.execute(insert)
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_an_error_that_is_not_the_row_s_is_not_rejectable(backend_store):
+    # A missing table fails every row; a copy that swallowed it would report each as rejected.
+    dialect = backend_store._dialect
+    conn = dialect.connect()
+    try:
+        missing_table = (
+            sqlite3.OperationalError if dialect.name == "sqlite" else psycopg.errors.UndefinedTable
+        )
+        with pytest.raises(missing_table) as excinfo:
+            conn.execute("INSERT INTO no_such_table (x) VALUES (1)")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert not isinstance(excinfo.value, dialect.rejectable_errors)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_a_nul_byte_postgres_refuses_in_text_is_rejectable(postgres_store):
+    # SQLite stores the byte; a copy into Postgres meets it in executor logs or tag values.
+    dialect = postgres_store._dialect
+    conn = dialect.connect()
+    try:
+        with pytest.raises(dialect.rejectable_errors):
+            conn.execute("INSERT INTO registry_audit (at, action) VALUES (0, ?)", ("a\x00b",))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 class TestPooledConnectionLifecycle:
