@@ -42,6 +42,17 @@ All notable changes to vestigo are recorded here. The format follows
   script, and the index of one active publication per version, when it died after the
   stamp, revoking all but the oldest live link as migration 10 does. A read-only open
   refuses such a ledger with `StoreSchemaMismatch` (#80).
+- `finalize_and_set_name` that another process finalized first, into a pointer at
+  another id, returns that canonical and names it, as a retry does; it returned the
+  pointer row and set no name. A version the other process failed raises `ValueError`
+  as for a retry (#83).
+- `promote_version`'s copy names the node that produced its source (`definition_of`);
+  it had none, so `versions_lacking_definition` listed it (#83).
+- `vestigo.torch`: a rank interrupted (`KeyboardInterrupt`, `SystemExit`) while
+  `Run.finish` waits for its save in flight tells the other ranks, which raise it,
+  instead of leaving them waiting at the finish until the group's timeout (#83).
+- `vestigo.torch`: `Ledger.observations` raises `ValueError` for an id that is no
+  execution, a derivation's build included, as `execution` does; it returned `[]` (#83).
 
 ## 0.5.0 - 2026-11-08
 

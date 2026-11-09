@@ -2111,10 +2111,12 @@ class Ledger:
         return StagedVersion(artifact_id, version, "", None, size, hasher.hexdigest())
 
     def observations(self, execution_id: str) -> list[ArtifactVersion]:
-        """The implementations the execution's attempts recorded, oldest first."""
-        build = self.builds.get_build(execution_id)
-        if build is None or build.computation_key is None:
-            raise ValueError(f"execution {execution_id} does not exist")
+        """The implementations the execution's attempts recorded, oldest first.
+
+        Raises:
+            ValueError: the execution does not exist.
+        """
+        self._build(execution_id)
         # By id, not by computation key: the key's outputs are every checkpoint file.
         found = [
             v
@@ -2950,11 +2952,12 @@ class Run:
             InputChanged: a ``Path`` input's bytes changed since the run resolved
                 it, on any rank; the attempt gives up its lease.
         """
-        error: Exception | None = None
+        error: BaseException | None = None
         try:
             self._drain()
-        except Exception as exc:
-            # Every rank meets at the gather below: one that cannot wait says so first.
+        except BaseException as exc:
+            # An interrupt too: every rank meets at the gather below, and one that cannot
+            # wait says so first.
             error = exc
         self._ranks.raise_any(error)
         # A remote input names the same objects on every rank: rank 0 lists them.

@@ -1838,6 +1838,8 @@ def test_executions_are_found_by_program_by_model_and_by_input(ledger: Ledger, t
     for missing in ("0" * 32, derived.release.build_id):
         with pytest.raises(ValueError, match="does not exist"):
             ledger.execution(missing)
+        with pytest.raises(ValueError, match="does not exist"):
+            ledger.observations(missing)
 
 
 def test_descendants_are_the_branches_of_a_run_at_any_depth(ledger: Ledger):
@@ -3626,8 +3628,9 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
     ``otherledger``, a ledger that fails to answer in ``unreachable``, and a copy with
     other bytes in ``badcopy``. In ``unread`` rank 0's copy cannot be read for step 2's
     asynchronous acceptance, and in ``closefails`` rank 0's manager fails to close at
-    the finish. Under a 10 second group timeout, rank 1 never comes to the run in
-    ``stall``, and in ``lost`` dies as rank 0 sends it the opened run.
+    the finish, in ``closeinterrupted`` with an interrupt. Under a 10 second group
+    timeout, rank 1 never comes to the run in ``stall``, and in ``lost`` dies as rank 0
+    sends it the opened run.
 
     Asynchronous, the group gets its rank directly and the environment names none, so
     the writer's subprocess has only what each rank configured.
@@ -3712,7 +3715,7 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
         outcome.update(error=type(exc).__name__, message=str(exc))
         outcome["seconds"] = time.monotonic() - started
         run = None
-    if run is not None and case in ("unread", "closefails"):
+    if run is not None and case in ("unread", "closefails", "closeinterrupted"):
         outcome["execution"] = run.execution_id
         for step in (1, 2):
             if rank == 0 and step == 2 and case == "unread":
@@ -3726,18 +3729,20 @@ def _rank_main(rank: int, world: int, root: str, case: str, signing_key: bytes) 
                 outcome.update(error=type(exc).__name__, message=str(exc))
             finally:
                 copy.chmod(0o600)
-        if rank == 0 and case == "closefails":
+        if rank == 0 and case in ("closefails", "closeinterrupted"):
             close = run.manager.close
 
             def fails_once() -> None:
                 run.manager.close = close  # type: ignore[method-assign]
+                if case == "closeinterrupted":
+                    raise KeyboardInterrupt
                 raise OSError("the manager did not close")
 
             run.manager.close = fails_once  # type: ignore[method-assign]
         try:
             run.finish()
             outcome["finished"] = True
-        except (OSError, InputChanged) as exc:
+        except (OSError, InputChanged, KeyboardInterrupt) as exc:
             outcome.update(error=type(exc).__name__, message=str(exc))
         run.close()
     elif run is not None:
@@ -3951,6 +3956,16 @@ def test_a_rank_that_cannot_wait_for_its_save_stops_every_rank_s_finish(tmp_path
         assert each["error"] == "OSError" and "the manager did not close" in each["message"]
     with Ledger(tmp_path / "ledger") as ledger:
         assert ledger.builds.get_build(outcomes[0]["execution"]).state == "building"
+
+
+def test_a_rank_interrupted_waiting_for_its_save_stops_every_rank_s_finish(tmp_path: Path):
+    exits, outcomes, _ = _two_ranks(tmp_path, "closeinterrupted")
+
+    # Rank 1 hears of it at the finish's gather rather than waiting there for rank 0.
+    assert exits == [0, 0]
+    for each in outcomes:
+        assert each is not None and each["saved"] == [1, 2] and "finished" not in each
+        assert each["error"] == "KeyboardInterrupt"
 
 
 def test_a_rank_that_never_comes_stops_rank_0_at_the_group_s_timeout(tmp_path: Path):
