@@ -5,6 +5,17 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Several processes opening a new SQLite ledger together through `BuildStore` or
+  `create_tables` no longer fail with "database is locked" at the switch to WAL:
+  `SqliteDialect.connect` waits out the process making the file, as only
+  `ArtifactStore` did (#80).
+- A SQLite ledger whose 0.4.0 first boot was killed part way is repaired on open: the
+  name pointers' table, when the boot died before it, and the index of one active
+  publication per version, when it died after the stamp, revoking all but the oldest
+  live link as migration 10 does (#80).
+
 ## 0.5.0 - 2026-11-08
 
 ### Changed
