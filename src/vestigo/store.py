@@ -729,9 +729,10 @@ def _add_content_sha256(conn: StoreConnection, dialect: SqlDialect) -> None:
 
 def _in_tenant(column: str, include_tenantless: bool) -> str:
     """A condition on *column* for one tenant's rows (its one parameter), with the legacy
-    tenantless rows (``''``; an open turns a NULL into it) when *include_tenantless*."""
+    tenantless rows when *include_tenantless*: ``''``, or NULL, which a legacy SQLite
+    column still admits after the open that normalized it."""
     if include_tenantless:
-        return f"({column} = ? OR {column} = '')"
+        return f"({column} = ? OR {column} = '' OR {column} IS NULL)"
     return f"{column} = ?"
 
 
@@ -2067,7 +2068,7 @@ class ArtifactStore:
             row = conn.execute(
                 "SELECT id, version FROM artifact_versions "
                 "WHERE provenance_hash = ? AND state = 'ready' "
-                "AND tenant = ''",
+                "AND (tenant = '' OR tenant IS NULL)",
                 (record.provenance_hash,),
             ).fetchone()
         return (row["id"], row["version"]) if row is not None else None
@@ -3332,7 +3333,7 @@ class ArtifactStore:
                     SELECT {_VERSION_COLUMNS}, last_used_at
                     FROM artifact_versions
                     WHERE provenance_hash = ? AND state = 'ready'
-                      AND tenant = ''
+                      AND (tenant = '' OR tenant IS NULL)
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
