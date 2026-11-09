@@ -23,7 +23,9 @@ The package exports nothing at its top level; a consumer imports each module.
   `get_artifact_store` and `reset_artifact_store` for the process-wide instance.
 - `vestigo.sql_backend`: `SqliteDialect` (the default) and
   `PostgresDialect(dsn)`, passed as `dialect=` to the stores; `SqlDialect` and
-  `StoreConnection`, the protocols they satisfy.
+  `StoreConnection`, the protocols they satisfy, whose `execute` binds `SqlValue`s
+  and returns a `StoreCursor` of `StoreRow`s; `one(cursor)`, the row a query
+  returns without fail.
 - `vestigo.blob_store`: `BlobSettings`, `LocalBlobStore`, `S3BlobStore`,
   `GCSBlobStore`, `AzureBlobStore`; each object store's `objects(path)` lists a
   key, or a prefix ending in `/`, of its bucket (not under the store's prefix) as

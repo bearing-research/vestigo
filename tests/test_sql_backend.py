@@ -24,6 +24,7 @@ from vestigo.sql_backend import (
     _Row,
     advisory_lock_id,
     create_tables,
+    one,
     translate_placeholders,
 )
 from vestigo.store import _FIRST_BOOT_OBJECTS, ArtifactStore, StoreSchemaMismatch
@@ -1059,3 +1060,16 @@ def test_a_ledger_a_killed_0_4_first_boot_stamped_without_its_publication_index_
         conn.close()
     assert live == [("a" * 64,)]
     assert withdrawn == [("b" * 64,)]
+
+
+def test_one_returns_the_row_and_refuses_none(tmp_path: Path):
+    """A query whose row the caller's lock or lease guarantees: its absence is named,
+    not a TypeError from subscripting None."""
+    conn = SqliteDialect(tmp_path / "db.sqlite").connect()
+    try:
+        assert one(conn.execute("SELECT 7 AS n"))["n"] == 7
+        conn.execute("CREATE TABLE t (x)")
+        with pytest.raises(LookupError, match="returned none"):
+            one(conn.execute("SELECT x FROM t"))
+    finally:
+        conn.close()

@@ -38,7 +38,10 @@ from vestigo.releases import RELEASE_DDL
 from vestigo.sql_backend import (
     SqlDialect,
     SqliteDialect,
+    SqlValue,
     StoreConnection,
+    StoreRow,
+    one,
 )
 
 if TYPE_CHECKING:
@@ -188,10 +191,10 @@ _UNHELD_SQL = """
 
 
 def _deletion_order(
-    chosen: Mapping[tuple[str, int], Any],
+    chosen: Mapping[tuple[str, int], StoreRow],
     edges: Collection[tuple[tuple[str, int], tuple[str, int]]],
     reads: Collection[tuple[tuple[str, int], tuple[str, int]]] = (),
-) -> list[list[Any]]:
+) -> list[list[StoreRow]]:
     """*chosen*'s rows in groups, each after every chosen row the sweep's claim needs
     gone first.
 
@@ -282,7 +285,7 @@ def _deletion_order(
                 waiting[b] += 1
     ready = [(rank(groups[g][0]), g) for g, count in enumerate(waiting) if count == 0]
     heapq.heapify(ready)
-    ordered: list[list[Any]] = []
+    ordered: list[list[StoreRow]] = []
     while ready:
         _, g = heapq.heappop(ready)
         ordered.append([chosen[key] for key in groups[g]])
@@ -439,7 +442,7 @@ _VERSION_COLUMNS = ", ".join(_VERSION_FIELDS)
 _VERSION_COLUMNS_AV = ", ".join("av." + field for field in _VERSION_FIELDS)
 
 
-def _version_from_row(row: Any) -> ArtifactVersion:
+def _version_from_row(row: StoreRow) -> ArtifactVersion:
     """An ``ArtifactVersion`` from a row holding ``_VERSION_FIELDS``, by name."""
     return ArtifactVersion(**{field: row[field] for field in _VERSION_FIELDS})
 
@@ -1749,12 +1752,14 @@ class ArtifactStore:
             if self._held_by_another_tenant(conn, artifact_id, tenant):
                 conn.rollback()
                 raise ArtifactIdTaken(f"{artifact_id} already exists under another tenant")
-            row = conn.execute(
-                "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
-                "COALESCE(MAX(minted), 0) AS was_minted "
-                "FROM artifact_versions WHERE id = ?",
-                (artifact_id,),
-            ).fetchone()
+            row = one(
+                conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
+                    "COALESCE(MAX(minted), 0) AS was_minted "
+                    "FROM artifact_versions WHERE id = ?",
+                    (artifact_id,),
+                )
+            )
             # By name: a Postgres row unpacks to its column names, not values.
             version, was_minted = int(row["next_version"]), row["was_minted"]
 
@@ -2388,7 +2393,7 @@ class ArtifactStore:
                             record.version,
                         ),
                     ).rowcount
-                if filled:
+                if filled and failed is not None:
                     old_attempt = failed["blob_attempt"]
                     replaced_blob = (
                         attempt_blob_id(record.id, old_attempt) if old_attempt else record.id,
@@ -2584,12 +2589,14 @@ class ArtifactStore:
                 if self._held_by_another_tenant(conn, artifact_id, tenant):
                     conn.rollback()
                     raise ArtifactIdTaken(f"{artifact_id} already exists under another tenant")
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
-                    "COALESCE(MAX(minted), 0) AS was_minted "
-                    "FROM artifact_versions WHERE id = ?",
-                    (artifact_id,),
-                ).fetchone()
+                row = one(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(version), 0) + 1 AS next_version, "
+                        "COALESCE(MAX(minted), 0) AS was_minted "
+                        "FROM artifact_versions WHERE id = ?",
+                        (artifact_id,),
+                    )
+                )
                 new_version = int(row["next_version"])
                 conn.execute(
                     """
@@ -2766,7 +2773,7 @@ class ArtifactStore:
 
     @staticmethod
     def _versions_where(
-        conn: StoreConnection, where: str, params: tuple[Any, ...]
+        conn: StoreConnection, where: str, params: tuple[SqlValue, ...]
     ) -> list[ArtifactVersion]:
         """The versions matching a condition, on the caller's connection, oldest first."""
         rows = conn.execute(
@@ -3124,7 +3131,7 @@ class ArtifactStore:
                 "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
                 (artifact_id, version),
             ).fetchone()
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             conn.execute(
                 """
                 UPDATE artifact_versions
@@ -3315,7 +3322,7 @@ class ArtifactStore:
                 "SELECT last_used_at, tenant FROM artifact_versions WHERE id = ? AND version = ?",
                 (artifact_id, version),
             ).fetchone()
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             self._note_use(conn, artifact_id, version, row["last_used_at"])
         finally:
             conn.close()
@@ -3496,14 +3503,15 @@ class ArtifactStore:
 
     @classmethod
     def _require_writable_target(
-        cls, row, artifact_id: str, version: int, tenant: str | None
-    ) -> None:
-        """Raise :class:`ArtifactNotFoundError` unless ``row`` exists and ``tenant`` may use it.
+        cls, row: StoreRow | None, artifact_id: str, version: int, tenant: str | None
+    ) -> StoreRow:
+        """``row``, which exists and ``tenant`` may use, else :class:`ArtifactNotFoundError`.
 
         Checked before the row's state, which would otherwise describe another tenant's artifact.
         """
         if row is None or not cls._can_assign_name_for_tenant(row["tenant"] or None, tenant):
             raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
+        return row
 
     def _lock_target(
         self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
@@ -3561,7 +3569,7 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             row = self._lock_target(conn, artifact_id, version)
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             if row["state"] not in ("ready", "superseded"):
                 raise ValueError(
                     f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
@@ -3955,7 +3963,7 @@ class ArtifactStore:
         key = publication_key(token)
         raw = "" if key == token else token
         assignments: list[str] = []
-        params: list[Any] = []
+        params: list[SqlValue] = []
         if authors is not None:
             assignments.append("authors = ?")
             params.append(_json_or_none(_clean_entries(authors, ("name", "orcid", "affiliation"))))
@@ -3974,11 +3982,13 @@ class ArtifactStore:
                 if cursor.rowcount == 0:
                     conn.commit()
                     return None
-                bound = conn.execute(
-                    "SELECT artifact_id, version FROM artifact_publications "
-                    "WHERE token = ? AND tenant = ?",
-                    (key, effective_tenant),
-                ).fetchone()
+                bound = one(
+                    conn.execute(
+                        "SELECT artifact_id, version FROM artifact_publications "
+                        "WHERE token = ? AND tenant = ?",
+                        (key, effective_tenant),
+                    )
+                )
                 self._audit_in_connection(
                     conn,
                     action="credit",
@@ -4080,7 +4090,7 @@ class ArtifactStore:
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
             row = self._lock_target(conn, artifact_id, version)
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             if row["state"] not in ("ready", "superseded"):
                 raise ValueError(
                     f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
@@ -4261,7 +4271,7 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             row = self._lock_target(conn, artifact_id, version)
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             if row["state"] not in ("ready", "superseded"):
                 raise ValueError(
                     f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
@@ -4407,7 +4417,7 @@ class ArtifactStore:
                 "FROM registry_audit"
             )
             clauses: list[str] = []
-            params: list = []
+            params: list[SqlValue] = []
             if name is not None:
                 clauses.append("name = ?")
                 params.append(name)
@@ -4444,7 +4454,7 @@ class ArtifactStore:
                 "from_artifact_id, from_version, to_version, key, value, tenant "
                 "FROM registry_audit WHERE seq > ?"
             )
-            params: list = [since]
+            params: list[SqlValue] = [since]
             if tenant is not ALL_TENANTS:
                 query += " AND tenant = ?"
                 params.append(tenant if tenant is not None else "")
@@ -4478,7 +4488,7 @@ class ArtifactStore:
                 if artifact_id is None or version is None:
                     raise ValueError("alias 'set' request requires artifact_id and version")
                 row = self._lock_target(conn, artifact_id, version)
-                self._require_writable_target(row, artifact_id, version, tenant)
+                row = self._require_writable_target(row, artifact_id, version, tenant)
                 if row["state"] not in ("ready", "superseded"):
                     raise ValueError(
                         f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
@@ -4915,7 +4925,7 @@ class ArtifactStore:
             "SELECT id, tenant, input_versions FROM artifact_versions "
             "WHERE state = 'ready' AND input_versions LIKE ?"
         )
-        params: tuple = (f"%{prefix}%",)
+        params: tuple[SqlValue, ...] = (f"%{prefix}%",)
         if tenant is not ALL_TENANTS:
             query += " AND tenant = ?"
             params += (tenant if tenant is not None else "",)
@@ -4992,7 +5002,7 @@ class ArtifactStore:
                         ON av.id = an.artifact_id AND av.version = an.version
                     WHERE {_starts_with("an.name")}
                 """
-                params: list = [name_prefix, name_prefix]
+                params: list[SqlValue] = [name_prefix, name_prefix]
 
                 if tenant is not None:
                     query += " AND (av.tenant = ? OR av.tenant = '' OR av.tenant IS NULL)"
@@ -5367,7 +5377,7 @@ class ArtifactStore:
                 "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
                 (artifact_id, version),
             ).fetchone()
-            self._require_writable_target(row, artifact_id, version, tenant)
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             conn.execute(
                 "UPDATE artifact_versions SET state = 'superseded' "
                 "WHERE id = ? AND version = ? AND state = 'ready'",
@@ -5448,7 +5458,7 @@ class ArtifactStore:
             "DELETE FROM retention_roots "
             "WHERE artifact_id = ? AND version = ? AND kind = ? AND holder = ?"
         )
-        params: list[Any] = [artifact_id, version, kind, holder]
+        params: list[SqlValue] = [artifact_id, version, kind, holder]
         if tenant is not None:
             sql += " AND tenant = ?"
             params.append(tenant)
@@ -5470,7 +5480,7 @@ class ArtifactStore:
     ) -> list[RetentionRoot]:
         """Roots, oldest first, optionally for one version, one kind and one tenant."""
         clauses: list[str] = []
-        params: list[Any] = []
+        params: list[SqlValue] = []
         for column, value in (
             ("artifact_id", artifact_id),
             ("version", version),
@@ -5616,7 +5626,7 @@ class ArtifactStore:
                     " OR tenant = '' OR tenant IS NULL)" if include_tenantless else ")"
                 )
                 size_params.append(tenant)
-            store_bytes = int(conn.execute(size_sql, size_params).fetchone()[0])
+            store_bytes = int(one(conn.execute(size_sql, size_params))[0])
 
             # A folder's files are versions of their own, which its manifest requires. A
             # manifest kept while a file it names goes is a broken folder, and a
@@ -5627,11 +5637,11 @@ class ArtifactStore:
                 for named in files:
                     namers.setdefault(named, set()).add(manifest)
 
-            def split(picked: dict[tuple[str, int], Any]) -> set[tuple[str, int]]:
+            def split(picked: dict[tuple[str, int], StoreRow]) -> set[tuple[str, int]]:
                 """The files in *picked* that a manifest not in it names."""
                 return {key for key in picked if any(m not in picked for m in namers.get(key, ()))}
 
-            def select(protected: set[tuple[str, int]]) -> dict[tuple[str, int], Any]:
+            def select(protected: set[tuple[str, int]]) -> dict[tuple[str, int], StoreRow]:
                 """What the sweep takes while *protected* stays."""
                 candidates = [row for row in rows if (row["id"], row["version"]) not in protected]
                 if wanted:
@@ -5645,7 +5655,7 @@ class ArtifactStore:
                     candidates = sorted(
                         candidates + current, key=lambda r: (r["used"], r["id"], r["version"])
                     )
-                chosen: dict[tuple[str, int], Any] = {
+                chosen: dict[tuple[str, int], StoreRow] = {
                     (row["id"], row["version"]): row
                     for row in candidates
                     if (row["id"], row["version"]) in wanted
@@ -5984,7 +5994,7 @@ class ArtifactStore:
     def _take_together(
         self,
         conn: StoreConnection,
-        group: Sequence[Any],
+        group: Sequence[StoreRow],
         protected: set[tuple[str, int]],
         stayed: set[tuple[str, int]],
         namers: Mapping[tuple[str, int], set[tuple[str, int]]],
@@ -6027,7 +6037,7 @@ class ArtifactStore:
         conn.execute("RELEASE SAVEPOINT gc_group")
         return taken
 
-    def _claim_unheld(self, conn: StoreConnection, row: Any) -> bool:
+    def _claim_unheld(self, conn: StoreConnection, row: StoreRow) -> bool:
         """Lock *row*'s version if nothing used or held it since it was selected."""
         artifact_id, version = row["id"], row["version"]
         claimed = conn.execute(
@@ -6067,8 +6077,11 @@ class ArtifactStore:
         return False
 
     def _with_their_pointers(
-        self, conn: StoreConnection, chosen: dict[tuple[str, int], Any], candidates: list
-    ) -> dict[tuple[str, int], Any]:
+        self,
+        conn: StoreConnection,
+        chosen: dict[tuple[str, int], StoreRow],
+        candidates: list[StoreRow],
+    ) -> dict[tuple[str, int], StoreRow]:
         """``chosen`` without version gaps, with each chosen canonical's pointers.
 
         A version overtaken by a duplicate reads its canonical's bytes, so it goes with
@@ -6107,8 +6120,8 @@ class ArtifactStore:
         used: float,
         folders: dict[tuple[str, int], set[tuple[str, int]]],
         namers: dict[tuple[str, int], set[tuple[str, int]]],
-        candidates: dict[tuple[str, int], Any],
-        chosen: dict[tuple[str, int], Any],
+        candidates: dict[tuple[str, int], StoreRow],
+        chosen: dict[tuple[str, int], StoreRow],
     ) -> set[tuple[str, int]] | None:
         """*key* with its folder, for the byte cap to evict as one; ``None`` if it must stay.
 
@@ -6140,8 +6153,8 @@ class ArtifactStore:
 
     @staticmethod
     def _without_version_gaps(
-        conn: StoreConnection, chosen: dict[tuple[str, int], Any]
-    ) -> dict[tuple[str, int], Any]:
+        conn: StoreConnection, chosen: dict[tuple[str, int], StoreRow]
+    ) -> dict[tuple[str, int], StoreRow]:
         """``chosen``, less any id's highest version whose lower versions stay.
 
         Otherwise the next ``create_artifact`` for that id would reuse the number.
@@ -6206,7 +6219,7 @@ class ArtifactStore:
                 usage_params.append(tenant)
 
             cursor = conn.execute(usage_query, usage_params)
-            row = cursor.fetchone()
+            row = one(cursor)
 
             if tenant is not None:
                 cursor = conn.execute(
@@ -6216,7 +6229,7 @@ class ArtifactStore:
                 )
             else:
                 cursor = conn.execute("SELECT COUNT(*) as count FROM artifact_names")
-            names_count = cursor.fetchone()["count"]
+            names_count = one(cursor)["count"]
 
             unreferenced_query = """
                 SELECT COUNT(*) as count
@@ -6233,7 +6246,7 @@ class ArtifactStore:
                 )
                 unreferenced_params.append(tenant)
             cursor = conn.execute(unreferenced_query, unreferenced_params)
-            unreferenced_count = cursor.fetchone()["count"]
+            unreferenced_count = one(cursor)["count"]
 
             return {
                 "unique_artifacts": row["unique_artifacts"],
@@ -6517,13 +6530,14 @@ class ArtifactStore:
                 stats_query += " WHERE " + " AND ".join(conditions)
 
             cursor = conn.execute(stats_query, stats_params)
-            row = cursor.fetchone()
+            row = one(cursor)
             total_bytes = row["total_bytes"]
             if exclude_id_prefix:
                 # An included pointer reads its canonical's bytes, which may be excluded.
                 scoped = tenant is not None
-                held = conn.execute(
-                    f"""
+                held = one(
+                    conn.execute(
+                        f"""
                     SELECT COALESCE(SUM(c.byte_size), 0) AS held
                     FROM artifact_versions c
                     WHERE c.state IN ('ready', 'superseded') AND c.superseded_by IS NULL
@@ -6534,11 +6548,12 @@ class ArtifactStore:
                                     AND NOT {_starts_with("p.id")}
                                     {f"AND {in_tenant('p.')}" if scoped else ""})
                     """,
-                    [exclude_id_prefix] * 2
-                    + ([tenant] if scoped else [])
-                    + [exclude_id_prefix] * 2
-                    + ([tenant] if scoped else []),
-                ).fetchone()
+                        [exclude_id_prefix] * 2
+                        + ([tenant] if scoped else [])
+                        + [exclude_id_prefix] * 2
+                        + ([tenant] if scoped else []),
+                    )
+                )
                 total_bytes += held["held"]
 
             if tenant is not None:
@@ -6549,7 +6564,7 @@ class ArtifactStore:
                 )
             else:
                 cursor = conn.execute("SELECT COUNT(*) as count FROM artifact_names")
-            names_count = cursor.fetchone()["count"]
+            names_count = one(cursor)["count"]
 
             return {
                 "total_versions": row["total_versions"],
