@@ -33,6 +33,7 @@ from vestigo.store import (
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
+    NameStatus,
     StagedVersion,
     _deletion_order,
     _Holds,
@@ -410,6 +411,55 @@ class TestBlobIO:
 
         assert store.read_blob("test-id", version) == data
 
+    def test_an_attempt_that_was_not_promoted_loses_its_bytes(self, backend_store):
+        version = backend_store.create_artifact("built", "prov-built")
+        backend_store.write_blob("built", version, _ipc_bytes(1), attempt=_WINNER)
+        backend_store.write_blob("built", version, _ipc_bytes(2), attempt=_LOSER)
+        backend_store.finalize_artifact("built", version, "{}", 1, 10, blob_attempt=_WINNER)
+
+        backend_store.delete_attempt_blob("built", version, _LOSER)
+
+        assert not backend_store.blob_exists("built", version, attempt=_LOSER)
+        assert backend_store.read_blob("built", version) == _ipc_bytes(1)
+
+    def test_the_attempt_the_version_was_promoted_from_keeps_its_bytes(self, backend_store):
+        # Two finalize requests under one lease share an attempt id; the second one's
+        # cleanup must not take the bytes the first one published.
+        version = backend_store.create_artifact("built", "prov-built")
+        backend_store.write_blob("built", version, _ipc_bytes(1), attempt=_WINNER)
+        backend_store.finalize_artifact("built", version, "{}", 1, 10, blob_attempt=_WINNER)
+
+        backend_store.delete_attempt_blob("built", version, _WINNER)
+
+        assert backend_store.read_blob("built", version) == _ipc_bytes(1)
+
+    def test_a_digest_absent_from_an_older_row_is_computed_and_recorded(self, backend_store):
+        version = _finished(backend_store, "older", "prov-older")
+        conn = backend_store._get_connection()
+        try:
+            conn.execute("UPDATE artifact_versions SET content_sha256 = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+        expected = hashlib.sha256(_ipc_bytes(1)).hexdigest()
+
+        assert backend_store.content_digest("older", version) == expected
+        assert backend_store.get_artifact("older", version).content_sha256 == expected
+        # Recorded: with the bytes gone, the row still answers.
+        backend_store.blob_store.delete_blob("older", version)
+        assert backend_store.content_digest("older", version) == expected
+
+    def test_no_digest_without_an_artifact_or_its_bytes(self, backend_store):
+        version = backend_store.create_artifact("empty", "prov-empty")
+        backend_store.finalize_artifact("empty", version, "{}", 0, 0)
+
+        assert backend_store.content_digest("empty", version) is None
+        assert backend_store.content_digest("missing", 1) is None
+
+
+_WINNER = "a" * 32
+_LOSER = "b" * 32
+
 
 class TestNamePointers:
     def test_set_and_resolve_name(self, store):
@@ -495,6 +545,44 @@ class TestNamePointers:
         names = store.list_names()
         assert len(names) == 3
         assert [n.name for n in names] == ["name-0", "name-1", "name-2"]
+
+    def test_listing_every_name_spans_tenants_in_name_order(self, backend_store):
+        for artifact_id, tenant, name in (("mine", None, "zeta"), ("theirs", "acme", "alpha")):
+            version = _finished(backend_store, artifact_id, f"prov-{artifact_id}", tenant=tenant)
+            backend_store.set_name(name, artifact_id, version, tenant=tenant)
+
+        assert [(n.name, n.artifact_id, n.tenant) for n in backend_store.list_all_names()] == [
+            ("alpha", "theirs", "acme"),
+            ("zeta", "mine", None),
+        ]
+        assert [n.name for n in backend_store.list_names()] == ["zeta"]
+
+    def test_a_name_s_status_is_its_version_and_what_it_read(self, backend_store):
+        read = {"vestigo://artifact/up@v=1": "up@v=1"}
+        version = _finished(
+            backend_store, "model", "prov-model", input_versions=read, tenant="acme"
+        )
+        backend_store.set_name("best", "model", version, tenant="acme")
+
+        status = backend_store.get_name_status("best", tenant="acme")
+
+        assert status == NameStatus(
+            name="best",
+            artifact_uri=f"vestigo://artifact/model@v={version}",
+            artifact_id="model",
+            version=version,
+            state="ready",
+            updated_at=backend_store.get_name("best", tenant="acme").updated_at,
+            input_versions=read,
+        )
+        assert backend_store.get_name_status("best") is None
+        assert backend_store.get_name_status("other", tenant="acme") is None
+
+    def test_a_name_s_status_without_recorded_reads_has_an_empty_mapping(self, backend_store):
+        version = _finished(backend_store, "plain", "prov-plain")
+        backend_store.set_name("plain", "plain", version)
+
+        assert backend_store.get_name_status("plain").input_versions == {}
 
 
 class TestCleanup:
@@ -1419,6 +1507,24 @@ class TestAliases:
             ("candidate", "model-b"),
             ("champion", "model-a"),
         ]
+
+    def test_listing_every_alias_spans_tenants_in_name_and_alias_order(self, backend_store):
+        for artifact_id, tenant, name, alias in (
+            ("mine", None, "zeta", "champion"),
+            ("theirs", "acme", "alpha", "champion"),
+            ("ours", "acme", "alpha", "candidate"),
+        ):
+            version = _finished(backend_store, artifact_id, f"prov-{artifact_id}", tenant=tenant)
+            backend_store.set_alias(name, alias, artifact_id, version, tenant=tenant)
+
+        listed = backend_store.list_all_aliases()
+
+        assert [(a.name, a.alias, a.artifact_id, a.tenant) for a in listed] == [
+            ("alpha", "candidate", "ours", "acme"),
+            ("alpha", "champion", "theirs", "acme"),
+            ("zeta", "champion", "mine", None),
+        ]
+        assert [a.name for a in backend_store.list_aliases()] == ["zeta"]
 
     def test_alias_move_keeps_old_version_reachable(self, store):
         """Promotion must not lose the old champion."""
