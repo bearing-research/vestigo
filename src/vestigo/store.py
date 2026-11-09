@@ -729,7 +729,8 @@ def _add_content_sha256(conn: StoreConnection, dialect: SqlDialect) -> None:
 
 def _in_tenant(column: str, include_tenantless: bool) -> str:
     """A condition on *column* for one tenant's rows (its one parameter), with the legacy
-    tenantless rows when *include_tenantless*."""
+    tenantless rows when *include_tenantless*: ``''``, or NULL, which a legacy SQLite
+    column still admits after the open that normalized it."""
     if include_tenantless:
         return f"({column} = ? OR {column} = '' OR {column} IS NULL)"
     return f"{column} = ?"
@@ -5002,9 +5003,9 @@ class ArtifactStore:
                 params: list[SqlValue] = [name_prefix, name_prefix]
 
                 if tenant is not None:
-                    query += " AND (av.tenant = ? OR av.tenant = '' OR av.tenant IS NULL)"
+                    query += f" AND {_in_tenant('av.tenant', True)}"
                     params.append(tenant)
-                    query += " AND (an.tenant = ? OR an.tenant = '')"
+                    query += f" AND {_in_tenant('an.tenant', True)}"
                     params.append(tenant)
 
                 if state is not None:
@@ -5030,7 +5031,7 @@ class ArtifactStore:
 
                 conditions: list[str] = []
                 if tenant is not None:
-                    conditions.append("(tenant = ? OR tenant = '' OR tenant IS NULL)")
+                    conditions.append(_in_tenant("tenant", True))
                     params.append(tenant)
                 if state is not None:
                     conditions.append("state = ?")
@@ -5593,9 +5594,8 @@ class ArtifactStore:
             floor = min_idle_seconds + _USE_RESOLUTION_SECONDS if min_idle_seconds else 0.0
             params: list[float | str] = [now - floor]
             filters = ""
-            tenantless = " OR av.tenant = '' OR av.tenant IS NULL" if include_tenantless else ""
             if tenant is not None:
-                filters += f" AND (av.tenant = ?{tenantless})"
+                filters += f" AND {_in_tenant('av.tenant', include_tenantless)}"
                 params.append(tenant)
             # Least recently used first; the version breaks ties, so a sweep
             # facing an id whose versions share a timestamp takes the oldest.
@@ -5618,9 +5618,7 @@ class ArtifactStore:
             )
             size_params: list[str] = []
             if tenant is not None:
-                size_sql += " AND (tenant = ?" + (
-                    " OR tenant = '' OR tenant IS NULL)" if include_tenantless else ")"
-                )
+                size_sql += f" AND {_in_tenant('tenant', include_tenantless)}"
                 size_params.append(tenant)
             store_bytes = int(one(conn.execute(size_sql, size_params))[0])
 
@@ -6186,7 +6184,7 @@ class ArtifactStore:
             """
             params: list[str] = []
             if tenant is not None:
-                query += " AND (tenant = ? OR tenant = '' OR tenant IS NULL)"
+                query += f" AND {_in_tenant('tenant', True)}"
                 params.append(tenant)
             rows = conn.execute(query, params).fetchall()
             attempts = {(row["id"], row["version"]): row["blob_attempt"] for row in rows}
