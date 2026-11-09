@@ -2464,6 +2464,19 @@ class TestTenantlessArtifactsAreVisibleToScopedQueries:
         assert store.get_usage(tenant="team-a")["total_versions"] >= 2
         assert store.stats(tenant="team-a")["total_versions"] >= 2
 
+    def test_usage_counts_the_tenant_s_unnamed_versions_and_ids(self, store):
+        self._seed(store)
+        store.create_artifact("elsewhere", "prov-elsewhere", tenant="team-b")
+        store.finalize_artifact("elsewhere", 1, "{}", 1, 10)
+        store.set_name("named", "scoped", 1, tenant="team-a")
+
+        mine = store.get_usage(tenant="team-a", include_tenantless=False)
+        assert (mine["unique_artifacts"], mine["unreferenced_count"]) == (1, 0)
+        seen = store.get_usage(tenant="team-a")
+        assert (seen["unique_artifacts"], seen["unreferenced_count"]) == (2, 1)
+        every = store.get_usage()
+        assert (every["unique_artifacts"], every["unreferenced_count"]) == (3, 2)
+
     def test_verify_sees_legacy_rows(self, store):
         self._seed(store)
         store.blob_store.write_blob("legacy", 1, b"not an arrow stream")
