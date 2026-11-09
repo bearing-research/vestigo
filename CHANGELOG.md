@@ -70,7 +70,7 @@ All notable changes to vestigo are recorded here. The format follows
 - On Postgres a sweep no longer deletes a version an alias change approved after the
   sweep selected it: the claim's re-check read no pending change and could not see the
   approval's uncommitted alias, and left the alias naming nothing. The re-check reads
-  pending alias changes too.
+  pending alias changes too (#91).
 
 ## 0.5.0 - 2026-11-08
 
