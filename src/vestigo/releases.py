@@ -371,6 +371,10 @@ class ReleaseStore:
                 )
             self._check_outputs(conn, release, staged, sizes)
             try:
+                # Version rows before the audit lock an audited operation takes, as the
+                # store orders them: a hit holding a holder's row while it waits for that
+                # lock would otherwise deadlock with this supersede of the holder.
+                self._artifacts._promote_staged(conn, list(staged), now)
                 self._run(
                     conn,
                     operations,
@@ -379,7 +383,6 @@ class ReleaseStore:
                     now,
                     accepting=release.release_id,
                 )
-                self._artifacts._promote_staged(conn, list(staged), now)
                 if release.kind == "final":
                     target = one(
                         conn.execute(
@@ -809,7 +812,8 @@ class ReleaseStore:
         name before it is accepted.
         """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
-            # Before the transaction's first write, as the audit lock requires.
+            # Before the operations' own writes; after any version rows, as the store
+            # takes them (an acceptance promotes first).
             self._artifacts._serialize_audit(conn)
         asserted: dict[str, int] = {}
         for op in operations:
