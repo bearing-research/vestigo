@@ -53,6 +53,9 @@ All notable changes to vestigo are recorded here. The format follows
   instead of leaving them waiting at the finish until the group's timeout (#83).
 - `vestigo.torch`: `Ledger.observations` raises `ValueError` for an id that is no
   execution, a derivation's build included, as `execution` does; it returned `[]` (#83).
+- On Postgres, `ReleaseStore.abandon` during an acceptance of the same release waits
+  for it and answers False: it took no lock, settled the release the acceptance had
+  read unsettled, answered True, and the acceptance then overwrote it as accepted (#89).
 
 ## 0.5.0 - 2026-11-08
 

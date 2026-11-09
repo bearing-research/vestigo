@@ -20,6 +20,7 @@ import pytest
 from vestigo.build_store import BuildStore
 from vestigo.graph import Edge, NodeSpec, Traversal
 from vestigo.provenance import TransformSpec
+from vestigo.releases import ReleaseStore
 from vestigo.sql_backend import SERVER_THREAD_LIMIT, PostgresDialect, advisory_lock_id
 from vestigo.store import (
     _LATEST_SCHEMA_VERSION,
@@ -428,6 +429,22 @@ class TestFindReadyAndSetName:
         name = store.get_name("the-name")
         assert (name.artifact_id, name.version) == ("a1", rebuilt[0])
         assert store.get_artifact("a1", first).state == "superseded"
+
+
+def _until_it_waits(store, thread: threading.Thread) -> None:
+    """Return once *thread* waits on a lock another session holds, or has ended."""
+    probe = store._get_connection()
+    deadline = time.monotonic() + 30
+    try:
+        while thread.is_alive():
+            assert time.monotonic() < deadline, "it never came to wait on the lock"
+            row = probe.execute("SELECT count(*) AS n FROM pg_locks WHERE NOT granted").fetchone()
+            probe.commit()
+            if row["n"]:
+                return
+            thread.join(timeout=0.05)
+    finally:
+        probe.close()
 
 
 class TestGarbageCollection:
@@ -1433,6 +1450,56 @@ class TestWriterSerialization:
         assert result is not None
         found = store.find_by_provenance("same-prov")
         assert found is not None
+
+    def test_an_abandon_during_an_acceptance_waits_for_it(self, store, monkeypatch):
+        """An acceptance read the release unsettled under the build's key; an abandon,
+        under none, settled it and answered True, and the acceptance then overwrote it."""
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+
+        checking, release_accept = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        abandoned: list[bool] = []
+        check_outputs = releases._check_outputs
+
+        def pausing_under_the_build_key(*args, **kwargs):
+            checking.set()
+            assert release_accept.wait(30)
+            return check_outputs(*args, **kwargs)
+
+        monkeypatch.setattr(releases, "_check_outputs", pausing_under_the_build_key)
+
+        def accept() -> None:
+            try:
+                releases.accept(release.release_id, [], [])
+            except BaseException as exc:
+                errors.append(exc)
+
+        def abandon() -> None:
+            try:
+                abandoned.append(releases.abandon(release.release_id, "a1"))
+            except BaseException as exc:
+                errors.append(exc)
+
+        accepting = threading.Thread(target=accept)
+        accepting.start()
+        assert checking.wait(30)
+        abandoning = threading.Thread(target=abandon)
+        abandoning.start()
+        _until_it_waits(store, abandoning)
+        release_accept.set()
+        accepting.join()
+        abandoning.join()
+
+        assert errors == []
+        assert releases.get(release.release_id).state == "accepted"
+        assert abandoned == [False]
 
 
 class TestSchemaMigrations:

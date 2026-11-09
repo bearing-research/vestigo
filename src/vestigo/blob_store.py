@@ -465,6 +465,14 @@ class _ObjectBlobStore(BlobStore):
         """Stream ``source_path`` straight to the object, skipping the local staging copy."""
         self._upload_from_path(self._object_key(artifact_id, version), source_path)
 
+    def blob_exists(self, artifact_id: str, version: int) -> bool:
+        """Whether the object exists; a backend error propagates.
+
+        Not an SDK's ``exists()``: Azure's answers False to any 404, a missing
+        container's included, which must be an error here as it is on S3.
+        """
+        return self.blob_size(artifact_id, version) is not None
+
 
 class S3BlobStore(_ObjectBlobStore):
     """S3 or S3-compatible (MinIO, LocalStack) blob storage through boto3.
@@ -571,10 +579,6 @@ class S3BlobStore(_ObjectBlobStore):
         """
         with open(source_path, "rb") as src, _object_store_call("put"):
             self._client.upload_fileobj(src, self.bucket, key)
-
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in S3; a backend error propagates."""
-        return self.blob_size(artifact_id, version) is not None
 
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from S3 object metadata; a backend error propagates."""
@@ -861,11 +865,6 @@ class GCSBlobStore(_ObjectBlobStore):
         with open(source_path, "rb") as src, _object_store_call("put"):
             self._blob(key).upload_from_file(src, size=size, retry=DEFAULT_RETRY)
 
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in GCS; a backend error propagates."""
-        with _object_store_call("head"):
-            return bool(self._blob(self._object_key(artifact_id, version)).exists())
-
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from GCS object metadata; a backend error propagates."""
         blob = self._blob(self._object_key(artifact_id, version))
@@ -1137,14 +1136,6 @@ class AzureBlobStore(_ObjectBlobStore):
         blob_client = self._client.get_blob_client(key)
         with open(source_path, "rb") as src, _object_store_call("put"):
             blob_client.upload_blob(src, overwrite=True)
-
-    def blob_exists(self, artifact_id: str, version: int) -> bool:
-        """Check if blob exists in Azure Blob Storage.
-
-        Not the SDK's ``exists()``: that answers False to any 404, a missing container's
-        included, which must be an error here as it is on S3.
-        """
-        return self.blob_size(artifact_id, version) is not None
 
     def blob_size(self, artifact_id: str, version: int) -> int | None:
         """Return blob size from Azure Blob Storage metadata."""

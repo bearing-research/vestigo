@@ -442,7 +442,10 @@ class ReleaseStore:
         """
         conn = self._connect()
         try:
-            self._own(conn, release_id, attempt)
+            release = self._own(conn, release_id, attempt)
+            # The build's key, as an acceptance holds it from its read of the release to
+            # its commit: unheld, this settled a release the acceptance then overwrote.
+            self._dialect.begin_write(conn, release.build_id)
             settled = self._settle_on(conn, release_id, "abandoned")
             conn.commit()
             return settled
@@ -740,7 +743,7 @@ class ReleaseStore:
     def _settle_on(self, conn: StoreConnection, release_id: str, state: str) -> bool:
         """``_settle`` on the caller's transaction; whether the release was unsettled."""
         cursor = conn.execute(
-            f"UPDATE build_releases SET state = ?, settled_at = ? "
+            "UPDATE build_releases SET state = ?, settled_at = ? "
             f"WHERE release_id = ? AND {_UNSETTLED_SQL}",
             (state, self._clock(), release_id),
         )
