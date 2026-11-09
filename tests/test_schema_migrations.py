@@ -275,6 +275,7 @@ _MIGRATED_INDEXES = [
     "idx_versions_release",
     "idx_versions_computation",
     "idx_publications_active",
+    "idx_versions_superseded_by",
 ]
 _MIGRATED_TABLES = [
     "schema_version",

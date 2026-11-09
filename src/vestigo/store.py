@@ -970,6 +970,14 @@ def _reorder_link_target_index(conn: StoreConnection, dialect: SqlDialect) -> No
     conn.execute(dialect.adapt_ddl(LINK_TARGET_INDEX))
 
 
+def _index_pointers(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """``superseded_by`` indexed: a sweep asked each row's pointers by scanning every version."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_versions_superseded_by "
+        "ON artifact_versions(superseded_by) WHERE superseded_by IS NOT NULL"
+    )
+
+
 _ROOTS_KEY = "tenant, kind, holder, artifact_id, version"
 
 
@@ -1031,6 +1039,7 @@ _MIGRATIONS: list[_Migration] = [
         16, "idx_node_links_target on (scope, target_node_id, relation)", _reorder_link_target_index
     ),
     _Migration(17, "retention_roots keyed by tenant", _key_roots_by_tenant),
+    _Migration(18, "idx_versions_superseded_by", _index_pointers),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1086,6 +1095,9 @@ CREATE INDEX IF NOT EXISTS idx_versions_computation ON artifact_versions(computa
 
 -- Index for provenance lookup (deduplication)
 CREATE INDEX IF NOT EXISTS idx_provenance ON artifact_versions(provenance_hash);
+-- The versions reading a canonical's bytes, which a delete or a sweep asks per row (migration 18)
+CREATE INDEX IF NOT EXISTS idx_versions_superseded_by ON artifact_versions(superseded_by)
+WHERE superseded_by IS NOT NULL;
 
 -- Unique constraint for idempotent finalize: (tenant, provenance_hash) for ready artifacts.
 -- Prevents duplicate ready artifacts for the same computation within a tenant. Relies on
