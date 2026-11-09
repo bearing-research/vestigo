@@ -500,6 +500,21 @@ class TestDefinitions:
         assert store.graph.get(leaf) is not None
         assert store.definition_of("out", 99) is None
 
+    def test_a_promoted_copy_names_the_node_that_produced_its_source(self, store):
+        spec = TransformSpec("x@v1", {}, [])
+        store.create_artifact("out", "prov-1", spec, definition=THREE)
+        store.write_blob("out", 1, b"one")
+        store.finalize_artifact("out", 1, "{}", 1, 3)
+        store.create_artifact("out", "prov-2", spec)
+        store.write_blob("out", 2, b"two")
+        store.finalize_artifact("out", 2, "{}", 1, 3)
+
+        copy = store.promote_version("out", 1)
+
+        assert copy is not None and copy.version == 3
+        assert store.definition_of("out", 3) == store.definition_of("out", 1) is not None
+        assert ("out", 3) not in {(v.id, v.version) for v in store.versions_lacking_definition()}
+
     def test_a_refused_definition_creates_no_version(self, store):
         bad = [NodeSpec("test/cell", b"a", (Edge("rows", 0, _hex(1)),))]
         with pytest.raises(ValueError):

@@ -2574,6 +2574,35 @@ def _rebuild_after_first_lookup(store, monkeypatch, artifact_id: str, provenance
     monkeypatch.setattr(store, "find_by_provenance", find_then_rebuild)
 
 
+class TestAFinalizeAnotherProcessFinished:
+    def test_it_answers_and_names_as_a_retry_would(self, backend_store, monkeypatch):
+        # Between this call's lookup and its write, another id with the provenance lands
+        # and another process finalizes this version, into a pointer at that one.
+        store = backend_store
+        for artifact_id in ("a1", "b1"):
+            store.create_artifact(artifact_id, "prov-1")
+            store.write_blob(artifact_id, 1, b"x")
+        find = store.find_by_provenance
+        landed = []
+
+        def find_then_finish_elsewhere(*args, **kwargs):
+            found = find(*args, **kwargs)
+            if not landed:
+                landed.append(True)
+                store.finalize_artifact("b1", 1, "{}", 1, 1)
+                store.finalize_artifact("a1", 1, "{}", 1, 1)
+            return found
+
+        monkeypatch.setattr(store, "find_by_provenance", find_then_finish_elsewhere)
+
+        result = store.finalize_and_set_name("a1", 1, "{}", 1, 1, name="the-name")
+
+        assert (result.id, result.version, result.state) == ("b1", 1, "ready")
+        assert store.get_artifact("a1", 1).state == "superseded"
+        name = store.get_name("the-name")
+        assert (name.artifact_id, name.version) == ("b1", 1)
+
+
 class TestFindReadyAndSetName:
     def test_it_names_the_ready_version(self, store):
         _make_ready_artifact(store, "a1", "prov-1")
