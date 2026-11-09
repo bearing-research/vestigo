@@ -371,14 +371,9 @@ class ReleaseStore:
                 )
             self._check_outputs(conn, release, staged, sizes)
             try:
-                self._run(
-                    conn,
-                    operations,
-                    release.tenant,
-                    release.release_id,
-                    now,
-                    accepting=release.release_id,
-                )
+                # Version rows before the audit lock an audited operation takes, as the
+                # store orders them: a hit holding a holder's row while it waits for that
+                # lock would otherwise deadlock with this supersede of the holder.
                 self._artifacts._promote_staged(conn, list(staged), now)
                 if release.kind == "final":
                     target = one(
@@ -387,25 +382,11 @@ class ReleaseStore:
                             (release.build_id,),
                         )
                     )
-                    if not self._builds.complete_attempt_within(
-                        conn,
-                        release.build_id,
-                        release.attempt,
-                        artifact_id=staged[0].artifact_id if staged else None,
-                        version=staged[0].version if staged else None,
-                        now=now,
-                    ):
-                        # Every build writer here takes the build's key, but a consumer's
-                        # own transaction need not: the release must not outlive the build.
-                        conn.rollback()
-                        self._settle(release_id, "rejected")
-                        raise ReleaseRejected(
-                            f"build {release.build_id} is no longer building under attempt "
-                            f"{release.attempt}"
-                        )
                     # A build made before its outputs existed targets a placeholder row;
                     # once the build points at a real output (or ends with none) the
                     # placeholder is a failed row for GC, not a building one forever.
+                    # A version row too: before the audit lock, which a delete of the
+                    # placeholder takes after its row.
                     if not staged or (target["artifact_id"], target["version"]) != (
                         staged[0].artifact_id,
                         staged[0].version,
@@ -415,6 +396,30 @@ class ReleaseStore:
                             "WHERE id = ? AND version = ? AND state = 'building'",
                             (target["artifact_id"], target["version"]),
                         )
+                self._run(
+                    conn,
+                    operations,
+                    release.tenant,
+                    release.release_id,
+                    now,
+                    accepting=release.release_id,
+                )
+                if release.kind == "final" and not self._builds.complete_attempt_within(
+                    conn,
+                    release.build_id,
+                    release.attempt,
+                    artifact_id=staged[0].artifact_id if staged else None,
+                    version=staged[0].version if staged else None,
+                    now=now,
+                ):
+                    # Every build writer here takes the build's key, but a consumer's
+                    # own transaction need not: the release must not outlive the build.
+                    conn.rollback()
+                    self._settle(release_id, "rejected")
+                    raise ReleaseRejected(
+                        f"build {release.build_id} is no longer building under attempt "
+                        f"{release.attempt}"
+                    )
                 conn.execute(
                     "UPDATE build_releases SET state = 'accepted', settled_at = ? "
                     "WHERE release_id = ?",
@@ -809,7 +814,8 @@ class ReleaseStore:
         name before it is accepted.
         """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
-            # Before the transaction's first write, as the audit lock requires.
+            # Before the operations' own writes; after any version rows, as the store
+            # takes them (an acceptance promotes first).
             self._artifacts._serialize_audit(conn)
         asserted: dict[str, int] = {}
         for op in operations:

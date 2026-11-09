@@ -53,6 +53,13 @@ All notable changes to vestigo are recorded here. The format follows
   instead of leaving them waiting at the finish until the group's timeout (#83).
 - `vestigo.torch`: `Ledger.observations` raises `ValueError` for an id that is no
   execution, a derivation's build included, as `execution` does; it returned `[]` (#83).
+- On Postgres, accepting a release with an `InsertAuditEvent` while a cache hit
+  (`find_ready_and_set_name`, `set_name`, `set_alias`, `set_tag`) named the version
+  the release supersedes could deadlock, and Postgres aborted one of them:
+  `ReleaseStore.accept` took the audit lock before the version rows, the reverse of
+  the store's order. It now promotes the outputs, and fails a final release's
+  placeholder row (which a `delete_artifact` of the placeholder deadlocked against the
+  same way), before it runs the operations (#86).
 - On Postgres a sweep no longer deletes a canonical that a duplicate's finalize points
   at while the sweep waits for its row: the claim judged pointers and requirers from a
   snapshot taken before that wait, and the duplicate then read bytes that were gone. A
