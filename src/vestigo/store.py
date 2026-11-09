@@ -2848,7 +2848,9 @@ class ArtifactStore:
         before anything commits.
 
         Raises:
-            ValueError: If the artifact is not found or not in "building" state.
+            ArtifactNotFoundError: The artifact does not exist, or *name* is given and
+                the artifact's tenant is one the caller cannot name in; one error for both.
+            ValueError: If the artifact is not in "building" state.
             BuildLeaseLost: If ``fence`` found the lease held by another attempt.
         """
 
@@ -2872,7 +2874,7 @@ class ArtifactStore:
             )
             row = cursor.fetchone()
             if row is None:
-                raise ValueError(f"Artifact {artifact_id}@v={version} not found")
+                raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
 
             # Already finalized: a retry gets what the first call returned, the row
             # itself (ready, or superseded since by a refresh of its id) or, for one a
@@ -2884,9 +2886,7 @@ class ArtifactStore:
                 if name:
                     artifact_tenant = row["tenant"] if row["tenant"] else None
                     if not self._can_assign_name_for_tenant(artifact_tenant, tenant):
-                        raise ValueError(
-                            f"Artifact {artifact_id}@v={version} belongs to another tenant"
-                        )
+                        raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
                     self._set_name_in_connection(conn, name, *canonical, tenant)
                 _commit_through_fence(conn, *canonical)
                 return self.get_artifact(*canonical)
@@ -2902,7 +2902,7 @@ class ArtifactStore:
             normalized_artifact_tenant = artifact_tenant if artifact_tenant else None
 
             if name and not self._can_assign_name_for_tenant(normalized_artifact_tenant, tenant):
-                raise ValueError(f"Artifact {artifact_id}@v={version} belongs to another tenant")
+                raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
 
             digest = content_sha256
             for attempt in range(_CANONICAL_PROMOTE_ATTEMPTS):
@@ -3618,7 +3618,9 @@ class ArtifactStore:
         current value when another id holds the same computation.
 
         Raises:
-            ValueError: If the target version doesn't exist or isn't readable.
+            ArtifactNotFoundError: The target does not exist or belongs to a tenant the
+                caller cannot write in; one error for both.
+            ValueError: The target is not readable.
         """
         conn = self._get_connection()
         try:
@@ -3865,25 +3867,29 @@ class ArtifactStore:
         revocation always withdraws the artifact.
 
         Raises:
-            ValueError: If the artifact does not exist, is not readable, or belongs
-                to a different tenant.
+            ArtifactNotFoundError: The artifact does not exist or belongs to a tenant
+                the caller cannot write in, as for :meth:`set_name`; one error for both.
+            ValueError: The artifact is in another tenant the caller may still write in
+                (a tenantless one, or ``_default`` for a tenantless caller), or is not
+                readable.
         """
         effective_tenant = tenant if tenant is not None else ""
         conn = self._get_connection()
         try:
             # Locked, so the version cannot be swept or deleted under the new link.
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
-            if row is None:
-                raise ValueError(f"Artifact {artifact_id}@v={version} not found")
-            if row["state"] not in _RESULT_STATES:
-                raise ValueError(
-                    f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
-                )
+            # What naming hides, hidden as naming does; then publishing's own, stricter
+            # rule, for a version the caller may already name: a link is one tenant's.
+            row = self._require_writable_target(row, artifact_id, version, tenant)
             artifact_tenant = row["tenant"] or ""
             if artifact_tenant != effective_tenant:
                 raise ValueError(
-                    f"Artifact {artifact_id}@v={version} belongs to tenant "
-                    f"{artifact_tenant!r}, cannot publish in tenant {effective_tenant!r}"
+                    f"Artifact {artifact_id}@v={version} is in tenant {artifact_tenant!r}; "
+                    "publish it from that tenant"
+                )
+            if row["state"] not in _RESULT_STATES:
+                raise ValueError(
+                    f"Artifact {artifact_id}@v={version} is not readable (state={row['state']})"
                 )
 
             existing = conn.execute(
@@ -4115,8 +4121,9 @@ class ArtifactStore:
         idempotent promote cell does not fill the audit history.
 
         Raises:
-            ValueError: If the artifact doesn't exist, isn't readable, or belongs to
-                a different tenant.
+            ArtifactNotFoundError: The artifact does not exist or belongs to a tenant
+                the caller cannot write in; one error for both.
+            ValueError: The artifact is not readable.
         """
         conn = self._get_connection()
         try:
@@ -4298,8 +4305,9 @@ class ArtifactStore:
         """Set a key/value tag on an artifact version (audited).
 
         Raises:
-            ValueError: If the artifact doesn't exist, isn't readable, or belongs to
-                a different tenant.
+            ArtifactNotFoundError: The artifact does not exist or belongs to a tenant
+                the caller cannot write in; one error for both.
+            ValueError: The artifact is not readable.
         """
         conn = self._get_connection()
         try:
@@ -5393,8 +5401,9 @@ class ArtifactStore:
         two tenants holding one shared version under one holder hold a root each.
 
         Raises:
-            ValueError: If the version does not exist or belongs to another tenant,
-                or *kind* or *holder* is empty.
+            ArtifactNotFoundError: The version does not exist or belongs to another
+                tenant; one error for both.
+            ValueError: *kind* or *holder* is empty.
         """
         kind = kind.strip()
         holder = holder.strip()
@@ -5404,10 +5413,8 @@ class ArtifactStore:
         try:
             # Locked, so a sweep's claim or a delete cannot take the version with the root.
             row = self._lock_target(conn, artifact_id, version, "tenant")
-            if row is None:
-                raise ValueError(f"Artifact {artifact_id}@v={version} not found")
-            if tenant is not None and (row["tenant"] or "") not in (tenant, ""):
-                raise ValueError(f"Artifact {artifact_id}@v={version} not found")
+            if row is None or (tenant is not None and (row["tenant"] or "") not in (tenant, "")):
+                raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
             # A root held without a tenant is the version's tenant's, so that tenant can
             # release and list it.
             effective_tenant = tenant if tenant is not None else (row["tenant"] or "")
