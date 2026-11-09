@@ -136,11 +136,12 @@ _PLACEHOLDER = re.compile(r"torch_([0-9a-f]{32})")
 _STAGED = re.compile(r"torch_([0-9a-f]{32})@attempt=([0-9a-f]{32})@step=\d+")
 _OBSERVED = re.compile(r"torch_([0-9a-f]{32})@observed=")
 _CHUNK = 8 * 1024 * 1024
-# The fields of each kind of signed document, and the one the other kind has and it
-# lacks: one key signs both, so a report is never taken for a manifest or back.
+# Each kind of signed document's identity (the checkpoint it names), its other fields,
+# and the one the other kind has and it lacks: one key signs both, so a report is never
+# taken for a manifest or back.
 _SIGNED = {
-    "manifest": (("execution", "attempt", "step", "release", "files"), "rank"),
-    "report": (("execution", "attempt", "step", "rank", "files", "inputs"), "release"),
+    "manifest": (("execution", "attempt", "step", "release"), ("files",), "rank"),
+    "report": (("execution", "attempt", "step", "rank"), ("files", "inputs"), "release"),
 }
 
 
@@ -387,7 +388,8 @@ class Remote:
         return store.objects(path)
 
 
-_REMOTE_STORES: dict[str, type[S3BlobStore] | type[GCSBlobStore] | type[AzureBlobStore]] = {
+_ObjectStoreClass = type[S3BlobStore] | type[GCSBlobStore] | type[AzureBlobStore]
+_REMOTE_STORES: dict[str, _ObjectStoreClass] = {
     "s3": S3BlobStore,
     "gs": GCSBlobStore,
     "az": AzureBlobStore,
@@ -401,7 +403,8 @@ def _pin_remote(remote: Remote, objects: list[tuple[str, int, str]]) -> dict[str
     if not remote.uri.endswith("/"):
         [(_, size, name)] = objects
         return {"uri": remote.uri, "size": size, "object": name}
-    under = len(remote._parts()[2])
+    _, _, path = remote._parts()
+    under = len(path)
     listing = sorted([key[under:], size, name] for key, size, name in objects)
     return {
         "uri": remote.uri,
@@ -465,7 +468,7 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
 def _remote_errors(remote: Remote) -> tuple[type[Exception], ...]:
     """What *remote*'s SDK raises when its store does not answer: an outage, a refusal,
     no credentials. ``OSError`` is a dropped connection under any of them."""
-    scheme = remote._parts()[0]
+    scheme, _, _ = remote._parts()
     if scheme == "s3":
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -890,7 +893,7 @@ class RemoteBlobs:
         return _BACKENDS[self.backend].from_settings(self.settings, self.bucket, self.prefix)
 
 
-_BACKENDS: dict[str, type[S3BlobStore] | type[GCSBlobStore] | type[AzureBlobStore]] = {
+_BACKENDS: dict[str, _ObjectStoreClass] = {
     "s3": S3BlobStore,
     "gcs": GCSBlobStore,
     "azure": AzureBlobStore,
@@ -1723,11 +1726,10 @@ class Ledger:
             public.verify(bytes.fromhex(document["signature"]), _signed(document))
         except (InvalidSignature, ValueError, TypeError) as exc:
             raise OSError(f"the signature on {what} does not verify") from exc
-        fields, other = _SIGNED[kind]
-        if other in document or not all(name in document for name in fields):
+        identity, rest, other = _SIGNED[kind]
+        if other in document or not all(name in document for name in identity + rest):
             raise OSError(f"{what} is malformed")
-        # The identity is the first four fields of either kind.
-        if tuple(document[name] for name in fields[:4]) != checkpoint:
+        if tuple(document[name] for name in identity) != checkpoint:
             raise OSError(f"{what} is signed for another checkpoint")
         return document
 
