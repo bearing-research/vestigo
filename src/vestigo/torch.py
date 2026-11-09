@@ -144,6 +144,13 @@ _SIGNED = {
 }
 
 
+def _after_newest(step: int, newest: int | None) -> None:
+    """Raises ValueError: *step* is not after *newest*, the newest step the attempt
+    accepted."""
+    if newest is not None and step <= newest:
+        raise ValueError(f"step {step} is not after step {newest}, which this attempt accepted")
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
@@ -360,22 +367,31 @@ class Remote:
     settings: BlobSettings = field(default_factory=BlobSettings, repr=False)
 
     def __post_init__(self) -> None:
-        scheme, _, rest = self.uri.partition("://")
-        if scheme not in _REMOTE_STORES or not rest.partition("/")[0]:
+        scheme, bucket, _ = self._parts()
+        if scheme not in _REMOTE_STORES or not bucket:
             raise ValueError(f"{self.uri!r} is not s3://, gs:// or az:// with a bucket")
+
+    def _parts(self) -> tuple[str, str, str]:
+        """The URI's scheme, bucket and key (or prefix)."""
+        scheme, _, rest = self.uri.partition("://")
+        bucket, _, key = rest.partition("/")
+        return scheme, bucket, key
 
     def objects(self) -> list[tuple[str, int, str]]:
         """Each object the URI names: its key, size and its bytes' name, from its store.
 
         A backend error propagates.
         """
-        scheme, _, rest = self.uri.partition("://")
-        bucket, _, path = rest.partition("/")
+        scheme, bucket, path = self._parts()
         store = _REMOTE_STORES[scheme].from_settings(self.settings, bucket, "")
         return store.objects(path)
 
 
-_REMOTE_STORES: dict[str, Any] = {"s3": S3BlobStore, "gs": GCSBlobStore, "az": AzureBlobStore}
+_REMOTE_STORES: dict[str, type[S3BlobStore] | type[GCSBlobStore] | type[AzureBlobStore]] = {
+    "s3": S3BlobStore,
+    "gs": GCSBlobStore,
+    "az": AzureBlobStore,
+}
 Input = str | Path | Remote
 
 
@@ -385,7 +401,7 @@ def _pin_remote(remote: Remote, objects: list[tuple[str, int, str]]) -> dict[str
     if not remote.uri.endswith("/"):
         [(_, size, name)] = objects
         return {"uri": remote.uri, "size": size, "object": name}
-    under = len(remote.uri.partition("://")[2].partition("/")[2])
+    under = len(remote._parts()[2])
     listing = sorted([key[under:], size, name] for key, size, name in objects)
     return {
         "uri": remote.uri,
@@ -449,7 +465,7 @@ def _resolve(inputs: Mapping[str, Input] | None) -> _Inputs:
 def _remote_errors(remote: Remote) -> tuple[type[Exception], ...]:
     """What *remote*'s SDK raises when its store does not answer: an outage, a refusal,
     no credentials. ``OSError`` is a dropped connection under any of them."""
-    scheme = remote.uri.partition("://")[0]
+    scheme = remote._parts()[0]
     if scheme == "s3":
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -867,15 +883,18 @@ class RemoteBlobs:
     settings: BlobSettings = field(default_factory=BlobSettings)
 
     def __post_init__(self) -> None:
-        if self.backend not in ("s3", "gcs", "azure"):
+        if self.backend not in _BACKENDS:
             raise ValueError(f"backend must be s3, gcs or azure, not {self.backend!r}")
 
     def open(self) -> BlobStore:
-        if self.backend == "s3":
-            return S3BlobStore.from_settings(self.settings, self.bucket, self.prefix)
-        if self.backend == "gcs":
-            return GCSBlobStore.from_settings(self.settings, self.bucket, self.prefix)
-        return AzureBlobStore.from_settings(self.settings, self.bucket, self.prefix)
+        return _BACKENDS[self.backend].from_settings(self.settings, self.bucket, self.prefix)
+
+
+_BACKENDS: dict[str, type[S3BlobStore] | type[GCSBlobStore] | type[AzureBlobStore]] = {
+    "s3": S3BlobStore,
+    "gcs": GCSBlobStore,
+    "azure": AzureBlobStore,
+}
 
 
 @dataclass(frozen=True)
@@ -1034,12 +1053,12 @@ class Ledger:
             _ed25519().Ed25519PublicKey.from_public_bytes(verify_key)
         self.config = LedgerConfig(
             Path(artifact_dir),
-            dsn,
-            blobs,
-            lease_seconds,
-            writable_seconds,
-            signing_key,
-            verify_key,
+            dsn=dsn,
+            blobs=blobs,
+            lease_seconds=lease_seconds,
+            writable_seconds=writable_seconds,
+            signing_key=signing_key,
+            verify_key=verify_key,
         )
         self.store = ArtifactStore(
             self.config.artifact_dir,
@@ -1328,6 +1347,41 @@ class Ledger:
             checkpointing,
         )
 
+    def _new_build(
+        self,
+        key: str,
+        spec: TransformSpec,
+        executor: str,
+        label: str,
+        definition: Sequence[NodeSpec] = (),
+    ) -> tuple[str, str, int]:
+        """A new build of the computation *key* under *executor*, pending: its id, and its
+        placeholder's id and version.
+
+        A build references a version, so one whose outputs do not exist yet targets a
+        placeholder its final release fails.
+        """
+        build_id = uuid.uuid4().hex
+        placeholder = f"torch_{build_id}"
+        version = self.store.create_artifact(
+            placeholder,
+            run_output_key(key, build_id, label),
+            spec,
+            minted=True,
+            definition=definition,
+            computation_key=key,
+        )
+        self.builds.create_build(
+            build_id,
+            placeholder,
+            version,
+            executor_ref=executor,
+            params=spec.params,
+            computation_key=key,
+            dispatch="external",
+        )
+        return build_id, placeholder, version
+
     def _branch(
         self,
         program: Definition,
@@ -1365,26 +1419,8 @@ class Ledger:
         (refused while its lease is live), and the new one is failed unopened."""
         spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
-        build_id = uuid.uuid4().hex
-        # A build references a version, so a run whose outputs do not exist yet targets
-        # a placeholder its final release fails.
-        placeholder = f"torch_{build_id}"
-        version = self.store.create_artifact(
-            placeholder,
-            run_output_key(key, build_id, "run"),
-            spec,
-            minted=True,
-            definition=[program.spec],
-            computation_key=key,
-        )
-        self.builds.create_build(
-            build_id,
-            placeholder,
-            version,
-            executor_ref=EXECUTOR,
-            params=spec.params,
-            computation_key=key,
-            dispatch="external",
+        build_id, placeholder, version = self._new_build(
+            key, spec, EXECUTOR, "run", definition=[program.spec]
         )
         attempt = uuid.uuid4().hex
         conn = self.store._get_connection()
@@ -1628,10 +1664,12 @@ class Ledger:
         if len(rows) != 1:
             raise OSError(f"{where} has {len(rows)} manifests")
         raw = self.store.read_blob(rows[0].id, rows[0].version)
-        manifest = self._verified(raw, f"the manifest of {where}", "manifest")
-        named = (manifest["execution"], manifest["attempt"], manifest["step"], manifest["release"])
-        if named != (at.execution_id, at.attempt, at.step, bundle.release.release_id):
-            raise OSError(f"the manifest of {where} is signed for another checkpoint")
+        manifest = self._verified(
+            raw,
+            f"the manifest of {where}",
+            "manifest",
+            (at.execution_id, at.attempt, at.step, bundle.release.release_id),
+        )
         try:
             return {
                 e["file"]: _File(e["artifact_id"], e["version"], e["byte_size"], e["sha256"])
@@ -1653,15 +1691,19 @@ class Ledger:
         key = _ed25519().Ed25519PrivateKey.from_private_bytes(self.config.signing_key)
         return {**document, "signature": key.sign(_signed(document)).hex()}
 
-    def _verified(self, raw: bytes | None, what: str, kind: str) -> dict[str, Any]:
+    def _verified(
+        self, raw: bytes | None, what: str, kind: str, checkpoint: tuple[Any, ...]
+    ) -> dict[str, Any]:
         """The signed document of *kind* (``manifest`` or ``report``) *raw* holds, once
-        its signature verifies under the verify key.
+        its signature verifies under the verify key and it names *checkpoint*: the
+        execution, attempt, step, and the release (a manifest) or the rank (a report).
 
         Its fields are trusted only after that, so only its envelope is checked first.
 
         Raises:
             OSError: *raw* is missing, is not a JSON object, is unsigned, its signature
-                does not verify, or it is not a document of *kind*.
+                does not verify, it is not a document of *kind*, or it is signed for
+                another checkpoint.
         """
         from cryptography.exceptions import InvalidSignature
 
@@ -1684,6 +1726,9 @@ class Ledger:
         fields, other = _SIGNED[kind]
         if other in document or not all(name in document for name in fields):
             raise OSError(f"{what} is malformed")
+        # The identity is the first four fields of either kind.
+        if tuple(document[name] for name in fields[:4]) != checkpoint:
+            raise OSError(f"{what} is signed for another checkpoint")
         return document
 
     # --- Lineage ---
@@ -1819,24 +1864,7 @@ class Ledger:
         self._refuse_later(prefix, source, name)
         key, spec = self._derivation(from_release, name)
 
-        build_id = uuid.uuid4().hex
-        placeholder = f"torch_{build_id}"
-        target = self.store.create_artifact(
-            placeholder,
-            run_output_key(key, build_id, "derived"),
-            spec,
-            minted=True,
-            computation_key=key,
-        )
-        self.builds.create_build(
-            build_id,
-            placeholder,
-            target,
-            executor_ref=DERIVE_EXECUTOR,
-            params=spec.params,
-            computation_key=key,
-            dispatch="external",
-        )
+        build_id, placeholder, target = self._new_build(key, spec, DERIVE_EXECUTOR, "derived")
         attempt = uuid.uuid4().hex
         # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
         # however long the uploads take.
@@ -2258,11 +2286,7 @@ class Ledger:
         if self.config.signing_key is None:
             return json.loads(raw)
         what = f"rank {rank}'s report of step {at.step} of execution {at.execution_id}"
-        report = self._verified(raw, what, "report")
-        named = (report["execution"], report["attempt"], report["step"], report["rank"])
-        if named != (at.execution_id, at.attempt, at.step, rank):
-            raise OSError(f"{what} is signed for another checkpoint")
-        return report
+        return self._verified(raw, what, "report", (at.execution_id, at.attempt, at.step, rank))
 
     def _pending(self, report_id: str) -> list[ArtifactVersion]:
         """The versions of a rank's report no release holds yet, oldest first."""
@@ -2283,11 +2307,8 @@ class Ledger:
         if done is not None and not self._pending(f"{at.prefix}@rank=0"):
             # The writer retried a finalize whose acceptance had landed.
             return done
-        if newest is not None and at.step <= newest:
-            # Saved through the manager itself, or while a later save was in flight.
-            raise ValueError(
-                f"step {at.step} is not after step {newest}, which this attempt accepted"
-            )
+        # Saved through the manager itself, or while a later save was in flight.
+        _after_newest(at.step, newest)
         reports: list[tuple[str, int, bytes]] = []
         for rank in range(world):
             report_id = f"{at.prefix}@rank={rank}"
@@ -2836,13 +2857,12 @@ class Run:
                 window closed.
             InputChanged: a ``Path`` or ``Remote`` input's bytes changed since the run
                 resolved it, on any rank (from rank 0's future, for an asynchronous save);
-                nothing is released, and the attempt gives up its lease.
+                nothing is released, and the attempt gives up its lease. An input that
+                cannot be read raises it too, keeping the lease: a later save may pass.
         """
         # Before anything is staged: a step again would be dropped for the one accepted,
         # and an earlier one's files are a collection's to take while they are written.
-        newest = self.ledger._newest_step(self.execution_id, self.attempt)
-        if newest is not None and step <= newest:
-            raise ValueError(f"step {step} is not after step {newest}, which this attempt accepted")
+        _after_newest(step, self.ledger._newest_step(self.execution_id, self.attempt))
         checkpoint_id = self._checkpoints.checkpoint_id(step)
         if not self._synchronous:
             pending = self.manager.save(checkpoint_id, _saved(state))
@@ -2949,7 +2969,8 @@ class Run:
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.
             InputChanged: a ``Path`` or ``Remote`` input's bytes changed since the run
-                resolved it, on any rank; the attempt gives up its lease.
+                resolved it, on any rank; the attempt gives up its lease. An input that
+                cannot be read raises it too, keeping the lease.
         """
         error: BaseException | None = None
         try:
