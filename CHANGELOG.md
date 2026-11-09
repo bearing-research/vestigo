@@ -70,7 +70,7 @@ All notable changes to vestigo are recorded here. The format follows
 - `publish_artifact` answers another tenant's version as missing, with
   `ArtifactNotFoundError` (a `ValueError`), as `set_name`, `set_alias` and `set_tag`
   do. It named a ready version's owning tenant, and a building one's state, to a
-  caller of another tenant.
+  caller of another tenant (#92).
 
 ## 0.5.0 - 2026-11-08
 
