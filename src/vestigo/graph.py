@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from vestigo.sql_backend import StoreConnection
+    from vestigo.sql_backend import SqlValue, StoreConnection
 
 DOMAIN_RE = re.compile(r"^[a-z0-9_\-./]+$")
 NODE_ID_BYTES = 32
@@ -529,7 +529,7 @@ class GraphStore:
             "SELECT node_id, relation, target_node_id, created_at FROM node_links "
             f"WHERE scope = ? AND {column} = ?"
         )
-        params: tuple = (identity_scope(tenant).hex(), _checked_id(node_id))
+        params: tuple[SqlValue, ...] = (identity_scope(tenant).hex(), _checked_id(node_id))
         if relation is not None:
             sql += " AND relation = ?"
             params += (relation,)

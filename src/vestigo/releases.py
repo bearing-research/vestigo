@@ -33,10 +33,11 @@ from vestigo.operations import (
     InsertAuditEvent,
     Operation,
 )
+from vestigo.sql_backend import one
 
 if TYPE_CHECKING:
     from vestigo.build_store import BuildStore
-    from vestigo.sql_backend import StoreConnection
+    from vestigo.sql_backend import SqlValue, StoreConnection
     from vestigo.store import ArtifactStore, ArtifactVersion, StagedVersion
 
 KINDS = ("checkpoint", "final")
@@ -154,9 +155,7 @@ def lease_held(conn: StoreConnection, build_id: str, attempt: str, now: float) -
 
 def _tenant_of(conn: StoreConnection, build_id: str) -> str:
     """The build's tenant, ``''`` for the default; the build must exist."""
-    row = conn.execute(
-        "SELECT tenant_id FROM artifact_builds WHERE build_id = ?", (build_id,)
-    ).fetchone()
+    row = one(conn.execute("SELECT tenant_id FROM artifact_builds WHERE build_id = ?", (build_id,)))
     return row["tenant_id"] or ""
 
 
@@ -211,11 +210,13 @@ class ReleaseStore:
                 raise ReleaseRejected(f"attempt {attempt} does not hold build {build_id}")
             tenant = self._release_tenant(conn, build_id, tenant)
             if sequence is None:
-                row = conn.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
-                    "FROM build_releases WHERE build_id = ? AND kind = ?",
-                    (build_id, kind),
-                ).fetchone()
+                row = one(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
+                        "FROM build_releases WHERE build_id = ? AND kind = ?",
+                        (build_id, kind),
+                    )
+                )
                 sequence = int(row["next_sequence"])
             release = Release(
                 release_id=release_id or uuid.uuid4().hex,
@@ -355,11 +356,13 @@ class ReleaseStore:
                 raise ReleaseRejected(
                     f"attempt {release.attempt} no longer holds build {release.build_id}"
                 )
-            earlier = conn.execute(
-                "SELECT COUNT(*) AS n FROM build_releases WHERE build_id = ? AND kind = ? "
-                "AND sequence < ? AND state IN ('preparing', 'prepared')",
-                (release.build_id, release.kind, release.sequence),
-            ).fetchone()
+            earlier = one(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM build_releases WHERE build_id = ? AND kind = ? "
+                    "AND sequence < ? AND state IN ('preparing', 'prepared')",
+                    (release.build_id, release.kind, release.sequence),
+                )
+            )
             if earlier["n"]:
                 conn.rollback()
                 raise ReleaseOutOfOrder(
@@ -378,10 +381,12 @@ class ReleaseStore:
                 )
                 self._artifacts._promote_staged(conn, list(staged), now)
                 if release.kind == "final":
-                    target = conn.execute(
-                        "SELECT artifact_id, version FROM artifact_builds WHERE build_id = ?",
-                        (release.build_id,),
-                    ).fetchone()
+                    target = one(
+                        conn.execute(
+                            "SELECT artifact_id, version FROM artifact_builds WHERE build_id = ?",
+                            (release.build_id,),
+                        )
+                    )
                     if not self._builds.complete_attempt_within(
                         conn,
                         release.build_id,
@@ -484,11 +489,13 @@ class ReleaseStore:
                     raise ValueError(
                         f"release {from_release} is not an accepted release of build {build_id}"
                     )
-            unsettled = conn.execute(
-                "SELECT COUNT(*) AS n FROM build_releases "
-                "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
-                (build_id, attempt),
-            ).fetchone()["n"]
+            unsettled = one(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM build_releases "
+                    "WHERE build_id = ? AND attempt <> ? AND state IN ('preparing', 'prepared')",
+                    (build_id, attempt),
+                )
+            )["n"]
             if not self._builds.open_attempt_within(
                 conn,
                 build_id,
@@ -688,7 +695,7 @@ class ReleaseStore:
     @staticmethod
     def _releases_of_on(conn: StoreConnection, build_id: str, kind: str | None) -> list[Release]:
         sql = "SELECT * FROM build_releases WHERE build_id = ?"
-        params: list = [build_id]
+        params: list[SqlValue] = [build_id]
         if kind is not None:
             sql += " AND kind = ?"
             params.append(kind)
@@ -839,10 +846,12 @@ class ReleaseStore:
                 "VALUES (?, ?, ?, ?) ON CONFLICT (tenant, target) DO NOTHING",
                 (tenant, op.target, op.release_id, now),
             )
-            row = conn.execute(
-                "SELECT release_id FROM release_authorities WHERE tenant = ? AND target = ?",
-                (tenant, op.target),
-            ).fetchone()
+            row = one(
+                conn.execute(
+                    "SELECT release_id FROM release_authorities WHERE tenant = ? AND target = ?",
+                    (tenant, op.target),
+                )
+            )
             if row["release_id"] != op.release_id:
                 raise OperationFailed(f"slot {op.target} already belongs to {row['release_id']}")
         elif isinstance(op, AdvanceReference):

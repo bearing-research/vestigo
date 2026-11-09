@@ -21,7 +21,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -130,6 +130,46 @@ def advisory_lock_id(key: str) -> int:
     return int.from_bytes(digest, "big", signed=True)
 
 
+# A value a statement binds.
+type SqlValue = str | int | float | bytes | None
+
+
+class StoreRow(Protocol):
+    """A result row, by column name or position: ``sqlite3.Row`` or :class:`_Row`.
+
+    ``keys`` and ``__getitem__`` make ``dict(row)`` work.
+    """
+
+    def __getitem__(self, key: str | int, /) -> Any: ...
+
+    def keys(self) -> Iterable[str]: ...
+
+
+class StoreCursor(Protocol):
+    """What ``execute`` returns: the rows of a query, or a write's count."""
+
+    def fetchone(self) -> StoreRow | None: ...
+
+    def fetchall(self) -> Sequence[StoreRow]: ...
+
+    @property
+    def rowcount(self) -> int: ...
+
+    def __iter__(self) -> Iterator[StoreRow]: ...
+
+
+def one(cursor: StoreCursor) -> StoreRow:
+    """The row a query returns without fail: an aggregate's, or one the transaction holds.
+
+    Raises:
+        LookupError: there is none, which the caller's lock or lease rules out.
+    """
+    row = cursor.fetchone()
+    if row is None:
+        raise LookupError("a query that returns a row returned none")
+    return row
+
+
 class StoreConnection(Protocol):
     """The connection surface ``artifact_store`` uses, shaped like ``sqlite3.Connection``.
 
@@ -137,9 +177,9 @@ class StoreConnection(Protocol):
     """
 
     # Positional-only so sqlite3.Connection matches the protocol.
-    def execute(self, sql: str, params: Sequence[Any] = (), /) -> Any: ...
+    def execute(self, sql: str, params: Sequence[SqlValue] = (), /) -> StoreCursor: ...
 
-    def executescript(self, sql: str, /) -> Any: ...
+    def executescript(self, sql: str, /) -> object: ...
 
     def commit(self) -> None: ...
 
@@ -489,7 +529,7 @@ class _PostgresConnection:
             raise RuntimeError("this artifact-store connection is closed")
         return self._inner
 
-    def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
+    def execute(self, sql: str, params: Sequence[SqlValue] = ()) -> StoreCursor:
         cursor = self._raw().execute(translate_placeholders(sql), params)
         # The server's command tag says what ran; only a SELECT's text is looked at.
         tag = (cursor.statusmessage or "").split(" ", 1)[0]

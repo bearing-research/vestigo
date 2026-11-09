@@ -25,6 +25,7 @@ from vestigo.releases import ReleaseStore
 from vestigo.sql_backend import SqlDialect, SqliteDialect
 from vestigo.store import (
     _VERSION_FIELDS,
+    ALL_TENANTS,
     IMPORT_STAGING_TTL_SECONDS,
     ArtifactIdTaken,
     ArtifactImportConflict,
@@ -1883,6 +1884,14 @@ class TestAuditTenantScoping:
         self._seed(store, "globex", "globex/model")
         tenants = {e["tenant"] for e in store.read_audit()}
         assert {"acme", "globex"} <= tenants
+
+    def test_all_tenants_passed_is_the_default(self, store):
+        """A caller can name the whole-store view, as a CLI flag passes it through."""
+        self._seed(store, "acme", "acme/model")
+        self._seed(store, "globex", "globex/model")
+        assert store.read_audit(tenant=ALL_TENANTS) == store.read_audit()
+        assert store.read_events(tenant=ALL_TENANTS) == store.read_events()
+        assert {e["tenant"] for e in store.read_events(tenant=ALL_TENANTS)} >= {"acme", "globex"}
 
     def test_none_tenant_filters_to_default(self, store):
         """Explicit tenant=None scopes to the '' default tenant, not all."""

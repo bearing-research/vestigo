@@ -110,10 +110,18 @@ from vestigo.store import (
     ArtifactStore,
     ArtifactVersion,
     BuildLeaseLost,
+    GcResult,
     StagedVersion,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CollectResult(GcResult):
+    """What :meth:`Ledger.collect` did: the store's sweep, and the orphans it found."""
+
+    orphaned: int
+
 
 EXECUTOR = "vestigo.torch/train@v1"
 DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
@@ -576,7 +584,9 @@ class _Ranks:
 
     rank: int = 0
     world: int = 1
+    # A dist.ProcessGroup; new_group is typed to return a marker for a rank outside it.
     group: Any = None
+    # A dist.Store, whose stub says set takes a str; it takes the bytes posted here.
     store: Any = None
     barrier_seconds: float = 0.0
 
@@ -625,7 +635,7 @@ class _Ranks:
             raise error
         return result
 
-    def from_rank_0(self, work: Callable[[], Any]) -> Any:
+    def from_rank_0[T](self, work: Callable[[], T]) -> T:
         """``work()`` run on rank 0; on every rank its result, or its error raised."""
         if self.world == 1:
             return work()
@@ -645,7 +655,7 @@ class _Ranks:
             if error is not None:
                 raise error
             return
-        errors: list[Any] = [None] * self.world
+        errors: list[BaseException | None] = [None] * self.world
         dist.all_gather_object(
             errors, None if error is None else _portable(error), group=self.group
         )
@@ -721,7 +731,7 @@ def _attempt(state: AttemptState) -> Attempt:
     return Attempt(state.build_id, state.attempt, state.resumed_from)
 
 
-def _model_payload(model: Any, version: str) -> dict[str, Any]:
+def _model_payload(model: torch.nn.Module, version: str) -> dict[str, Any]:
     schema = [
         [key, list(value.shape), str(value.dtype)]
         if isinstance(value, torch.Tensor)
@@ -807,7 +817,7 @@ def _attributes(obj: object) -> dict[str, Any]:
     return {key: value for key, value in found.items() if not key.startswith("_")}
 
 
-def _tensor_digest(key: str, tensor: Any) -> list[Any]:
+def _tensor_digest(key: str, tensor: torch.Tensor) -> list[Any]:
     """Raises TypeError: the tensor is on the meta device, with no values to digest."""
     if tensor.is_meta:
         raise TypeError(f"tensor {key!r} is on the meta device and has no values to record")
@@ -820,7 +830,11 @@ def _tensor_digest(key: str, tensor: Any) -> list[Any]:
     return [list(data.shape), str(data.dtype), hashlib.sha256(raw).hexdigest()]
 
 
-def _program_payload(loss: Any, optimizer: Any, config: Mapping[str, Any] | None) -> dict[str, Any]:
+def _program_payload(
+    loss: str | Callable[..., Any],
+    optimizer: torch.optim.Optimizer,
+    config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     # A group's own settings (a per-layer learning rate) are outside the defaults.
     groups = [
         {key: value for key, value in group.items() if key != "params"}
@@ -1050,7 +1064,7 @@ class Ledger:
 
     # --- Definitions ---
 
-    def define_model(self, model: Any, *, version: str) -> Definition:
+    def define_model(self, model: torch.nn.Module, *, version: str) -> Definition:
         """The model's node: its class and ``state_dict`` schema, under *version*.
 
         The schema is every key's shape and dtype, the interface a checkpoint keys on.
@@ -1067,8 +1081,8 @@ class Ledger:
         self,
         model: Definition,
         *,
-        loss: Any,
-        optimizer: Any,
+        loss: str | Callable[..., Any],
+        optimizer: torch.optim.Optimizer,
         config: Mapping[str, Any] | None = None,
     ) -> Definition:
         """The training program's node: the model it implements, its loss and update.
@@ -1142,15 +1156,15 @@ class Ledger:
 
     def run(
         self,
-        model: Any,
-        optimizer: Any,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
         *,
-        loss: Any,
+        loss: str | Callable[..., Any],
         version: str,
         inputs: Mapping[str, Input] | None = None,
         config: Mapping[str, Any] | None = None,
         from_release: str | None = None,
-        checkpointing: Any = None,
+        checkpointing: CheckpointManager.Config | None = None,
     ) -> Run:
         """Resume this computation's unfinished execution, or start one.
 
@@ -1201,7 +1215,7 @@ class Ledger:
         terms: dict[str, Any],
         inputs: Mapping[str, Input] | None,
         opened: Callable[[_Inputs, _Ranks], Run],
-        checkpointing: Any,
+        checkpointing: CheckpointManager.Config | None,
     ) -> Run:
         """The run *opened* makes, on every rank once all agree on *terms* and inputs.
 
@@ -1277,7 +1291,7 @@ class Ledger:
         program: Definition,
         inputs: Mapping[str, Input] | None = None,
         *,
-        checkpointing: Any = None,
+        checkpointing: CheckpointManager.Config | None = None,
     ) -> Run:
         """A new execution of *program* on *inputs*, in its first attempt; in a process
         group, on every rank as :meth:`run` is."""
@@ -1294,7 +1308,7 @@ class Ledger:
         from_release: str,
         inputs: Mapping[str, Input] | None = None,
         *,
-        checkpointing: Any = None,
+        checkpointing: CheckpointManager.Config | None = None,
     ) -> Run:
         """A new execution starting from *from_release*, an accepted checkpoint of any run.
 
@@ -1319,7 +1333,7 @@ class Ledger:
         program: Definition,
         from_release: str,
         inputs: _Inputs,
-        checkpointing: Any,
+        checkpointing: CheckpointManager.Config | None,
         ranks: _Ranks,
         *,
         alone: bool = False,
@@ -1341,7 +1355,7 @@ class Ledger:
         program: Definition,
         inputs: _Inputs,
         init: str | None,
-        checkpointing: Any,
+        checkpointing: CheckpointManager.Config | None,
         ranks: _Ranks,
         *,
         alone: bool = False,
@@ -1434,7 +1448,7 @@ class Ledger:
         from_release: str | None = None,
         *,
         inputs: Mapping[str, Input] | None = None,
-        checkpointing: Any = None,
+        checkpointing: CheckpointManager.Config | None = None,
     ) -> Run:
         """Continue *execution_id* in a new attempt, fencing every earlier one.
 
@@ -1468,7 +1482,7 @@ class Ledger:
         execution_id: str,
         from_release: str | None,
         inputs: _Inputs | None,
-        checkpointing: Any,
+        checkpointing: CheckpointManager.Config | None,
         ranks: _Ranks,
     ) -> Run:
         # Before the lease is taken: a build of another executor is no execution.
@@ -1583,7 +1597,7 @@ class Ledger:
         finally:
             manager.close()
 
-    def configure(self, config: Any) -> Any:
+    def configure(self, config: CheckpointManager.Config) -> CheckpointManager.Config:
         """Point a ``CheckpointManager.Config`` at the ledger for loads only; returns it.
 
         For a job that loads checkpoints and saves none, such as an evaluation or an
@@ -1907,7 +1921,9 @@ class Ledger:
 
     # --- Retention ---
 
-    def collect(self, *, keep: int, min_idle_seconds: float = 0.0, dry_run: bool = False) -> dict:
+    def collect(
+        self, *, keep: int, min_idle_seconds: float = 0.0, dry_run: bool = False
+    ) -> CollectResult:
         """Delete the checkpoints no execution needs any more; ``garbage_collect``'s counts.
 
         Kept: of each unfinished execution, its newest *keep* checkpoints and the one
@@ -2369,8 +2385,12 @@ class _Checkpoints:
         return f"{ROOT}/{self.execution_id}/{self.attempt}/step-{step}"
 
     def configure(
-        self, config: Any, rank: int = 0, world: int = 1, opened: Ledger | None = None
-    ) -> Any:
+        self,
+        config: CheckpointManager.Config,
+        rank: int = 0,
+        world: int = 1,
+        opened: Ledger | None = None,
+    ) -> CheckpointManager.Config:
         """Point a ``CheckpointManager.Config`` at the ledger, as *rank* of *world*;
         returns it.
 
@@ -2686,10 +2706,10 @@ class Run:
     ledger: Ledger
     _checkpoints: _Checkpoints
     restores_from: str | None = None
-    checkpointing: Any = None
+    checkpointing: CheckpointManager.Config | None = None
     _ranks: _Ranks = field(default_factory=_Ranks, repr=False)
     finished: bool = False
-    _manager: Any = field(default=None, repr=False)
+    _manager: CheckpointManager | None = field(default=None, repr=False)
     # The last asynchronous save's future, which reports how that save went.
     _pending: Future[Any] | None = field(default=None, repr=False)
     # Every rank's count of its synchronous saves, which names each one's outcome: a
@@ -2794,7 +2814,7 @@ class Run:
         return self._manager
 
     @property
-    def _config(self) -> Any:
+    def _config(self) -> CheckpointManager.Config:
         return self.checkpointing or CheckpointManager.Config.with_sync_save()
 
     @property
@@ -2869,7 +2889,9 @@ class Run:
             return dict(state)
         return _load(self.manager, self.ledger.checkpoint_id(self.restores_from), state)
 
-    def observe(self, program: Any, *, scope: str, coverage: str) -> ArtifactVersion:
+    def observe(
+        self, program: torch.export.ExportedProgram, *, scope: str, coverage: str
+    ) -> ArtifactVersion:
         """Record an ``ExportedProgram`` this attempt captured, as what it observed.
 
         The PT2 archive ``torch.export.save`` writes is stored as a version of the

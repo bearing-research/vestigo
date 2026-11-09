@@ -16,11 +16,16 @@ The package exports nothing at its top level; a consumer imports each module.
   `finalize_canonical_together` for the `StagedVersion` records (a `building`
   version whose bytes are written) that a release's `accept` also takes;
   `register_validator(content_type, validate)`; the
-  `ArtifactVersion` record; `get_artifact_store` and `reset_artifact_store`
-  for the process-wide instance.
+  `ArtifactVersion` record; `ALL_TENANTS` (an `AllTenants`), the whole-store
+  reads' default tenant; the results as `TypedDict`s (`AuditEntry`,
+  `AliasChange` and `PendingChange`, `RetentionRoot`, `GcResult` with its
+  `CollectedVersion`s, `StoreStats` and `StoreUsage`, `VerifyFinding`);
+  `get_artifact_store` and `reset_artifact_store` for the process-wide instance.
 - `vestigo.sql_backend`: `SqliteDialect` (the default) and
   `PostgresDialect(dsn)`, passed as `dialect=` to the stores; `SqlDialect` and
-  `StoreConnection`, the protocols they satisfy.
+  `StoreConnection`, the protocols they satisfy, whose `execute` binds `SqlValue`s
+  and returns a `StoreCursor` of `StoreRow`s; `one(cursor)`, the row a query
+  returns without fail.
 - `vestigo.blob_store`: `BlobSettings`, `LocalBlobStore`, `S3BlobStore`,
   `GCSBlobStore`, `AzureBlobStore`; each object store's `objects(path)` lists a
   key, or a prefix ending in `/`, of its bucket (not under the store's prefix) as
@@ -31,9 +36,9 @@ The package exports nothing at its top level; a consumer imports each module.
   `principal`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `complete_attempt_within`, `list_runnable_builds` for the
   builds whose `dispatch` is `runner`; the lineage reads `builds_of(executor_ref)`,
-  `attempts_of(build_id)` and `attempts_resumed_from(release_id)`); `BuildState`,
-  `AttemptState`, `DISPATCHES`; `get_build_store` and `reset_build_store` for the
-  process-wide instance.
+  `attempts_of(build_id)` and `attempts_resumed_from(release_id)`); `BuildState`
+  (`to_dict()` a `BuildRecord`), `AttemptState`, `BuildStats`, `DISPATCHES`;
+  `get_build_store` and `reset_build_store` for the process-wide instance.
 - `vestigo.releases`: `ReleaseStore(artifacts, builds)`, a build's checkpoint
   and final releases (`prepare`, `attach`, `accept`, `abandon`, `resume`,
   `latest_accepted`, `bundles_of`, `collectable_checkpoints` with its `keep`
@@ -107,7 +112,8 @@ The package exports nothing at its top level; a consumer imports each module.
   checkpoints no execution needs: an unfinished run keeps its newest `keep`
   and the one it resumed from, a finished run the one it ended on, heads and
   a branch's source stay, and the staged files of a save that can no longer
-  be released go, as do failed rows.
+  be released go, as do failed rows; it returns a `CollectResult`, the store's
+  `GcResult` with the orphans it found.
   `Ledger.derive(from_release, name, outputs)` publishes what was computed
   from an accepted checkpoint (an export, evaluation metrics) as a release of
   its own, which keeps only its own outputs; `Ledger.derived` finds it again,

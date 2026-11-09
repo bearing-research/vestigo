@@ -15,12 +15,15 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from vestigo.sql_backend import (
     SqlDialect,
     SqliteDialect,
+    SqlValue,
     StoreConnection,
+    StoreRow,
+    one,
 )
 
 # What a legacy SQLite ``artifact_builds`` may lack, added on its open.
@@ -114,6 +117,33 @@ CREATE TABLE IF NOT EXISTS build_console_chunks (
 """
 
 
+class BuildRecord(TypedDict):
+    """A build as :meth:`BuildState.to_dict` gives it for an API response."""
+
+    build_id: str
+    artifact_id: str
+    version: int
+    state: str
+    executor_ref: str
+    created_at: float
+    started_at: float | None
+    completed_at: float | None
+    error_message: str | None
+    error_code: str | None
+    input_byte_count: int | None
+    output_byte_count: int | None
+
+
+class BuildStats(TypedDict):
+    """Builds by state: :meth:`BuildStore.get_stats`."""
+
+    total: int
+    pending: int
+    building: int
+    ready: int
+    failed: int
+
+
 @dataclass
 class BuildState:
     """One build row. Timestamps are Unix seconds; ``input_uris`` and ``params`` serve pull mode."""
@@ -150,7 +180,7 @@ class BuildState:
         """Alias for tenant_id."""
         return self.tenant_id
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> BuildRecord:
         """Return the API response shape."""
         return {
             "build_id": self.build_id,
@@ -187,7 +217,7 @@ _ATTEMPT_COLUMNS = (
 )
 
 
-def _row_to_attempt(row: Any) -> AttemptState:
+def _row_to_attempt(row: StoreRow) -> AttemptState:
     return AttemptState(
         build_id=row["build_id"],
         attempt=row["attempt"],
@@ -240,7 +270,7 @@ def _fence(conn: StoreConnection, build_id: str, attempt: str, now: float) -> No
     )
 
 
-def _row_to_build_state(row: Any) -> BuildState:
+def _row_to_build_state(row: StoreRow) -> BuildState:
     """A ``BuildState`` from a row holding ``_BUILD_FIELDS``, by name."""
     values = {field: row[field] for field in _BUILD_FIELDS}
     values["input_uris"] = json.loads(row["input_uris"]) if row["input_uris"] else None
@@ -648,7 +678,7 @@ class BuildStore:
         """The attempts that continued from *release_id*, in the order they opened."""
         return self._attempts_where("resumed_from = ?", (release_id,))
 
-    def _attempts_where(self, clause: str, params: tuple[Any, ...]) -> list[AttemptState]:
+    def _attempts_where(self, clause: str, params: tuple[SqlValue, ...]) -> list[AttemptState]:
         conn = self._get_connection()
         try:
             rows = conn.execute(
@@ -916,7 +946,7 @@ class BuildStore:
                 (new_lease_owner, lease_expires_at, now, build_id, now, *dispatch_params),
             )
             reclaimed = cursor.rowcount > 0
-            if reclaimed and row["attempt"] is not None:
+            if reclaimed and row is not None and row["attempt"] is not None:
                 _fence(conn, build_id, row["attempt"], now)
             conn.commit()
             return reclaimed
@@ -979,7 +1009,7 @@ class BuildStore:
                 SET state = 'ready', completed_at = ?, output_byte_count = ?, logs = ?
                 WHERE build_id = ? AND state = 'building'
             """
-            params: list[Any] = [self._clock(), output_byte_count, logs, build_id]
+            params: list[SqlValue] = [self._clock(), output_byte_count, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
@@ -991,7 +1021,7 @@ class BuildStore:
 
     def complete_within(
         self,
-        conn: Any,
+        conn: StoreConnection,
         build_id: str,
         *,
         artifact_id: str,
@@ -1017,7 +1047,7 @@ class BuildStore:
                 artifact_id = ?, version = ?
             WHERE build_id = ? AND state = 'building' AND lease_owner = ?
         """
-        params: list[Any] = [
+        params: list[SqlValue] = [
             self._clock(),
             output_byte_count,
             logs,
@@ -1191,7 +1221,7 @@ class BuildStore:
                 SET state = 'failed', completed_at = ?, error_message = ?, error_code = ?, logs = ?
                 WHERE build_id = ? AND state IN ('pending', 'building')
             """
-            params: list[Any] = [self._clock(), error_message, error_code, logs, build_id]
+            params: list[SqlValue] = [self._clock(), error_message, error_code, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
@@ -1320,7 +1350,7 @@ class BuildStore:
         finally:
             conn.close()
 
-    def get_stats(self) -> dict:
+    def get_stats(self) -> BuildStats:
         """Return build counts, total and by state."""
         conn = self._get_connection()
         try:
@@ -1335,7 +1365,7 @@ class BuildStore:
                 FROM artifact_builds
                 """
             )
-            row = cursor.fetchone()
+            row = one(cursor)
             return {
                 "total": row["total"],
                 "pending": row["pending"],
