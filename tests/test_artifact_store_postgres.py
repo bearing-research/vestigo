@@ -907,25 +907,25 @@ class TestGarbageCollection:
             store.write_blob(artifact_id, version, b"x" * 100)
             store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=100)
             self._last_used(store, artifact_id, 7200 - i)
-        children = store._delete_version_children
+        children = store._delete_versions_children
 
-        def name_lands(conn, artifact_id, version):
+        def name_lands(conn, keys):
             # A raw insert: its foreign-key check does not wait on the claim, while
             # ``set_name`` takes the row FOR SHARE and would wait behind it.
-            if artifact_id == ids[raced]:
+            if (ids[raced], 1) in keys:
                 with psycopg.connect(postgres_dsn) as other:
                     other.execute(
                         "INSERT INTO artifact_names (name, artifact_id, version, updated_at, "
                         "tenant) VALUES ('raced', %s, 1, 0, '')",
-                        (artifact_id,),
+                        (ids[raced],),
                     )
-            children(conn, artifact_id, version)
+            children(conn, keys)
 
-        store._delete_version_children = name_lands
+        store._delete_versions_children = name_lands
         try:
             result = store.garbage_collect(max_idle_days=0)
         finally:
-            store._delete_version_children = children
+            store._delete_versions_children = children
 
         assert result["deleted_count"] == 2
         for i, artifact_id in enumerate(ids):
@@ -2387,18 +2387,19 @@ class TestAHoldDuringTheClaimsWait:
     ):
         """The claim read the holds before it waited for the row (audit SR-E)."""
         version = _idle_ready(store, "held", "prov-held")
-        held_now = ArtifactStore._held_now
+        held_among = ArtifactStore._held_among
 
-        def root_committed_meanwhile(conn, artifact_id, held_version):
+        def root_committed_meanwhile(conn, keys):
             with psycopg.connect(postgres_dsn) as other:
-                other.execute(
-                    "INSERT INTO retention_roots (tenant, kind, holder, artifact_id, version, "
-                    "created_at) VALUES ('', 'pin', 'review', %s, %s, 0)",
-                    (artifact_id, held_version),
-                )
-            return held_now(conn, artifact_id, held_version)
+                for artifact_id, held_version in keys:
+                    other.execute(
+                        "INSERT INTO retention_roots (tenant, kind, holder, artifact_id, "
+                        "version, created_at) VALUES ('', 'pin', 'review', %s, %s, 0)",
+                        (artifact_id, held_version),
+                    )
+            return held_among(conn, keys)
 
-        monkeypatch.setattr(ArtifactStore, "_held_now", staticmethod(root_committed_meanwhile))
+        monkeypatch.setattr(ArtifactStore, "_held_among", staticmethod(root_committed_meanwhile))
         result = store.garbage_collect(max_idle_days=0, collect_latest=True)
         monkeypatch.undo()
 

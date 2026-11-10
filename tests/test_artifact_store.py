@@ -3102,20 +3102,21 @@ class TestAHoldAfterTheClaim(_Racing):
     def test_the_hold_is_refused_while_the_claim_holds_the_row(self, store, competitor, hold):
         _finished(store, "gone", "prov-gone")
         _idle_everything(store)
-        children = store._delete_version_children
+        children = store._delete_versions_children
         refused = []
 
-        def hold_meanwhile(conn, artifact_id, version):
-            try:
-                if hold == "retain":
-                    competitor.retain(artifact_id, version, kind="pin", holder="review")
-                else:
-                    competitor.publish_artifact(artifact_id, version)
-            except competitor.dialect.operational_error as exc:
-                refused.append(exc)
-            children(conn, artifact_id, version)
+        def hold_meanwhile(conn, keys):
+            for artifact_id, version in keys:
+                try:
+                    if hold == "retain":
+                        competitor.retain(artifact_id, version, kind="pin", holder="review")
+                    else:
+                        competitor.publish_artifact(artifact_id, version)
+                except competitor.dialect.operational_error as exc:
+                    refused.append(exc)
+            children(conn, keys)
 
-        store._delete_version_children = hold_meanwhile
+        store._delete_versions_children = hold_meanwhile
         result = store.garbage_collect(max_idle_days=0, collect_latest=True)
 
         assert result["deleted_count"] == 1
