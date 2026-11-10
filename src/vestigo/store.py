@@ -1140,6 +1140,29 @@ def _index_pointers(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute(_POINTER_INDEX_SQL)
 
 
+# What holds a version, which every chunk of a sweep's claim asks by (artifact_id,
+# version) (_held_among): unindexed, each chunk scanned all three tables. Pending changes
+# hold only as _HOLD_SOURCES says, so only those are indexed.
+_NAME_VERSION_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_names_version ON artifact_names(artifact_id, version)"
+)
+_REFERENCE_VERSION_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_aliases_version ON artifact_aliases(artifact_id, version)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_version ON registry_pending(artifact_id, version) "
+    "WHERE action = 'set' AND artifact_id IS NOT NULL",
+)
+
+
+def _index_holds(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Names, aliases and pending changes indexed by the version they hold."""
+    # A ledger a killed 0.4.0 first boot left without its names table gets the table,
+    # and this index with it, from the repair after the migrations.
+    if dialect.schema_exists(conn, "artifact_names"):
+        conn.execute(_NAME_VERSION_INDEX_SQL)
+    for ddl in _REFERENCE_VERSION_INDEX_SQL:
+        conn.execute(ddl)
+
+
 _ROOTS_KEY = "tenant, kind, holder, artifact_id, version"
 
 
@@ -1202,6 +1225,7 @@ _MIGRATIONS: list[_Migration] = [
     ),
     _Migration(17, "retention_roots keyed by tenant", _key_roots_by_tenant),
     _Migration(18, "idx_versions_superseded_by", _index_pointers),
+    _Migration(19, "idx_names_version, idx_aliases_version, idx_pending_version", _index_holds),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1289,7 +1313,7 @@ CREATE TABLE IF NOT EXISTS artifact_names (
 -- Index for name lookup without tenant (personal mode)
 CREATE INDEX IF NOT EXISTS idx_names_name ON artifact_names(name);
 """
-_SCHEMA_SQL += _POINTER_INDEX_SQL + ";\n"
+_SCHEMA_SQL += _POINTER_INDEX_SQL + ";\n" + _NAME_VERSION_INDEX_SQL + ";\n"
 
 # Every table and index _SCHEMA_SQL makes, and the index on active publications. Looked
 # for only in a store stamped current: in one behind, the newest are the migrations' to make.
@@ -1367,6 +1391,9 @@ CREATE TABLE IF NOT EXISTS registry_pending (
     PRIMARY KEY (tenant, name, alias)
 );
 """
+# Beside their tables, so every path that makes the tables makes them; migration 19 for
+# a ledger made before them.
+_REGISTRY_SCHEMA_SQL += "".join(ddl + ";\n" for ddl in _REFERENCE_VERSION_INDEX_SQL)
 
 # Publications: opt-in, per-artifact-version public read grants.
 #

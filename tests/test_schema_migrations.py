@@ -201,7 +201,7 @@ class TestAReadOnlyOpen:
         not because a first boot died: the refusal says the store is older."""
         db_path = ArtifactStore(tmp_path / "old").db_path
         conn = sqlite3.connect(db_path)
-        conn.execute("DROP INDEX idx_versions_superseded_by")
+        conn.execute("DROP INDEX idx_names_version")
         conn.execute("UPDATE schema_version SET version = ?", (_LATEST_SCHEMA_VERSION - 1,))
         conn.commit()
         conn.close()
@@ -213,7 +213,7 @@ class TestAReadOnlyOpen:
 
         ArtifactStore(tmp_path / "old").close()
         ArtifactStore(tmp_path / "old", read_only=True).close()
-        assert ("idx_versions_superseded_by",) in {(n,) for n, _ in _schema(db_path)}
+        assert ("idx_names_version",) in {(n,) for n, _ in _schema(db_path)}
 
     def test_a_missing_store_is_refused_before_anything_is_created(self, tmp_path):
         target = tmp_path / "nope" / "artifacts"
@@ -295,6 +295,9 @@ _MIGRATED_INDEXES = [
     "idx_versions_computation",
     "idx_publications_active",
     "idx_versions_superseded_by",
+    "idx_names_version",
+    "idx_aliases_version",
+    "idx_pending_version",
 ]
 _MIGRATED_TABLES = [
     "schema_version",
