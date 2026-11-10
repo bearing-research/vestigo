@@ -2510,3 +2510,39 @@ class TestRootsKeyedByTenantMigration:
             assert tenants == ["a", "b"]
         finally:
             reopened.close()
+
+
+class TestTheHoldTablesIndexes:
+    """Names, aliases and pending changes indexed by the version they hold, which a
+    sweep's selection and every chunk of its claim ask, on a new ledger and an old one."""
+
+    INDEXES = frozenset({"idx_names_version", "idx_aliases_version", "idx_pending_version"})
+
+    def _present(self, store) -> set[str]:
+        conn = store._get_connection()
+        try:
+            rows = conn.execute("SELECT indexname FROM pg_indexes").fetchall()
+        finally:
+            conn.close()
+        return {row["indexname"] for row in rows} & self.INDEXES
+
+    def test_a_new_ledger_has_them_and_an_older_one_gets_them(self, store, postgres_dsn, tmp_path):
+        assert self._present(store) == self.INDEXES
+        conn = store._get_connection()
+        try:
+            for name in self.INDEXES:
+                conn.execute(f"DROP INDEX {name}")
+            conn.execute("DELETE FROM schema_version WHERE version >= 19")
+            conn.commit()
+        finally:
+            conn.close()
+
+        dialect = PostgresDialect(postgres_dsn)
+        try:
+            reopened = ArtifactStore(tmp_path / "artifacts", dialect=dialect)
+            try:
+                assert self._present(reopened) == self.INDEXES
+            finally:
+                reopened.close()
+        finally:
+            dialect.close()

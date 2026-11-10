@@ -31,6 +31,14 @@ All notable changes to vestigo are recorded here. The format follows
   together; until a writer has opened it, a read-only open refuses a store at schema
   17 as older (#81).
 
+- Migration 19 indexes names, aliases and pending alias changes by the version they
+  point at (`idx_names_version`, `idx_aliases_version`, `idx_pending_version`). A sweep
+  asks them of every version it selects and every chunk it claims, and scanned each
+  table every time: with 20000 of each holding other versions, sweeping 2000 versions
+  took 21 s on SQLite and 23 s on Postgres; with the indexes, under 2 s and 7 s. As with
+  migration 18, the first writer of this version to open a store builds them under the
+  schema lock, and every process upgrades together.
+
 - On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
   create a hold (a version, its lineage, a name, an alias or a pending change, a
   pointer, a publication, a root, a required edge, a release's acceptance or operations)
