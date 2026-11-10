@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from dataclasses import fields, replace
 
 import pyarrow as pa
@@ -1345,6 +1346,19 @@ class TestRefreshSupersede:
         finally:
             conn.close()
         assert (held["state"], held["superseded_by"]) == ("superseded", "art-1@v=1")
+
+    def test_finalize_and_set_name_on_a_duplicate_names_the_canonical(self, backend_store):
+        """A new id with a ready provenance finalizes into the ready one, and the name follows."""
+        _make_ready_artifact(backend_store, "art-1", "prov-x")
+        backend_store.create_artifact("art-2", "prov-x")
+        backend_store.write_blob("art-2", 1, _ipc_bytes(1))
+
+        finalized = backend_store.finalize_and_set_name("art-2", 1, "{}", 1, 10, name="report")
+
+        assert (finalized.id, finalized.version) == ("art-1", 1)
+        assert backend_store.get_artifact("art-2", 1).state == "superseded"
+        resolved = backend_store.resolve_name("report")
+        assert (resolved.id, resolved.version) == ("art-1", 1)
 
     def test_finalize_and_set_name_supersedes(self, store):
         """The atomic finalize+name path supersedes the same way."""
@@ -2833,6 +2847,41 @@ class TestWholeStoreReads:
                 (f"reads-{upstream}", f"{upstream}@v=1")
             ]
 
+    def test_find_dependents_tells_apart_ids_that_share_a_prefix(self, backend_store):
+        for artifact_id in ("base-1", "base-10"):
+            _make_ready_artifact(backend_store, artifact_id, f"prov-{artifact_id}")
+        version = backend_store.create_artifact(
+            "reader",
+            "prov-reader",
+            input_versions={
+                "vestigo://artifact/base-10@v=1": "base-10@v=1",
+                "vestigo://artifact/base-1@v=1": "base-1@v=1",
+            },
+        )
+        backend_store.finalize_artifact("reader", version, "{}", 1, 10)
+
+        dependents = backend_store.find_dependents("base-1", 1)
+
+        assert [(d.id, used) for d, used in dependents] == [("reader", "base-1@v=1")]
+
+    def test_find_dependents_reads_an_underscore_in_the_id_literally(self, backend_store):
+        # ``_`` is a LIKE wildcard: ``nb_a`` must not find what read ``nbXa``.
+        version = backend_store.create_artifact(
+            "reader", "prov-reader", input_versions={"vestigo://artifact/nbXa@v=1": "nbXa@v=1"}
+        )
+        backend_store.finalize_artifact("reader", version, "{}", 1, 10)
+
+        assert backend_store.find_dependents("nb_a", 1) == []
+        assert [d.id for d, _ in backend_store.find_dependents("nbXa", 1)] == ["reader"]
+
+    def test_list_name_reads_leaves_out_a_version_still_building(self, store):
+        self._seed(store)
+        store.create_artifact(
+            "building", "prov-building", input_versions={"vestigo://name/model@champion": "up@v=1"}
+        )
+
+        assert {r[1] for r in store.list_name_reads()} == {"mine", "theirs"}
+
     def test_list_name_reads(self, store):
         self._seed(store)
 
@@ -3833,6 +3882,103 @@ class TestTenantScopedLifecycleWrites:
         assert tuple(_row(store, "theirs", version)) != before
 
 
+def _arrow_ids(values: list[int]) -> bytes:
+    """An Arrow IPC stream of *values*; same length, same shape, same size."""
+    sink = pa.BufferOutputStream()
+    with ipc.new_stream(sink, pa.schema([("id", pa.int64())])) as writer:
+        writer.write_batch(pa.RecordBatch.from_pydict({"id": values}))
+    return sink.getvalue().to_pybytes()
+
+
+def _stored(store, artifact_id: str, data: bytes, **kwargs):
+    version = store.create_artifact(artifact_id, f"prov-{artifact_id}")
+    store.write_blob(artifact_id, version, data)
+    return store.finalize_artifact(artifact_id, version, "{}", 3, len(data), **kwargs)
+
+
+class TestContentDigests:
+    """Every ready version records a digest of its bytes, so two stores compare outputs."""
+
+    def test_finalize_records_the_digest_of_the_bytes(self, backend_store):
+        data = _arrow_ids([1, 2, 3])
+
+        assert _stored(backend_store, "a", data).content_sha256 == hashlib.sha256(data).hexdigest()
+
+    def test_finalize_and_set_name_records_it_too(self, backend_store):
+        data = _arrow_ids([4, 5, 6])
+        backend_store.create_artifact("n", "prov-n")
+        backend_store.write_blob("n", 1, data)
+
+        finalized = backend_store.finalize_and_set_name("n", 1, "{}", 3, len(data), name="n")
+
+        assert finalized.content_sha256 == hashlib.sha256(data).hexdigest()
+
+    def test_a_caller_holding_the_bytes_is_believed(self, backend_store, monkeypatch):
+        data = _arrow_ids([1, 2, 3])
+        declared = hashlib.sha256(data).hexdigest()
+        monkeypatch.setattr(backend_store, "blob_digest", lambda *_a: pytest.fail("read again"))
+
+        assert _stored(backend_store, "a", data, content_sha256=declared).content_sha256 == declared
+
+    def test_a_caller_holding_the_bytes_is_believed_when_naming(self, backend_store, monkeypatch):
+        data = _arrow_ids([1, 2, 3])
+        declared = hashlib.sha256(data).hexdigest()
+        backend_store.create_artifact("m", "prov-m")
+        backend_store.write_blob("m", 1, data)
+        monkeypatch.setattr(backend_store, "blob_digest", lambda *_a: pytest.fail("read again"))
+
+        finalized = backend_store.finalize_and_set_name(
+            "m", 1, "{}", 3, len(data), name="m", content_sha256=declared
+        )
+
+        assert finalized.content_sha256 == declared
+
+    def test_two_stores_agree_on_the_same_bytes(self, tmp_path):
+        data = _arrow_ids([1, 2, 3])
+        with closing(ArtifactStore(tmp_path / "here")) as here:
+            with closing(ArtifactStore(tmp_path / "there")) as there:
+                mine, theirs = _stored(here, "a", data), _stored(there, "a", data)
+
+        # Both unrecorded would be equal too, and say nothing.
+        assert mine.content_sha256 == theirs.content_sha256 == hashlib.sha256(data).hexdigest()
+
+    def test_results_of_the_same_shape_digest_differently(self, tmp_path):
+        with closing(ArtifactStore(tmp_path / "mine")) as here:
+            with closing(ArtifactStore(tmp_path / "yours")) as there:
+                mine = _stored(here, "a", _arrow_ids([1, 2, 3]))
+                yours = _stored(there, "a", _arrow_ids([1, 2, 4]))
+
+        assert (mine.byte_size, mine.row_count) == (yours.byte_size, yours.row_count)
+        assert mine.content_sha256 != yours.content_sha256
+
+    def test_verify_catches_an_edit_that_keeps_the_shape(self, backend_store):
+        # It still parses and counts right, so only the digest catches it.
+        _stored(backend_store, "a", _arrow_ids([1, 2, 3]))
+        backend_store.write_blob("a", 1, _arrow_ids([1, 2, 4]))
+
+        assert [f["problem"] for f in backend_store.verify_artifacts()] == ["digest_mismatch"]
+
+    def test_verify_takes_a_row_with_no_digest_for_one_from_before_digests(self, backend_store):
+        _stored(backend_store, "a", _arrow_ids([1, 2, 3]))
+        conn = backend_store._get_connection()
+        try:
+            conn.execute("UPDATE artifact_versions SET content_sha256 = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert backend_store.verify_artifacts() == []
+
+    def test_a_publication_carries_the_versions_own_digest(self, backend_store, monkeypatch):
+        stored = _stored(backend_store, "a", _arrow_ids([1, 2, 3]))
+        # A publication that hashed again would take this instead of the row's.
+        monkeypatch.setattr(backend_store, "_streamed_digest", lambda *_a, **_k: "f" * 64)
+
+        publication = backend_store.publish_artifact("a", 1)
+
+        assert publication.content_sha256 == stored.content_sha256
+
+
 class TestVerifyStreams:
     def test_a_blob_no_validator_reads_is_hashed_as_a_stream(self, store, monkeypatch):
         """Read whole, a large blob is a large allocation per version (audit SR-G)."""
@@ -3979,3 +4125,205 @@ class TestPublicCallablesTheSuiteMissed:
         assert store.list_artifacts_with_tag_key("other") == []
         assert store.get_name_for_artifact("tagged", version) == "best"
         assert store.get_name_for_artifact("tagged", version + 1) is None
+
+
+class TestTheEventFeed:
+    """``read_events``: what changed, oldest first, for a follower that would otherwise diff."""
+
+    def test_publish_withdraw_and_registry_moves_each_append_one_event(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "fig", "prov-fig")
+        store.set_name("paper/fig", "fig", 1)
+        publication = store.publish_artifact("fig", 1, published_by="ana")
+        store.set_tag("fig", 1, "reviewed", "yes")
+        assert store.revoke_publication(publication.token, actor="ben")
+
+        events = store.read_events()
+
+        assert [e["action"] for e in events] == ["name_set", "publish", "tag_set", "withdraw"]
+        assert [e["seq"] for e in events] == sorted(e["seq"] for e in events)
+        publish, withdraw = events[1], events[3]
+        assert (publish["artifact_id"], publish["to_version"]) == ("fig", 1)
+        # The id, never the token: followers read the feed, not only the owner.
+        assert (publish["key"], publish["value"], publish["actor"]) == (
+            "token",
+            publication.id,
+            "ana",
+        )
+        assert (withdraw["value"], withdraw["actor"]) == (publication.id, "ben")
+
+    def test_a_credit_change_is_an_event(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "fig", "prov-fig")
+        publication = store.publish_artifact("fig", 1)
+        store.update_publication_credits(
+            publication.token, external_ids=[{"scheme": "doi", "value": "10.1/x"}], actor="ana"
+        )
+
+        credit = store.read_events()[-1]
+
+        assert (credit["action"], credit["artifact_id"]) == ("credit", "fig")
+        assert credit["to_version"] == 1
+        assert (credit["key"], credit["value"], credit["actor"]) == ("token", publication.id, "ana")
+
+    def test_a_credit_change_to_an_unknown_token_is_not_an_event(self, backend_store):
+        assert backend_store.update_publication_credits("nope", authors=[]) is None
+        assert backend_store.read_events() == []
+
+    def test_what_changes_nothing_is_not_an_event(self, backend_store):
+        """Publishing again returns the grant; revoking again fails. Neither is recorded."""
+        store = backend_store
+        _make_ready_artifact(store, "fig", "prov-fig")
+        first = store.publish_artifact("fig", 1)
+        assert store.publish_artifact("fig", 1).id == first.id
+        assert store.revoke_publication(first.token)
+        assert not store.revoke_publication(first.token)
+        assert not store.revoke_publication("no-such-token")
+
+        assert [e["action"] for e in store.read_events()] == ["publish", "withdraw"]
+
+    def test_a_follower_paging_by_since_sees_each_event_once(self, backend_store):
+        store = backend_store
+        for index in range(5):
+            _make_ready_artifact(store, f"a{index}", f"prov-a{index}")
+            store.set_name(f"n/{index}", f"a{index}", 1)
+
+        seen = []
+        page = store.read_events(since=0, limit=2)
+        while page:
+            seen.extend(e["seq"] for e in page)
+            # Something lands between two pages.
+            if len(seen) == 2:
+                _make_ready_artifact(store, "late", "prov-late")
+                store.set_name("n/late", "late", 1)
+            page = store.read_events(since=page[-1]["seq"], limit=2)
+
+        assert len(seen) == len(set(seen)) == 6
+
+    def test_a_tenant_reads_only_its_own(self, backend_store):
+        store = backend_store
+        for tenant in ("acme", "globex"):
+            store.create_artifact(f"{tenant}-fig", f"prov-{tenant}", tenant=tenant)
+            store.write_blob(f"{tenant}-fig", 1, _ipc_bytes(1))
+            store.finalize_artifact(f"{tenant}-fig", 1, "{}", 1, 10)
+            store.publish_artifact(f"{tenant}-fig", 1, tenant=tenant)
+
+        assert [e["artifact_id"] for e in store.read_events(tenant="acme")] == ["acme-fig"]
+        assert {e["tenant"] for e in store.read_events()} == {"acme", "globex"}
+
+
+class TestProtectedAliasEvents:
+    """A protected move is queued, then approved or rejected; each step is news."""
+
+    @staticmethod
+    def _champion(store, **kwargs):
+        return [e for e in store.read_events(**kwargs) if e["alias"] == "champion"]
+
+    def test_a_request_then_approval_appends_request_approval_and_move(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "old", "prov-old")
+        _make_ready_artifact(store, "new", "prov-new")
+        store.set_alias("team/model", "champion", "old", 1)
+        store.request_alias_change(
+            "team/model", "champion", "set", artifact_id="new", version=1, actor="ana"
+        )
+        store.approve_alias_change("team/model", "champion", actor="ben")
+
+        events = self._champion(store)
+
+        assert [(e["action"], e["actor"]) for e in events] == [
+            ("alias_set", None),
+            ("alias_request_set", "ana"),
+            ("alias_approved", "ben"),
+            ("alias_set", "ben"),
+        ]
+        request, approved, moved = events[1:]
+        assert (request["artifact_id"], request["to_version"]) == ("new", 1)
+        assert (approved["artifact_id"], approved["to_version"]) == ("new", 1)
+        assert (moved["from_artifact_id"], moved["artifact_id"]) == ("old", "new")
+
+    def test_a_request_then_rejection_appends_request_and_rejection_only(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "new", "prov-new")
+        store.request_alias_change(
+            "team/model", "champion", "set", artifact_id="new", version=1, actor="ana"
+        )
+        store.reject_alias_change("team/model", "champion", actor="ben")
+
+        assert [
+            (e["action"], e["actor"], e["artifact_id"], e["to_version"])
+            for e in self._champion(store)
+        ] == [("alias_request_set", "ana", "new", 1), ("alias_rejected", "ben", "new", 1)]
+        assert store.resolve_alias("team/model", "champion") is None
+
+    def test_an_approved_delete_appends_request_approval_and_delete(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "fig", "prov-fig")
+        store.set_alias("team/model", "champion", "fig", 1)
+        store.request_alias_change("team/model", "champion", "delete", actor="ana")
+        store.approve_alias_change("team/model", "champion", actor="ben")
+
+        events = self._champion(store)[1:]
+
+        assert [(e["action"], e["actor"]) for e in events] == [
+            ("alias_request_delete", "ana"),
+            ("alias_approved", "ben"),
+            ("alias_delete", "ben"),
+        ]
+        assert (events[-1]["from_artifact_id"], events[-1]["from_version"]) == ("fig", 1)
+
+    def test_a_refused_or_empty_decision_is_not_an_event(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "fig", "prov-fig")
+        _make_ready_artifact(store, "gone", "prov-gone")
+        store.set_alias("team/model", "champion", "fig", 1)
+        baseline = len(store.read_events())
+
+        # Already the live pointer: nothing queued.
+        assert not store.request_alias_change(
+            "team/model", "champion", "set", artifact_id="fig", version=1, actor="ana"
+        )
+        with pytest.raises(ValueError, match="No pending change"):
+            store.approve_alias_change("team/model", "champion", actor="ben")
+        with pytest.raises(ValueError, match="No pending change"):
+            store.reject_alias_change("team/model", "champion", actor="ben")
+        assert len(store.read_events()) == baseline
+
+        store.request_alias_change(
+            "team/model", "champion", "set", artifact_id="gone", version=1, actor="ana"
+        )
+        queued = len(store.read_events())
+        with pytest.raises(ValueError, match="Separation of duty"):
+            store.approve_alias_change(
+                "team/model", "champion", actor="ana", require_distinct_approver=True
+            )
+        assert store.delete_artifact("gone", 1)
+        after_delete = len(store.read_events())
+        with pytest.raises(ValueError, match="no longer available"):
+            store.approve_alias_change("team/model", "champion", actor="ben")
+
+        assert queued == baseline + 1
+        assert len(store.read_events()) == after_delete
+        assert store.list_pending_changes()[0]["artifact_id"] == "gone"
+
+    def test_a_tenant_follows_only_its_own_protected_moves(self, backend_store):
+        store = backend_store
+        for tenant in ("acme", "globex"):
+            store.create_artifact(f"{tenant}-fig", f"prov-{tenant}", tenant=tenant)
+            store.write_blob(f"{tenant}-fig", 1, _ipc_bytes(1))
+            store.finalize_artifact(f"{tenant}-fig", 1, "{}", 1, 10)
+            store.request_alias_change(
+                "team/model",
+                "champion",
+                "set",
+                artifact_id=f"{tenant}-fig",
+                version=1,
+                tenant=tenant,
+                actor="ana",
+            )
+            store.approve_alias_change("team/model", "champion", tenant=tenant, actor="ben")
+
+        acme = self._champion(store, tenant="acme")
+
+        assert [e["action"] for e in acme] == ["alias_request_set", "alias_approved", "alias_set"]
+        assert {e["artifact_id"] for e in acme} == {"acme-fig"}
