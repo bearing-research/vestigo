@@ -31,6 +31,25 @@ All notable changes to vestigo are recorded here. The format follows
   together; until a writer has opened it, a read-only open refuses a store at schema
   17 as older (#81).
 
+- On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
+  create a hold (a version, its lineage, a name, an alias or a pending change, a
+  pointer, a publication, a root, a required edge, a release's acceptance or operations)
+  takes it shared before any other lock, as does `delete_artifact`, whose locks a claim
+  takes in an order of its own. No hold lands while a batch claims, as SQLite's write
+  lock already ensured, so a claim no longer acts on a reading such a hold made stale.
+  Those writers wait for a batch, as on SQLite. A dialect of one's own implements
+  `SqlDialect.share_write(conn, key)` (#94).
+- A sweep batch ends after 0.25 s as well as after 1000 versions, and claims and
+  deletes a group of versions in a fixed number of statements rather than about ten
+  per version. On Postgres a 2000-version chain (each version reading the one before,
+  one group) held those writers off for 5.3 s and now 0.3 s; with 5000 lone versions a
+  writer waits at most 0.36 s (0.41 s before the sweep's key). On SQLite a
+  20000-version chain holds the write lock for 0.35 s, from 1.3 s. What holds a version
+  is one list, which the selection and the claim both read (#94).
+- `publish_artifact` streams the bytes of a version with no recorded digest before it
+  locks anything, not under the version's lock (on SQLite, the write lock) and the
+  sweep's key (#94).
+
 ### Fixed
 
 - Several processes opening a new SQLite ledger together through `BuildStore` or
@@ -79,6 +98,10 @@ All notable changes to vestigo are recorded here. The format follows
   missing version is "not found". A version the caller may name but not publish (a
   tenantless one from a tenant) is still refused with a `ValueError`, not as missing
   (#92).
+- On Postgres a hold landing on a version while its sweep batch claimed (a name, an
+  alias, a pin) kept that version but not its inputs, which the same batch then took:
+  the held version's lineage named versions that were gone. The hold now waits for the
+  batch (#94).
 
 ## 0.5.0 - 2026-11-08
 

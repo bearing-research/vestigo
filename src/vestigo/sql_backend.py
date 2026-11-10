@@ -296,6 +296,14 @@ class SqlDialect(Protocol):
         """
         ...
 
+    def share_write(self, conn: StoreConnection, key: str) -> None:
+        """Hold ``key`` shared until the transaction ends, as its first lock: any number
+        of writers share it, and a :meth:`begin_write` on ``key`` waits for them all, as
+        they wait for it. How a sweep keeps the writers that create holds out of a batch;
+        a backend whose ``begin_write`` locks globally (SQLite) needs nothing.
+        """
+        ...
+
     def execute_ddl(self, conn: StoreConnection, script: str) -> None:
         """Run *script*, this package's schema DDL or a consumer's, inside the open
         transaction, which it never commits: under :meth:`begin_write`, the lock holds
@@ -395,6 +403,11 @@ class SqliteDialect:
     def begin_write(self, conn: StoreConnection, key: str) -> None:
         # SQLite locks the whole file, so the key is unused.
         conn.execute("BEGIN IMMEDIATE")
+
+    def share_write(self, conn: StoreConnection, key: str) -> None:
+        # The writer's own begin_write takes the whole file, which a begin_write on any
+        # key already waits for.
+        return
 
     def execute_ddl(self, conn: StoreConnection, script: str) -> None:
         # Statement by statement, cut where SQLite's own tokenizer says one ends: a ``;``
@@ -795,6 +808,9 @@ class PostgresDialect:
         :attr:`integrity_error`.
         """
         conn.execute("SELECT pg_advisory_xact_lock(?)", (advisory_lock_id(key),))
+
+    def share_write(self, conn: StoreConnection, key: str) -> None:
+        conn.execute("SELECT pg_advisory_xact_lock_shared(?)", (advisory_lock_id(key),))
 
     def execute_ddl(self, conn: StoreConnection, script: str) -> None:
         # psycopg runs the whole script in the open transaction.

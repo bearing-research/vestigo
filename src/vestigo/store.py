@@ -179,16 +179,36 @@ def _split_ref(ref: str) -> tuple[str, int]:
     return artifact_id, int(version)
 
 
-# A version nothing used or held since the sweep selected it (id, version, the use it
-# was selected at, then id and version four times): a garbage-collection claim.
-_UNHELD_SQL = """
-    id = ? AND version = ? AND COALESCE(last_used_at, created_at) <= ?
-    AND NOT EXISTS (SELECT 1 FROM artifact_names n WHERE n.artifact_id = ? AND n.version = ?)
-    AND NOT EXISTS (SELECT 1 FROM artifact_aliases a WHERE a.artifact_id = ? AND a.version = ?)
-    AND NOT EXISTS (SELECT 1 FROM retention_roots r WHERE r.artifact_id = ? AND r.version = ?)
-    AND NOT EXISTS (SELECT 1 FROM artifact_publications pub
-                    WHERE pub.artifact_id = ? AND pub.version = ?)
-"""
+# A sweep batch holds it exclusively; a writer that can create a hold, shared
+# (``ArtifactStore._hold_off_sweeps``).
+_SWEEP_KEY = "__gc__"
+
+# What holds a version: each table of (artifact_id, version) rows, and the condition its
+# rows hold under. The one list a sweep's selection reads (``_holds``) and its claim reads
+# again (``_held_among``); publications hold revoked or not.
+_HOLD_SOURCES = (
+    ("artifact_publications", ""),
+    ("retention_roots", ""),
+    ("artifact_names", ""),
+    ("artifact_aliases", ""),
+    ("registry_pending", "action = 'set' AND artifact_id IS NOT NULL"),
+)
+
+# Keys per statement in a sweep's claim and delete: two parameters each, five times over in
+# ``_held_among``, well under SQLite's 32766 and Postgres's 65535.
+_KEY_CHUNK = 200
+
+
+def _chunks[T](items: Sequence[T]) -> list[Sequence[T]]:
+    return [items[start : start + _KEY_CHUNK] for start in range(0, len(items), _KEY_CHUNK)]
+
+
+def _key_rows(keys: Sequence[tuple[str, int]]) -> tuple[str, list[SqlValue]]:
+    """``VALUES (?, ?), ...`` for *keys*, to follow ``(id, version) IN``, and its parameters."""
+    params: list[SqlValue] = []
+    for artifact_id, version in keys:
+        params.extend((artifact_id, version))
+    return "VALUES " + ", ".join(["(?, ?)"] * len(keys)), params
 
 
 def _deletion_order(
@@ -905,9 +925,11 @@ def _add_import_staging(conn: StoreConnection, dialect: SqlDialect) -> None:
 # recorded time can be this far behind the last real use.
 _USE_RESOLUTION_SECONDS = 300.0
 
-# Versions garbage_collect deletes per transaction, and how long it leaves SQLite's write
-# lock free between them.
+# Versions garbage_collect deletes per transaction, at most, and for how long at most it
+# claims in one (a group is never split); how long it leaves SQLite's write lock free
+# between them.
 _GC_DELETE_BATCH = 1000
+_GC_BATCH_SECONDS = 0.25
 _GC_BATCH_PAUSE_SECONDS = 0.1
 
 # How long a temp file goes untouched before a sweep takes it for a dead write's.
@@ -1775,6 +1797,7 @@ class ArtifactStore:
         reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             version, was_minted = self._next_version(conn, artifact_id, tenant)
 
             input_versions_json = json.dumps(input_versions) if input_versions else None
@@ -1973,6 +1996,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             for (artifact_id, version), requires in requirements.items():
                 row = conn.execute(
                     "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
@@ -2213,6 +2237,8 @@ class ArtifactStore:
 
         conn = self._get_connection()
         try:
+            # Lineage is a hold on the inputs, as a name is.
+            self._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, landed.id)
             row = conn.execute(
                 "SELECT input_versions FROM artifact_versions WHERE id = ? AND version = ?",
@@ -2393,6 +2419,7 @@ class ArtifactStore:
         replaced_blob: tuple[str, int] | None = None
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, record.id)
             try:
                 no_op = self._import_no_op(conn, record)
@@ -2624,6 +2651,7 @@ class ArtifactStore:
         with reader_cm as reader:
             conn = self._get_connection()
             try:
+                self._hold_off_sweeps(conn)
                 new_version, was_minted = self._next_version(conn, artifact_id, tenant)
                 conn.execute(
                     """
@@ -2863,6 +2891,9 @@ class ArtifactStore:
                 )
             conn.commit()
 
+        # Sweeps are held off just before the first lock on each path below, not here:
+        # find_by_provenance takes a nested connection, which a held lock refuses, and
+        # the digest reads the whole blob, which would hold every sweep off meanwhile.
         conn = self._get_connection()
         try:
             cursor = conn.execute(
@@ -2888,6 +2919,7 @@ class ArtifactStore:
                     artifact_tenant = row["tenant"] if row["tenant"] else None
                     if not self._can_assign_name_for_tenant(artifact_tenant, tenant):
                         raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
+                    self._hold_off_sweeps(conn)
                     self._set_name_in_connection(conn, name, *canonical, tenant)
                 _commit_through_fence(conn, *canonical)
                 return self.get_artifact(*canonical)
@@ -2912,6 +2944,7 @@ class ArtifactStore:
                 if existing is not None and existing.id != artifact_id:
                     # Locked before this version points at it: a delete of the canonical
                     # then waits for the commit and finds the pointer, or went first.
+                    self._hold_off_sweeps(conn)
                     if self._lock_ready(conn, existing.id, existing.version):
                         # Another artifact has this provenance: this one is overtaken and the
                         # name points at the existing one.
@@ -2940,6 +2973,7 @@ class ArtifactStore:
                     # file, import) arrives here, and this is the moment the bytes become final.
                     digest = self.blob_digest(artifact_id, version, blob_attempt)
 
+                self._hold_off_sweeps(conn)
                 if existing is not None:
                     # Same id, another ready version with the same provenance: a refresh rebuild.
                     # Supersede it so the rebuild becomes canonical, since the partial unique
@@ -3625,6 +3659,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             self._lock_readable_target(conn, artifact_id, version, tenant)
 
             # Upsert + audit in one transaction (shared with the finalize paths).
@@ -3655,6 +3690,7 @@ class ArtifactStore:
                 return None
             conn = self._get_connection()
             try:
+                self._hold_off_sweeps(conn)
                 # Taken before the audit lock, as finalize takes its row locks: the other order
                 # deadlocks against a refresh. A supersede committing later waits on this row.
                 claimed = conn.execute(
@@ -3877,6 +3913,22 @@ class ArtifactStore:
         effective_tenant = tenant if tenant is not None else ""
         conn = self._get_connection()
         try:
+            # A row with no recorded digest (written before digests were) has its bytes
+            # streamed for one before the sweep's key: a sweep waiting for the key, and
+            # every hold writer queued behind it, would wait for the whole download.
+            unrecorded = conn.execute(
+                "SELECT 1 FROM artifact_versions v WHERE id = ? AND version = ? "
+                f"AND {_in_tenant('tenant', not effective_tenant)} AND content_sha256 IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM artifact_publications p WHERE "
+                "p.artifact_id = v.id AND p.version = v.version AND p.revoked_at IS NULL)",
+                (artifact_id, version, effective_tenant),
+            ).fetchone()
+            streamed: tuple[tuple[str, int], str | None] | None = None
+            if unrecorded is not None:
+                blob_key = self._resolve_blob_key(conn, artifact_id, version)[0]
+                conn.commit()  # no transaction left open across the download
+                streamed = (blob_key, self._streamed_digest(*blob_key))
+            self._hold_off_sweeps(conn)
             # Locked, so the version cannot be swept or deleted under the new link.
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
             # What naming hides, hidden as naming does; then publishing's own, stricter
@@ -3901,13 +3953,20 @@ class ArtifactStore:
             if existing is not None:
                 return self._publication_from_row(existing)
 
+            # The version's own digest, not a second computation: a publication disagreeing
+            # with its artifact would be the more alarming answer. Resolved on this
+            # connection: a second one would wait on, or be refused behind, the lock this
+            # one holds. Streamed again under the lock only if the bytes moved meanwhile.
+            digest = row["content_sha256"]
+            if not digest:
+                blob_key = self._resolve_blob_key(conn, artifact_id, version)[0]
+                if streamed is not None and streamed[0] == blob_key:
+                    digest = streamed[1]
+                else:
+                    digest = self._streamed_digest(*blob_key)
             token = secrets.token_urlsafe(32)
             publication = Publication(
-                # The version's own digest, not a second computation: a publication disagreeing with
-                # its artifact would be the more alarming answer. Resolved on this connection: a
-                # second one would wait on, or be refused behind, the lock this one holds.
-                content_sha256=row["content_sha256"]
-                or self._streamed_digest(*self._resolve_blob_key(conn, artifact_id, version)[0]),
+                content_sha256=digest,
                 token=token,
                 id=publication_id(token),
                 artifact_id=artifact_id,
@@ -4128,6 +4187,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
             self._lock_readable_target(conn, artifact_id, version, tenant)
@@ -4521,6 +4581,7 @@ class ArtifactStore:
             raise ValueError(f"Unknown alias change action: {action!r}")
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             if action == "set":
                 if artifact_id is None or version is None:
                     raise ValueError("alias 'set' request requires artifact_id and version")
@@ -4604,6 +4665,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             effective_tenant = tenant if tenant is not None else ""
             # Lock before reading, or a reject or newer request committed in between is
             # consumed while the stale change read here is applied.
@@ -5102,7 +5164,10 @@ class ArtifactStore:
             # naming this version holds its row and then waits for the audit lock, so
             # taking the audit lock first here deadlocked against it on Postgres. This row
             # first: a duplicate's finalize locks it before pointing at it, so the pointers
-            # and holds read below are all there will be.
+            # and holds read below are all there will be. Not during a sweep batch: its
+            # claim locks a group's rows in its own order, and a canonical and its
+            # pointers are one group.
+            self._hold_off_sweeps(conn)
             locked = conn.execute(
                 "UPDATE artifact_versions SET last_used_at = last_used_at "
                 "WHERE id = ? AND version = ?",
@@ -5188,7 +5253,7 @@ class ArtifactStore:
             )
             # Tags and builds, through the same helper garbage_collect uses so
             # the two paths cannot drift on what a version has to shed first.
-            self._delete_version_children(conn, artifact_id, version)
+            self._delete_versions_children(conn, [(artifact_id, version)])
 
             # Which key the bytes are under is on the row about to go.
             attempt_row = conn.execute(
@@ -5212,10 +5277,10 @@ class ArtifactStore:
         self.blob_store.delete_blob(blob_id, version)
         return True
 
-    def _delete_version_children(
-        self, conn: StoreConnection, artifact_id: str, version: int
+    def _delete_versions_children(
+        self, conn: StoreConnection, keys: Collection[tuple[str, int]]
     ) -> None:
-        """Remove the rows that reference a version, before the version itself.
+        """Remove the rows that reference *keys*' versions, before the versions themselves.
 
         Tags have no foreign key; build rows cascade because a build of a deleted
         artifact describes nothing, and with a build its console chunks. Its attempts
@@ -5223,31 +5288,33 @@ class ArtifactStore:
         (``settled_attempts`` lists those of a build gone), and so do its releases. The
         build tables belong to the build store and may not exist.
         """
-        conn.execute(
-            "DELETE FROM artifact_tags WHERE artifact_id = ? AND version = ?",
-            (artifact_id, version),
-        )
-        conn.execute(
-            "DELETE FROM retention_roots WHERE artifact_id = ? AND version = ?",
-            (artifact_id, version),
-        )
-        # Its own requirements go with it; an edge pointing at it stays, so the version
-        # that required it reads as missing one (``requirements_met``).
-        conn.execute(
-            "DELETE FROM retention_edges WHERE from_artifact_id = ? AND from_version = ?",
-            (artifact_id, version),
-        )
-        if self._dialect.schema_exists(conn, "artifact_builds"):
-            if self._dialect.schema_exists(conn, "build_console_chunks"):
+        builds = self._dialect.schema_exists(conn, "artifact_builds")
+        chunks = builds and self._dialect.schema_exists(conn, "build_console_chunks")
+        for chunk in _chunks(sorted(keys)):
+            rows, params = _key_rows(chunk)
+            conn.execute(
+                f"DELETE FROM artifact_tags WHERE (artifact_id, version) IN ({rows})", params
+            )
+            conn.execute(
+                f"DELETE FROM retention_roots WHERE (artifact_id, version) IN ({rows})", params
+            )
+            # Their own requirements go with them; an edge pointing at one stays, so the
+            # version that required it reads as missing one (``requirements_met``).
+            conn.execute(
+                f"DELETE FROM retention_edges WHERE (from_artifact_id, from_version) IN ({rows})",
+                params,
+            )
+            if chunks:
                 conn.execute(
                     "DELETE FROM build_console_chunks WHERE build_id IN (SELECT build_id "
-                    "FROM artifact_builds WHERE artifact_id = ? AND version = ?)",
-                    (artifact_id, version),
+                    f"FROM artifact_builds WHERE (artifact_id, version) IN ({rows}))",
+                    params,
                 )
-            conn.execute(
-                "DELETE FROM artifact_builds WHERE artifact_id = ? AND version = ?",
-                (artifact_id, version),
-            )
+            if builds:
+                conn.execute(
+                    f"DELETE FROM artifact_builds WHERE (artifact_id, version) IN ({rows})",
+                    params,
+                )
 
     def _holds(self, conn: StoreConnection, *, current_values: bool = True) -> _Holds:
         """Every root that holds a version, and every edge a hold follows.
@@ -5258,15 +5325,12 @@ class ArtifactStore:
         version holds what it requires. Deliberately not tenant-scoped:
         over-protecting is free, and proving chains never cross tenants is not.
         """
-        roots_sql = (
-            "SELECT artifact_id, version FROM artifact_publications "
-            "UNION SELECT artifact_id, version FROM retention_roots "
-            "UNION SELECT artifact_id, version FROM artifact_names "
-            "UNION SELECT artifact_id, version FROM artifact_aliases "
-            "UNION SELECT artifact_id, version FROM registry_pending "
-            "WHERE action = 'set' AND artifact_id IS NOT NULL "
-            "UNION SELECT id AS artifact_id, version FROM artifact_versions "
-            "WHERE state = 'building'"
+        roots_sql = " UNION ".join(
+            [
+                f"SELECT artifact_id, version FROM {table}" + (f" WHERE {where}" if where else "")
+                for table, where in _HOLD_SOURCES
+            ]
+            + ["SELECT id AS artifact_id, version FROM artifact_versions WHERE state = 'building'"]
         )
         roots = [(row["artifact_id"], row["version"]) for row in conn.execute(roots_sql)]
         current = (
@@ -5412,6 +5476,7 @@ class ArtifactStore:
             raise ValueError("a retention root needs a kind and a holder")
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             # Locked, so a sweep's claim or a delete cannot take the version with the root.
             row = self._lock_target(conn, artifact_id, version, "tenant")
             if row is None or (tenant is not None and (row["tenant"] or "") not in (tenant, "")):
@@ -5789,11 +5854,19 @@ class ArtifactStore:
                     protected = guarded()
 
             in_batch = 0
+            batch_began = 0.0
             for group in groups:
                 # Committed in batches: one transaction over a large sweep holds SQLite's write
                 # lock long enough to stall every writer behind it. A group is never split, so
                 # a long one (every version of an id reading the one before) holds it longer.
-                if not in_batch or in_batch >= _GC_DELETE_BATCH:
+                # By time too: every writer that can create a hold waits for a batch, and
+                # on Postgres a claim is several round trips, so a thousand of them held
+                # those writers off for seconds.
+                if (
+                    not in_batch
+                    or in_batch >= _GC_DELETE_BATCH
+                    or time.monotonic() - batch_began >= _GC_BATCH_SECONDS
+                ):
                     if in_batch:
                         conn.commit()
                         collected.extend(pending)
@@ -5804,12 +5877,15 @@ class ArtifactStore:
                             time.sleep(_GC_BATCH_PAUSE_SECONDS)
                     # Reachability again, under the write lock, per batch: a hold landing on
                     # a reader since the selection (a name, a pin) keeps the reader's inputs.
-                    # On Postgres the lock serializes sweeps only, so a hold can still land
-                    # between this read and a claim below.
-                    self._dialect.begin_write(conn, "__gc__")
+                    # None lands during the batch: on Postgres every writer that can create
+                    # one waits for the sweep's key (_hold_off_sweeps).
+                    self._dialect.begin_write(conn, _SWEEP_KEY)
                     holds = self._holds(conn, current_values=not collect_latest)
                     results = self._results_of(conn, tracked)
                     protected = guarded()
+                    # After the re-read: one that alone outlasted the cap would leave a
+                    # batch of one group, and a re-read per group.
+                    batch_began = time.monotonic()
                     in_batch = 0
                 in_batch += len(group)
                 if not self._take(conn, group, protected, stayed, namers):
@@ -5855,24 +5931,17 @@ class ArtifactStore:
             "dry_run": False,
         }
 
-    @staticmethod
-    def _held_now(conn: StoreConnection, artifact_id: str, version: int) -> bool:
-        """Whether a root, a publication, an alias or a pending alias change names the
-        version (names have a key).
+    def _hold_off_sweeps(self, conn: StoreConnection) -> None:
+        """Keep sweep batches out until *conn*'s transaction ends: a writer that can
+        create a hold (a version, a name, an alias or a pending change, a pointer, a
+        publication, a root, a required edge) calls it before any other lock.
 
-        An approval consumes its pending change and writes the alias in one commit, so
-        this sees one or the other; a request comes after the claim only by waiting on
-        its row lock, and then finds the version gone.
+        A batch takes the sweep's key exclusively and reads the holds again under it, so
+        no hold lands while it claims, which on Postgres a claim could otherwise act on
+        unseen (SQLite's write lock already serializes them). Before any other lock, or a
+        writer holding a row waits on a batch that waits on the row.
         """
-        row = conn.execute(
-            "SELECT 1 FROM retention_roots WHERE artifact_id = ? AND version = ? "
-            "UNION ALL SELECT 1 FROM artifact_publications WHERE artifact_id = ? AND version = ? "
-            "UNION ALL SELECT 1 FROM artifact_aliases WHERE artifact_id = ? AND version = ? "
-            "UNION ALL SELECT 1 FROM registry_pending "
-            "WHERE action = 'set' AND artifact_id = ? AND version = ?",
-            (artifact_id, version) * 4,
-        ).fetchone()
-        return row is not None
+        self._dialect.share_write(conn, _SWEEP_KEY)
 
     @staticmethod
     def _results_of(conn: StoreConnection, ids: Collection[str]) -> dict[str, list[int]]:
@@ -5921,18 +5990,16 @@ class ArtifactStore:
         # the batch's commit would then silently roll back every row.
         conn.execute("SAVEPOINT gc_group")
         try:
-            # The needs are read after every claim, not in it: on Postgres a claim
-            # judges its subqueries from a snapshot older than its wait for the row
-            # lock, and a pointer committed during that wait shows only in a later read.
-            taken = all(self._claim_unheld(conn, row) for row in group)
-            taken = taken and not self._needed_outside(conn, keys)
+            # Statements over the whole group, not one per row: a batch holds every
+            # writer that can create a hold off, and a long group (an id's versions each
+            # reading the one before) cost several round trips a row on Postgres.
+            taken = self._claim_unheld(conn, group) and not self._needed_outside(conn, keys)
             if taken:
-                for artifact_id, version in keys:
-                    self._delete_version_children(conn, artifact_id, version)
-                for artifact_id, version in keys:
+                self._delete_versions_children(conn, keys)
+                for chunk in _chunks(sorted(keys)):
+                    rows, params = _key_rows(chunk)
                     conn.execute(
-                        "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
-                        (artifact_id, version),
+                        f"DELETE FROM artifact_versions WHERE (id, version) IN ({rows})", params
                     )
         except self._dialect.integrity_error:
             # A name or alias pointed at one since the claim: the pointer wins.
@@ -5945,42 +6012,92 @@ class ArtifactStore:
         conn.execute("RELEASE SAVEPOINT gc_group")
         return taken
 
-    def _claim_unheld(self, conn: StoreConnection, row: StoreRow) -> bool:
-        """Lock *row*'s version if nothing used or held it since it was selected."""
-        artifact_id, version = row["id"], row["version"]
-        claimed = conn.execute(
-            f"UPDATE artifact_versions SET state = state WHERE {_UNHELD_SQL}",
-            (artifact_id, version, row["used"], *(artifact_id, version) * 4),
-        )
-        return claimed.rowcount == 1 and not self._held_now(conn, artifact_id, version)
+    def _claim_unheld(self, conn: StoreConnection, group: Sequence[StoreRow]) -> bool:
+        """Lock *group*'s versions; whether every one is still there, used no later than
+        when it was selected, and unheld.
+
+        The use and the holds are read after the lock, not in its statement: on Postgres
+        a statement judges its own subqueries from a snapshot older than its wait for the
+        rows, and what committed during that wait shows only in a later read.
+        """
+        selected = {(row["id"], row["version"]): row["used"] for row in group}
+        keys = sorted(selected)
+        for chunk in _chunks(keys):
+            rows, params = _key_rows(chunk)
+            locked = conn.execute(
+                f"UPDATE artifact_versions SET state = state WHERE (id, version) IN ({rows})",
+                params,
+            ).rowcount
+            if locked != len(chunk):
+                return False
+        for chunk in _chunks(keys):
+            rows, params = _key_rows(chunk)
+            for row in conn.execute(
+                "SELECT id, version, COALESCE(last_used_at, created_at) AS used "
+                f"FROM artifact_versions WHERE (id, version) IN ({rows})",
+                params,
+            ).fetchall():
+                if row["used"] > selected[(row["id"], row["version"])]:
+                    return False
+        return not self._held_among(conn, keys)
+
+    @staticmethod
+    def _held_among(conn: StoreConnection, keys: Sequence[tuple[str, int]]) -> bool:
+        """Whether anything in ``_HOLD_SOURCES`` names one of *keys*.
+
+        An approval consumes its pending change and writes the alias in one commit, so
+        this sees one or the other; a request comes after the claim only by waiting on
+        its row lock, and then finds the version gone.
+        """
+        for chunk in _chunks(keys):
+            rows, params = _key_rows(chunk)
+            held = conn.execute(
+                " UNION ALL ".join(
+                    f"SELECT 1 FROM {table} WHERE "
+                    + (f"{where} AND " if where else "")
+                    + f"(artifact_id, version) IN ({rows})"
+                    for table, where in _HOLD_SOURCES
+                ),
+                params * len(_HOLD_SOURCES),
+            ).fetchone()
+            if held is not None:
+                return True
+        return False
 
     @staticmethod
     def _needed_outside(conn: StoreConnection, keys: set[tuple[str, int]]) -> bool:
         """Whether a version not in *keys* needs one of them: points at it, requires it
         within its tenant, or is a version of an id whose top *keys* hold."""
-        for artifact_id, version in keys:
-            pointers = conn.execute(
-                "SELECT id, version FROM artifact_versions WHERE superseded_by = ?",
-                (f"{artifact_id}@v={version}",),
-            ).fetchall()
-            requirers = conn.execute(
+        refs = sorted(f"{artifact_id}@v={version}" for artifact_id, version in keys)
+        for chunk in _chunks(refs):
+            marks = ", ".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT id, version FROM artifact_versions WHERE superseded_by IN ({marks})",
+                list(chunk),
+            ).fetchall():
+                if (row["id"], row["version"]) not in keys:
+                    return True
+        for chunk in _chunks(sorted(keys)):
+            rows, params = _key_rows(chunk)
+            for row in conn.execute(
                 "SELECT e.from_artifact_id AS id, e.from_version AS version "
                 "FROM retention_edges e JOIN artifact_versions av "
                 "ON av.id = e.to_artifact_id AND av.version = e.to_version "
-                "WHERE av.id = ? AND av.version = ? AND e.tenant = COALESCE(av.tenant, '')",
-                (artifact_id, version),
-            ).fetchall()
-            if any((row["id"], row["version"]) not in keys for row in [*pointers, *requirers]):
-                return True
-        for artifact_id in {key[0] for key in keys}:
-            numbers = {
-                row["version"]
-                for row in conn.execute(
-                    "SELECT version FROM artifact_versions WHERE id = ?", (artifact_id,)
-                ).fetchall()
-            }
+                f"WHERE (av.id, av.version) IN ({rows}) AND e.tenant = COALESCE(av.tenant, '')",
+                params,
+            ).fetchall():
+                if (row["id"], row["version"]) not in keys:
+                    return True
+        numbers: dict[str, set[int]] = {}
+        for chunk in _chunks(sorted({artifact_id for artifact_id, _ in keys})):
+            marks = ", ".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT id, version FROM artifact_versions WHERE id IN ({marks})", list(chunk)
+            ).fetchall():
+                numbers.setdefault(row["id"], set()).add(row["version"])
+        for artifact_id, present in numbers.items():
             mine = {version for a, version in keys if a == artifact_id}
-            if max(numbers) in mine and numbers - mine:
+            if max(present) in mine and present - mine:
                 return True
         return False
 
@@ -6306,7 +6423,7 @@ class ArtifactStore:
             # rows pointing at deleted blobs, as garbage_collect does.
             for row in rows:
                 # A failed build's row still references the version.
-                self._delete_version_children(conn, row["id"], row["version"])
+                self._delete_versions_children(conn, [(row["id"], row["version"])])
                 conn.execute(
                     "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                     (row["id"], row["version"]),

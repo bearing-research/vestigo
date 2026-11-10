@@ -341,6 +341,8 @@ class ReleaseStore:
             # On a remote store each size is a request; on SQLite the key below is
             # the database's write lock.
             sizes = self._sizes(staged) if release.state in UNSETTLED else {}
+            # Its promote writes pointers and its operations roots: no sweep batch then.
+            self._artifacts._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, release.build_id)
             release = self._get_on(conn, release_id)
             assert release is not None
@@ -543,6 +545,8 @@ class ReleaseStore:
         """
         conn = self._connect()
         try:
+            # Its operations may write roots: no sweep batch then.
+            self._artifacts._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, build_id)
             now = self._clock()
             if not lease_held(conn, build_id, attempt, now):

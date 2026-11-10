@@ -3102,26 +3102,50 @@ class TestAHoldAfterTheClaim(_Racing):
     def test_the_hold_is_refused_while_the_claim_holds_the_row(self, store, competitor, hold):
         _finished(store, "gone", "prov-gone")
         _idle_everything(store)
-        children = store._delete_version_children
+        children = store._delete_versions_children
         refused = []
 
-        def hold_meanwhile(conn, artifact_id, version):
-            try:
-                if hold == "retain":
-                    competitor.retain(artifact_id, version, kind="pin", holder="review")
-                else:
-                    competitor.publish_artifact(artifact_id, version)
-            except competitor.dialect.operational_error as exc:
-                refused.append(exc)
-            children(conn, artifact_id, version)
+        def hold_meanwhile(conn, keys):
+            for artifact_id, version in keys:
+                try:
+                    if hold == "retain":
+                        competitor.retain(artifact_id, version, kind="pin", holder="review")
+                    else:
+                        competitor.publish_artifact(artifact_id, version)
+                except competitor.dialect.operational_error as exc:
+                    refused.append(exc)
+            children(conn, keys)
 
-        store._delete_version_children = hold_meanwhile
+        store._delete_versions_children = hold_meanwhile
         result = store.garbage_collect(max_idle_days=0, collect_latest=True)
 
         assert result["deleted_count"] == 1
         assert len(refused) == 1, "the hold landed on a claimed version"
         assert store.retention_roots() == []
         assert store.list_publications(include_revoked=True) == []
+
+
+class TestABatchTimeCap:
+    def test_a_slow_reachability_read_does_not_shrink_a_batch(self, store, monkeypatch):
+        """The cap times a batch's claims, not its re-read of reachability: a re-read
+        that alone outlasted it left a batch, and a re-read, per group."""
+        for i in range(5):
+            _finished(store, f"lone{i}", f"p-lone{i}")
+        _idle_everything(store)
+        holds = ArtifactStore._holds
+        reads = []
+
+        def slow_holds(self, conn, **kwargs):
+            reads.append(True)
+            time.sleep(0.25)
+            return holds(self, conn, **kwargs)
+
+        monkeypatch.setattr("vestigo.store._GC_BATCH_SECONDS", 0.2)
+        monkeypatch.setattr(ArtifactStore, "_holds", slow_holds)
+        result = store.garbage_collect(max_idle_days=0, collect_latest=True)
+
+        assert result["deleted_count"] == 5
+        assert len(reads) == 2, "the selection's read, then one batch's"
 
 
 _READS_UP_1 = {"vestigo://artifact/up@v=1": "up@v=1"}
