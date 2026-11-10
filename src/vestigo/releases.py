@@ -734,7 +734,9 @@ class ReleaseStore:
         owner = _tenant_of(conn, build_id)
         if tenant is not None and tenant != owner:
             conn.rollback()
-            raise ValueError(f"build {build_id} belongs to tenant {owner!r}, not {tenant!r}")
+            # Not naming the owner: a caller from another tenant learns only that it is not
+            # this one's.
+            raise ValueError(f"build {build_id} is not in tenant {tenant!r}")
         return owner
 
     def _outputs_on(self, conn: StoreConnection, release_id: str) -> list[ArtifactVersion]:

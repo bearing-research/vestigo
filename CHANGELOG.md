@@ -102,6 +102,9 @@ All notable changes to vestigo are recorded here. The format follows
   alias, a pin) kept that version but not its inputs, which the same batch then took:
   the held version's lineage named versions that were gone. The hold now waits for the
   batch (#94).
+- A release (`prepare`, `apply`) asked for under a tenant other than its build's is
+  refused without naming the build's tenant: `build ... is not in tenant 'other'`, as
+  a caller from another tenant may not learn it.
 
 ## 0.5.0 - 2026-11-08
 

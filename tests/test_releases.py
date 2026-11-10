@@ -484,10 +484,13 @@ class TestCheckpointsAndFinals:
 
     def test_a_release_belongs_to_its_builds_tenant(self, ledger: Ledger):
         build_id = _build(ledger, tenant="acme")
-        with pytest.raises(ValueError, match="belongs to tenant 'acme'"):
+        # Refused without naming the build's tenant to a caller from another.
+        with pytest.raises(ValueError, match="is not in tenant 'other'") as refused:
             ledger.releases.prepare(build_id, "a1", "checkpoint", tenant="other")
-        with pytest.raises(ValueError, match="belongs to tenant 'acme'"):
+        assert "acme" not in str(refused.value)
+        with pytest.raises(ValueError, match="is not in tenant 'other'") as refused:
             ledger.releases.apply(build_id, "a1", [], tenant="other")
+        assert "acme" not in str(refused.value)
         release = ledger.releases.prepare(build_id, "a1", "checkpoint")
         assert release.tenant == "acme"
         ledger.releases.accept(
@@ -498,7 +501,7 @@ class TestCheckpointsAndFinals:
         assert ledger.releases.reference("train/head", tenant="acme") == (release.release_id, 1)
         assert ledger.releases.reference("train/head") is None
         # The default tenant's build likewise refuses another's release.
-        with pytest.raises(ValueError, match="belongs to tenant ''"):
+        with pytest.raises(ValueError, match="is not in tenant 'acme'"):
             ledger.releases.prepare(_build(ledger), "a1", "checkpoint", tenant="acme")
 
 
