@@ -37,7 +37,7 @@ All notable changes to vestigo are recorded here. The format follows
   table every time: with 20000 of each holding other versions, sweeping 2000 versions
   took 21 s on SQLite and 23 s on Postgres; with the indexes, under 2 s and 7 s. As with
   migration 18, the first writer of this version to open a store builds them under the
-  schema lock, and every process upgrades together.
+  schema lock, and every process upgrades together (#95).
 
 - On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
   create a hold (a version, its lineage, a name, an alias or a pending change, a
