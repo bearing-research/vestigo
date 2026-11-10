@@ -99,7 +99,10 @@ entry point, and the README's overview when a capability is added.
    under another id supersedes its own row with a pointer at the holder.
 2. **A sweep takes a canonical only once nothing points at it**, and
    recomputes reachability under the write lock per batch; retention roots
-   and required edges are one closure.
+   and required edges are one closure. On Postgres a batch holds the sweep's
+   key exclusively, and a writer that can create a hold calls
+   `_hold_off_sweeps` before any other lock and opens no nested connection
+   while it holds it; `TestASweepBatchHoldsOffHoldWriters` lists the writers.
 3. **A release is accepted only once every output's bytes are stored**, and
    only by the attempt whose lease is live; a lapsed lease fences its attempt.
 4. **The ledger never parses a node's payload**; traversals are bounded.

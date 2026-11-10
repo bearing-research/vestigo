@@ -26,8 +26,10 @@ from vestigo.releases import ReleaseStore
 from vestigo.sql_backend import SERVER_THREAD_LIMIT, PostgresDialect, advisory_lock_id
 from vestigo.store import (
     _LATEST_SCHEMA_VERSION,
+    _SWEEP_KEY,
     ArtifactIdTaken,
     ArtifactImportConflict,
+    ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
     StagedVersion,
@@ -35,6 +37,7 @@ from vestigo.store import (
     publication_id,
 )
 from vestigo.tables import LEDGER_TABLES, TRANSIENT_TABLES
+from vestigo.uris import artifact_uri
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -449,6 +452,157 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
         probe.close()
 
 
+class TestASweepBatchHoldsOffHoldWriters:
+    """A sweep batch takes the sweep's key exclusively and every writer that can create a
+    hold takes it shared, first, so no hold lands while a batch claims."""
+
+    WRITERS = (
+        "create_artifact",
+        "import_artifact",
+        "promote_version",
+        "set_name",
+        "find_ready_and_set_name",
+        "finalize_artifact",
+        "set_alias",
+        "request_alias_change",
+        "approve_alias_change",
+        "publish_artifact",
+        "retain",
+        "accept",
+        "apply",
+    )
+
+    @pytest.mark.parametrize("writer", WRITERS)
+    def test_a_hold_writer_waits_for_a_batch_before_it_locks_anything(
+        self, store, postgres_dsn, writer
+    ):
+        version = store.create_artifact("v", "prov-v", _spec())
+        store.write_blob("v", version, b"bytes")
+        store.finalize_artifact("v", version, "{}", row_count=0, byte_size=5)
+        building = store.create_artifact("b", "prov-b", _spec())
+        store.write_blob("b", building, b"other")
+        record = replace(store.get_artifact("v", version), id="copied", provenance_hash="p2")
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        releases = ReleaseStore(store, builds)
+        target = store.create_artifact("target", "prov-run", _spec())
+        builds.create_build("b1", "target", target, executor_ref="x@v1", computation_key="k")
+        assert builds.open_attempt(
+            "b1", "a1", writable_until=time.time() + 3600, lease_owner="runner-1"
+        )
+        release = releases.prepare("b1", "a1", "final")
+        if writer == "approve_alias_change":
+            store.request_alias_change("m", "prod", "set", "v", version)
+        event = InsertAuditEvent(AuditEvent("x", "alice"))
+        calls = {
+            "create_artifact": lambda: store.create_artifact("new", "prov-new", _spec()),
+            "import_artifact": lambda: store.import_artifact(record, b"bytes"),
+            "promote_version": lambda: store.promote_version("v", version),
+            "set_name": lambda: store.set_name("n", "v", version),
+            "find_ready_and_set_name": lambda: store.find_ready_and_set_name("prov-v", "n"),
+            "finalize_artifact": lambda: store.finalize_artifact(
+                "b", building, "{}", row_count=0, byte_size=5
+            ),
+            "set_alias": lambda: store.set_alias("m", "prod", "v", version),
+            "request_alias_change": lambda: store.request_alias_change(
+                "m", "prod", "set", "v", version
+            ),
+            "approve_alias_change": lambda: store.approve_alias_change("m", "prod"),
+            "publish_artifact": lambda: store.publish_artifact("v", version),
+            "retain": lambda: store.retain("v", version, kind="pin", holder="h"),
+            "accept": lambda: releases.accept(release.release_id, [], [event]),
+            "apply": lambda: releases.apply("b1", "a1", [event]),
+        }
+        errors: list[BaseException] = []
+
+        def write() -> None:
+            try:
+                calls[writer]()
+            except BaseException as exc:
+                errors.append(exc)
+
+        node = PostgresDialect(postgres_dsn)  # another node's pool: this thread's is the store's
+        batch = node.connect()
+        try:
+            node.begin_write(batch, _SWEEP_KEY)
+            writing = threading.Thread(target=write)
+            writing.start()
+            _until_it_waits(store, writing)
+            assert writing.is_alive(), f"{writer} went ahead of the sweep batch"
+            # A row lock or a write gives the waiting writer a transaction id: it locked
+            # something before the sweep's key, which can deadlock against a batch.
+            held = batch.execute(
+                "SELECT count(*) AS n FROM pg_locks held JOIN pg_locks waiting "
+                "ON held.pid = waiting.pid WHERE NOT waiting.granted "
+                "AND held.granted AND held.locktype = 'transactionid'"
+            ).fetchone()
+            assert held["n"] == 0, f"{writer} locked something before the sweep's key"
+        finally:
+            batch.commit()
+            batch.close()
+            node.close()
+        writing.join()
+        assert errors == []
+
+    def test_a_name_on_a_version_its_batch_is_taking_waits_and_finds_it_gone(
+        self, store, monkeypatch
+    ):
+        """A name landing on a reader while its batch claimed kept the reader (its row has
+        a key) but not its input, which the same batch then took: the name read a version
+        whose input was gone."""
+        store.create_artifact("i", "prov-i", _spec())
+        store.write_blob("i", 1, b"input")
+        store.finalize_artifact("i", 1, "{}", row_count=0, byte_size=5)
+        store.create_artifact(
+            "v", "prov-v", _spec(), input_versions={artifact_uri("i", 1): "i@v=1"}
+        )
+        store.write_blob("v", 1, b"reader")
+        store.finalize_artifact("v", 1, "{}", row_count=0, byte_size=6)
+
+        claiming, release_sweep = threading.Event(), threading.Event()
+        errors: list[BaseException] = []
+        named: list[BaseException | None] = []
+        take = ArtifactStore._take
+
+        def pausing_before_the_reader_s_claim(self, conn, group, *args):
+            if any(row["id"] == "v" for row in group):
+                claiming.set()
+                assert release_sweep.wait(30)
+            return take(self, conn, group, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_take", pausing_before_the_reader_s_claim)
+
+        def sweep() -> None:
+            try:
+                store.garbage_collect(collectable=[("i", 1), ("v", 1)], collect_latest=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def name() -> None:
+            try:
+                store.set_name("n", "v", 1)
+                named.append(None)
+            except ArtifactNotFoundError as exc:
+                named.append(exc)
+
+        sweeping = threading.Thread(target=sweep)
+        sweeping.start()
+        assert claiming.wait(30)
+        naming = threading.Thread(target=name)
+        naming.start()
+        _until_it_waits(store, naming)
+        release_sweep.set()
+        sweeping.join()
+        naming.join()
+
+        assert errors == []
+        if named == [None]:
+            assert store.get_artifact("i", 1) is not None, "the name's version lost its input"
+        else:
+            [refused] = named
+            assert isinstance(refused, ArtifactNotFoundError)
+            assert store.get_artifact("v", 1) is None
+
+
 class TestGarbageCollection:
     def test_a_version_an_approval_aliases_after_the_sweep_selected_it_stays(
         self, store, monkeypatch
@@ -456,7 +610,7 @@ class TestGarbageCollection:
         """A sweep selected an unheld version; a change was then requested and approved
         for it. The claim's re-check read no pending change and could not see the
         approval's uncommitted alias, so it deleted the version the approval then
-        aliased."""
+        aliased. Now the batch waits for the approval and reads the alias with the holds."""
         version = store.create_artifact("c1", "prov-c1", _spec())
         store.write_blob("c1", version, b"bytes")
         store.finalize_artifact("c1", version, "{}", row_count=0, byte_size=5)
@@ -464,19 +618,20 @@ class TestGarbageCollection:
         selected, release_sweep = threading.Event(), threading.Event()
         aliasing, release_approval = threading.Event(), threading.Event()
         errors: list[BaseException] = []
-        take, move = ArtifactStore._take, ArtifactStore._move_alias
+        begin_write, move = store.dialect.begin_write, ArtifactStore._move_alias
 
-        def pausing_before_each_claim(self, *args, **kwargs):
-            selected.set()
-            assert release_sweep.wait(30)
-            return take(self, *args, **kwargs)
+        def pausing_before_the_batch(conn, key):
+            if key == _SWEEP_KEY:
+                selected.set()
+                assert release_sweep.wait(30)
+            return begin_write(conn, key)
 
         def pausing_before_aliasing(self, conn, **kwargs):
             aliasing.set()
             assert release_approval.wait(30)
             return move(self, conn, **kwargs)
 
-        monkeypatch.setattr(ArtifactStore, "_take", pausing_before_each_claim)
+        monkeypatch.setattr(store.dialect, "begin_write", pausing_before_the_batch)
         monkeypatch.setattr(ArtifactStore, "_move_alias", pausing_before_aliasing)
 
         def sweep() -> None:

@@ -31,6 +31,14 @@ All notable changes to vestigo are recorded here. The format follows
   together; until a writer has opened it, a read-only open refuses a store at schema
   17 as older (#81).
 
+- On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
+  create a hold (a version, a name, an alias or a pending change, a pointer, a
+  publication, a root, a required edge, a release's acceptance or operations) takes it
+  shared before any other lock. No hold lands while a batch claims, as SQLite's write
+  lock already ensured, so a claim no longer acts on a reading such a hold made stale;
+  those writers wait for a batch, as on SQLite. A dialect of one's own implements
+  `SqlDialect.share_write(conn, key)`.
+
 ### Fixed
 
 - Several processes opening a new SQLite ledger together through `BuildStore` or
@@ -79,6 +87,10 @@ All notable changes to vestigo are recorded here. The format follows
   missing version is "not found". A version the caller may name but not publish (a
   tenantless one from a tenant) is still refused with a `ValueError`, not as missing
   (#92).
+- On Postgres a hold landing on a version while its sweep batch claimed (a name, an
+  alias, a pin) kept that version but not its inputs, which the same batch then took:
+  the held version's lineage named versions that were gone. The hold now waits for the
+  batch.
 
 ## 0.5.0 - 2026-11-08
 

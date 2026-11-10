@@ -25,7 +25,10 @@ The package exports nothing at its top level; a consumer imports each module.
   `PostgresDialect(dsn)`, passed as `dialect=` to the stores; `SqlDialect` and
   `StoreConnection`, the protocols they satisfy, whose `execute` binds `SqlValue`s
   and returns a `StoreCursor` of `StoreRow`s; `one(cursor)`, the row a query
-  returns without fail; `create_tables(dialect, table, ddl)`, a consumer's own
+  returns without fail. A dialect implements `begin_write(conn, key)` and
+  `share_write(conn, key)`, the key held shared, which every writer that can create a
+  hold takes before any other lock and a sweep batch takes exclusively;
+  `create_tables(dialect, table, ddl)`, a consumer's own
   tables beside the ledger's, created once per database under a lock keyed on
   `table`.
 - `vestigo.blob_store`: `BlobSettings`, `LocalBlobStore`, `S3BlobStore`,

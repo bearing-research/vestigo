@@ -179,6 +179,10 @@ def _split_ref(ref: str) -> tuple[str, int]:
     return artifact_id, int(version)
 
 
+# A sweep batch holds it exclusively; a writer that can create a hold, shared
+# (``ArtifactStore._hold_off_sweeps``).
+_SWEEP_KEY = "__gc__"
+
 # A version nothing used or held since the sweep selected it (id, version, the use it
 # was selected at, then id and version four times): a garbage-collection claim.
 _UNHELD_SQL = """
@@ -905,9 +909,11 @@ def _add_import_staging(conn: StoreConnection, dialect: SqlDialect) -> None:
 # recorded time can be this far behind the last real use.
 _USE_RESOLUTION_SECONDS = 300.0
 
-# Versions garbage_collect deletes per transaction, and how long it leaves SQLite's write
-# lock free between them.
+# Versions garbage_collect deletes per transaction, at most, and for how long at most it
+# claims in one (a group is never split); how long it leaves SQLite's write lock free
+# between them.
 _GC_DELETE_BATCH = 1000
+_GC_BATCH_SECONDS = 0.25
 _GC_BATCH_PAUSE_SECONDS = 0.1
 
 # How long a temp file goes untouched before a sweep takes it for a dead write's.
@@ -1775,6 +1781,7 @@ class ArtifactStore:
         reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             version, was_minted = self._next_version(conn, artifact_id, tenant)
 
             input_versions_json = json.dumps(input_versions) if input_versions else None
@@ -2393,6 +2400,7 @@ class ArtifactStore:
         replaced_blob: tuple[str, int] | None = None
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, record.id)
             try:
                 no_op = self._import_no_op(conn, record)
@@ -2624,6 +2632,7 @@ class ArtifactStore:
         with reader_cm as reader:
             conn = self._get_connection()
             try:
+                self._hold_off_sweeps(conn)
                 new_version, was_minted = self._next_version(conn, artifact_id, tenant)
                 conn.execute(
                     """
@@ -2863,6 +2872,9 @@ class ArtifactStore:
                 )
             conn.commit()
 
+        # Sweeps are held off just before the first lock on each path below, not here:
+        # find_by_provenance takes a nested connection, which a held lock refuses, and
+        # the digest reads the whole blob, which would hold every sweep off meanwhile.
         conn = self._get_connection()
         try:
             cursor = conn.execute(
@@ -2888,6 +2900,7 @@ class ArtifactStore:
                     artifact_tenant = row["tenant"] if row["tenant"] else None
                     if not self._can_assign_name_for_tenant(artifact_tenant, tenant):
                         raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
+                    self._hold_off_sweeps(conn)
                     self._set_name_in_connection(conn, name, *canonical, tenant)
                 _commit_through_fence(conn, *canonical)
                 return self.get_artifact(*canonical)
@@ -2912,6 +2925,7 @@ class ArtifactStore:
                 if existing is not None and existing.id != artifact_id:
                     # Locked before this version points at it: a delete of the canonical
                     # then waits for the commit and finds the pointer, or went first.
+                    self._hold_off_sweeps(conn)
                     if self._lock_ready(conn, existing.id, existing.version):
                         # Another artifact has this provenance: this one is overtaken and the
                         # name points at the existing one.
@@ -2940,6 +2954,7 @@ class ArtifactStore:
                     # file, import) arrives here, and this is the moment the bytes become final.
                     digest = self.blob_digest(artifact_id, version, blob_attempt)
 
+                self._hold_off_sweeps(conn)
                 if existing is not None:
                     # Same id, another ready version with the same provenance: a refresh rebuild.
                     # Supersede it so the rebuild becomes canonical, since the partial unique
@@ -3625,6 +3640,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             self._lock_readable_target(conn, artifact_id, version, tenant)
 
             # Upsert + audit in one transaction (shared with the finalize paths).
@@ -3655,6 +3671,7 @@ class ArtifactStore:
                 return None
             conn = self._get_connection()
             try:
+                self._hold_off_sweeps(conn)
                 # Taken before the audit lock, as finalize takes its row locks: the other order
                 # deadlocks against a refresh. A supersede committing later waits on this row.
                 claimed = conn.execute(
@@ -3877,6 +3894,7 @@ class ArtifactStore:
         effective_tenant = tenant if tenant is not None else ""
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             # Locked, so the version cannot be swept or deleted under the new link.
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
             # What naming hides, hidden as naming does; then publishing's own, stricter
@@ -4128,6 +4146,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
             self._lock_readable_target(conn, artifact_id, version, tenant)
@@ -4521,6 +4540,7 @@ class ArtifactStore:
             raise ValueError(f"Unknown alias change action: {action!r}")
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             if action == "set":
                 if artifact_id is None or version is None:
                     raise ValueError("alias 'set' request requires artifact_id and version")
@@ -4604,6 +4624,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             effective_tenant = tenant if tenant is not None else ""
             # Lock before reading, or a reject or newer request committed in between is
             # consumed while the stale change read here is applied.
@@ -5412,6 +5433,7 @@ class ArtifactStore:
             raise ValueError("a retention root needs a kind and a holder")
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             # Locked, so a sweep's claim or a delete cannot take the version with the root.
             row = self._lock_target(conn, artifact_id, version, "tenant")
             if row is None or (tenant is not None and (row["tenant"] or "") not in (tenant, "")):
@@ -5789,11 +5811,19 @@ class ArtifactStore:
                     protected = guarded()
 
             in_batch = 0
+            batch_began = 0.0
             for group in groups:
                 # Committed in batches: one transaction over a large sweep holds SQLite's write
                 # lock long enough to stall every writer behind it. A group is never split, so
                 # a long one (every version of an id reading the one before) holds it longer.
-                if not in_batch or in_batch >= _GC_DELETE_BATCH:
+                # By time too: every writer that can create a hold waits for a batch, and
+                # on Postgres a claim is several round trips, so a thousand of them held
+                # those writers off for seconds.
+                if (
+                    not in_batch
+                    or in_batch >= _GC_DELETE_BATCH
+                    or time.monotonic() - batch_began >= _GC_BATCH_SECONDS
+                ):
                     if in_batch:
                         conn.commit()
                         collected.extend(pending)
@@ -5804,9 +5834,10 @@ class ArtifactStore:
                             time.sleep(_GC_BATCH_PAUSE_SECONDS)
                     # Reachability again, under the write lock, per batch: a hold landing on
                     # a reader since the selection (a name, a pin) keeps the reader's inputs.
-                    # On Postgres the lock serializes sweeps only, so a hold can still land
-                    # between this read and a claim below.
-                    self._dialect.begin_write(conn, "__gc__")
+                    # None lands during the batch: on Postgres every writer that can create
+                    # one waits for the sweep's key (_hold_off_sweeps).
+                    self._dialect.begin_write(conn, _SWEEP_KEY)
+                    batch_began = time.monotonic()
                     holds = self._holds(conn, current_values=not collect_latest)
                     results = self._results_of(conn, tracked)
                     protected = guarded()
@@ -5854,6 +5885,18 @@ class ArtifactStore:
             "store_bytes": store_bytes,
             "dry_run": False,
         }
+
+    def _hold_off_sweeps(self, conn: StoreConnection) -> None:
+        """Keep sweep batches out until *conn*'s transaction ends: a writer that can
+        create a hold (a version, a name, an alias or a pending change, a pointer, a
+        publication, a root, a required edge) calls it before any other lock.
+
+        A batch takes the sweep's key exclusively and reads the holds again under it, so
+        no hold lands while it claims, which on Postgres a claim could otherwise act on
+        unseen (SQLite's write lock already serializes them). Before any other lock, or a
+        writer holding a row waits on a batch that waits on the row.
+        """
+        self._dialect.share_write(conn, _SWEEP_KEY)
 
     @staticmethod
     def _held_now(conn: StoreConnection, artifact_id: str, version: int) -> bool:
