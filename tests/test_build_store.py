@@ -1,5 +1,6 @@
 """Tests for build state store (server-mode transforms)."""
 
+import sqlite3
 import uuid
 from collections.abc import Iterable
 from contextlib import closing
@@ -615,6 +616,19 @@ class TestLeases:
         assert not build_store.open_attempt(build_id, "a1", writable_until=clock() + 3600)
         assert build_store.reclaim_expired_build(build_id, "runner-b")
 
+    def test_a_claimed_build_is_not_claimed_again(self, build_store):
+        build_id = self._building(build_store)
+
+        assert not build_store.claim_build(build_id, "runner-b", lease_duration_seconds=60.0)
+        assert build_store.get_build(build_id).lease_owner == "runner-a"
+
+    def test_only_the_owner_renews_a_live_lease(self, build_store, clock):
+        build_id = self._building(build_store)
+        expires_at = build_store.get_build(build_id).lease_expires_at
+
+        assert not build_store.renew_lease(build_id, "runner-b", 600.0)
+        assert build_store.get_build(build_id).lease_expires_at == expires_at
+
     def test_a_live_lease_is_not_reclaimed(self, build_store, clock):
         build_id = self._building(build_store)
         assert not build_store.reclaim_expired_build(build_id, "runner-b")
@@ -1018,6 +1032,86 @@ class TestAttempts:
         build_store.forget_attempt(build_id, "a1")
         assert build_store.settled_attempts() == [(build_id, "art-123", 1, "a2", False)]
         assert build_store.get_attempt(build_id, "a1") is None
+
+
+class TestBuildLogs:
+    """An executor's output, kept on the build row for whoever debugs it."""
+
+    def _building(self, build_store, artifact_id="art-123") -> str:
+        build_id = str(uuid.uuid4())
+        build_store.create_build(
+            build_id=build_id, artifact_id=artifact_id, version=1, executor_ref="sql@v1"
+        )
+        assert build_store.claim_build(build_id, "runner-a")
+        return build_id
+
+    def test_a_completed_build_keeps_its_logs(self, build_store):
+        build_id = self._building(build_store)
+        assert build_store.get_build(build_id).logs is None
+
+        build_store.complete_build(build_id, output_byte_count=1000, logs="[INFO] done\n42 rows")
+
+        build = build_store.get_build(build_id)
+        assert (build.state, build.logs) == ("ready", "[INFO] done\n42 rows")
+
+    def test_a_failed_build_keeps_its_logs_beside_the_error(self, build_store):
+        build_id = self._building(build_store)
+
+        build_store.fail_build(
+            build_id, error_message="Syntax error", error_code="SyntaxError", logs="[ERROR] line 5"
+        )
+
+        build = build_store.get_build(build_id)
+        assert (build.state, build.error_message, build.logs) == (
+            "failed",
+            "Syntax error",
+            "[ERROR] line 5",
+        )
+
+    def test_a_build_completed_without_logs_has_none(self, build_store):
+        build_id = self._building(build_store)
+
+        build_store.complete_build(build_id, output_byte_count=500)
+
+        assert build_store.get_build(build_id).logs is None
+
+    def test_a_table_from_before_the_column_gains_it_on_open(self, tmp_path):
+        db_path = tmp_path / "artifacts.sqlite"
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE artifact_builds (
+                    build_id TEXT PRIMARY KEY,
+                    artifact_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    executor_ref TEXT NOT NULL,
+                    executor_url TEXT,
+                    tenant_id TEXT,
+                    principal_id TEXT,
+                    created_at REAL NOT NULL,
+                    started_at REAL,
+                    completed_at REAL,
+                    error_message TEXT,
+                    error_code TEXT,
+                    input_byte_count INTEGER,
+                    output_byte_count INTEGER,
+                    lease_owner TEXT,
+                    lease_expires_at REAL,
+                    input_uris TEXT,
+                    params TEXT,
+                    name TEXT
+                )
+                """
+            )
+            conn.commit()
+        seed_build_targets(tmp_path, ["art-123"], [1])
+
+        build_store = BuildStore(db_path)
+        build_id = self._building(build_store)
+        build_store.complete_build(build_id, output_byte_count=100, logs="migrated")
+
+        assert build_store.get_build(build_id).logs == "migrated"
 
 
 class TestConsoleChunks:
