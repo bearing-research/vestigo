@@ -1996,6 +1996,7 @@ class ArtifactStore:
         """
         conn = self._get_connection()
         try:
+            self._hold_off_sweeps(conn)
             for (artifact_id, version), requires in requirements.items():
                 row = conn.execute(
                     "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
@@ -2236,6 +2237,8 @@ class ArtifactStore:
 
         conn = self._get_connection()
         try:
+            # Lineage is a hold on the inputs, as a name is.
+            self._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, landed.id)
             row = conn.execute(
                 "SELECT input_versions FROM artifact_versions WHERE id = ? AND version = ?",
@@ -3910,6 +3913,21 @@ class ArtifactStore:
         effective_tenant = tenant if tenant is not None else ""
         conn = self._get_connection()
         try:
+            # A row with no recorded digest (written before digests were) has its bytes
+            # streamed for one before the sweep's key: a sweep waiting for the key, and
+            # every hold writer queued behind it, would wait for the whole download.
+            unrecorded = conn.execute(
+                "SELECT 1 FROM artifact_versions v WHERE id = ? AND version = ? "
+                f"AND {_in_tenant('tenant', not effective_tenant)} AND content_sha256 IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM artifact_publications p WHERE "
+                "p.artifact_id = v.id AND p.version = v.version AND p.revoked_at IS NULL)",
+                (artifact_id, version, effective_tenant),
+            ).fetchone()
+            streamed: tuple[tuple[str, int], str | None] | None = None
+            if unrecorded is not None:
+                blob_key = self._resolve_blob_key(conn, artifact_id, version)[0]
+                conn.commit()  # no transaction left open across the download
+                streamed = (blob_key, self._streamed_digest(*blob_key))
             self._hold_off_sweeps(conn)
             # Locked, so the version cannot be swept or deleted under the new link.
             row = self._lock_target(conn, artifact_id, version, "state, tenant, content_sha256")
@@ -3935,13 +3953,20 @@ class ArtifactStore:
             if existing is not None:
                 return self._publication_from_row(existing)
 
+            # The version's own digest, not a second computation: a publication disagreeing
+            # with its artifact would be the more alarming answer. Resolved on this
+            # connection: a second one would wait on, or be refused behind, the lock this
+            # one holds. Streamed again under the lock only if the bytes moved meanwhile.
+            digest = row["content_sha256"]
+            if not digest:
+                blob_key = self._resolve_blob_key(conn, artifact_id, version)[0]
+                if streamed is not None and streamed[0] == blob_key:
+                    digest = streamed[1]
+                else:
+                    digest = self._streamed_digest(*blob_key)
             token = secrets.token_urlsafe(32)
             publication = Publication(
-                # The version's own digest, not a second computation: a publication disagreeing with
-                # its artifact would be the more alarming answer. Resolved on this connection: a
-                # second one would wait on, or be refused behind, the lock this one holds.
-                content_sha256=row["content_sha256"]
-                or self._streamed_digest(*self._resolve_blob_key(conn, artifact_id, version)[0]),
+                content_sha256=digest,
                 token=token,
                 id=publication_id(token),
                 artifact_id=artifact_id,
@@ -5139,7 +5164,10 @@ class ArtifactStore:
             # naming this version holds its row and then waits for the audit lock, so
             # taking the audit lock first here deadlocked against it on Postgres. This row
             # first: a duplicate's finalize locks it before pointing at it, so the pointers
-            # and holds read below are all there will be.
+            # and holds read below are all there will be. Not during a sweep batch: its
+            # claim locks a group's rows in its own order, and a canonical and its
+            # pointers are one group.
+            self._hold_off_sweeps(conn)
             locked = conn.execute(
                 "UPDATE artifact_versions SET last_used_at = last_used_at "
                 "WHERE id = ? AND version = ?",
@@ -5852,10 +5880,12 @@ class ArtifactStore:
                     # None lands during the batch: on Postgres every writer that can create
                     # one waits for the sweep's key (_hold_off_sweeps).
                     self._dialect.begin_write(conn, _SWEEP_KEY)
-                    batch_began = time.monotonic()
                     holds = self._holds(conn, current_values=not collect_latest)
                     results = self._results_of(conn, tracked)
                     protected = guarded()
+                    # After the re-read: one that alone outlasted the cap would leave a
+                    # batch of one group, and a re-read per group.
+                    batch_began = time.monotonic()
                     in_batch = 0
                 in_batch += len(group)
                 if not self._take(conn, group, protected, stayed, namers):

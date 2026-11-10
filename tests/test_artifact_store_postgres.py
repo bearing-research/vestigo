@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import secrets
 import threading
@@ -454,11 +455,13 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 
 class TestASweepBatchHoldsOffHoldWriters:
     """A sweep batch takes the sweep's key exclusively and every writer that can create a
-    hold takes it shared, first, so no hold lands while a batch claims."""
+    hold takes it shared, first, so no hold lands while a batch claims; so does a delete,
+    which locks the rows a claim locks, in an order of its own."""
 
     WRITERS = (
         "create_artifact",
         "import_artifact",
+        "import_artifact_lineage",
         "promote_version",
         "set_name",
         "find_ready_and_set_name",
@@ -468,8 +471,10 @@ class TestASweepBatchHoldsOffHoldWriters:
         "approve_alias_change",
         "publish_artifact",
         "retain",
+        "require",
         "accept",
         "apply",
+        "delete_artifact",
     )
 
     @pytest.mark.parametrize("writer", WRITERS)
@@ -492,10 +497,17 @@ class TestASweepBatchHoldsOffHoldWriters:
         release = releases.prepare("b1", "a1", "final")
         if writer == "approve_alias_change":
             store.request_alias_change("m", "prod", "set", "v", version)
+        cached = replace(record, id="cached", provenance_hash="p3")
+        if writer == "import_artifact_lineage":
+            store.import_artifact(cached, b"bytes")  # as the team cache writes it, no inputs
+        lineage = json.dumps({artifact_uri("v", version): f"v@v={version}"})
         event = InsertAuditEvent(AuditEvent("x", "alice"))
         calls = {
             "create_artifact": lambda: store.create_artifact("new", "prov-new", _spec()),
             "import_artifact": lambda: store.import_artifact(record, b"bytes"),
+            "import_artifact_lineage": lambda: store.import_artifact(
+                replace(cached, input_versions=lineage), b"bytes"
+            ),
             "promote_version": lambda: store.promote_version("v", version),
             "set_name": lambda: store.set_name("n", "v", version),
             "find_ready_and_set_name": lambda: store.find_ready_and_set_name("prov-v", "n"),
@@ -509,8 +521,10 @@ class TestASweepBatchHoldsOffHoldWriters:
             "approve_alias_change": lambda: store.approve_alias_change("m", "prod"),
             "publish_artifact": lambda: store.publish_artifact("v", version),
             "retain": lambda: store.retain("v", version, kind="pin", holder="h"),
+            "require": lambda: store.require("b", building, [("v", version)]),
             "accept": lambda: releases.accept(release.release_id, [], [event]),
             "apply": lambda: releases.apply("b1", "a1", [event]),
+            "delete_artifact": lambda: store.delete_artifact("v", version),
         }
         errors: list[BaseException] = []
 
@@ -528,12 +542,13 @@ class TestASweepBatchHoldsOffHoldWriters:
             writing.start()
             _until_it_waits(store, writing)
             assert writing.is_alive(), f"{writer} went ahead of the sweep batch"
-            # A row lock or a write gives the waiting writer a transaction id: it locked
-            # something before the sweep's key, which can deadlock against a batch.
+            # A row lock or a write gives the waiting writer a transaction id, and a key
+            # (an id's, a build's, the audit's) is an advisory lock: it locked something
+            # before the sweep's key, which can deadlock against a batch.
             held = batch.execute(
                 "SELECT count(*) AS n FROM pg_locks held JOIN pg_locks waiting "
-                "ON held.pid = waiting.pid WHERE NOT waiting.granted "
-                "AND held.granted AND held.locktype = 'transactionid'"
+                "ON held.pid = waiting.pid WHERE NOT waiting.granted AND held.granted "
+                "AND held.locktype IN ('transactionid', 'advisory')"
             ).fetchone()
             assert held["n"] == 0, f"{writer} locked something before the sweep's key"
         finally:
@@ -542,6 +557,51 @@ class TestASweepBatchHoldsOffHoldWriters:
             node.close()
         writing.join()
         assert errors == []
+
+    def test_a_publish_streams_an_unrecorded_digest_before_the_sweeps_key(
+        self, store, postgres_dsn, monkeypatch
+    ):
+        """A row written before digests has its bytes streamed for one, before the key:
+        under it, a sweep waiting for the key, and every hold writer queued behind that
+        sweep, waited for the whole download."""
+        version = store.create_artifact("v", "prov-v", _spec())
+        store.write_blob("v", version, b"bytes")
+        store.finalize_artifact("v", version, "{}", row_count=0, byte_size=5)
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET content_sha256 = NULL")
+        conn.commit()
+        conn.close()
+        digest = store._streamed_digest
+        streamed = []
+        monkeypatch.setattr(
+            store, "_streamed_digest", lambda *key: streamed.append(key) or digest(*key)
+        )
+        published, errors = [], []
+
+        def publish() -> None:
+            try:
+                published.append(store.publish_artifact("v", version))
+            except BaseException as exc:
+                errors.append(exc)
+
+        node = PostgresDialect(postgres_dsn)
+        batch = node.connect()
+        try:
+            node.begin_write(batch, _SWEEP_KEY)
+            publishing = threading.Thread(target=publish)
+            publishing.start()
+            _until_it_waits(store, publishing)
+            assert publishing.is_alive()
+            assert streamed == [("v", version)], "it streamed under the sweep's key"
+        finally:
+            batch.commit()
+            batch.close()
+            node.close()
+        publishing.join()
+
+        assert errors == []
+        assert published[0].content_sha256 == hashlib.sha256(b"bytes").hexdigest()
+        assert streamed == [("v", version)]
 
     def test_a_name_on_a_version_its_batch_is_taking_waits_and_finds_it_gone(
         self, store, monkeypatch

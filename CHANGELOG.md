@@ -32,9 +32,10 @@ All notable changes to vestigo are recorded here. The format follows
   17 as older (#81).
 
 - On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
-  create a hold (a version, a name, an alias or a pending change, a pointer, a
-  publication, a root, a required edge, a release's acceptance or operations) takes it
-  shared before any other lock. No hold lands while a batch claims, as SQLite's write
+  create a hold (a version, its lineage, a name, an alias or a pending change, a
+  pointer, a publication, a root, a required edge, a release's acceptance or operations)
+  takes it shared before any other lock, as does `delete_artifact`, whose locks a claim
+  takes in an order of its own. No hold lands while a batch claims, as SQLite's write
   lock already ensured, so a claim no longer acts on a reading such a hold made stale.
   Those writers wait for a batch, as on SQLite. A dialect of one's own implements
   `SqlDialect.share_write(conn, key)` (#94).
@@ -45,6 +46,9 @@ All notable changes to vestigo are recorded here. The format follows
   writer waits at most 0.36 s (0.41 s before the sweep's key). On SQLite a
   20000-version chain holds the write lock for 0.35 s, from 1.3 s. What holds a version
   is one list, which the selection and the claim both read (#94).
+- `publish_artifact` streams the bytes of a version with no recorded digest before it
+  locks anything, not under the version's lock (on SQLite, the write lock) and the
+  sweep's key (#94).
 
 ### Fixed
 
