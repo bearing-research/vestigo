@@ -2513,8 +2513,8 @@ class TestRootsKeyedByTenantMigration:
 
 
 class TestTheHoldTablesIndexes:
-    """Names, aliases and pending changes indexed by the version they hold, which a
-    sweep's selection and every chunk of its claim ask, on a new ledger and an old one."""
+    """Names, aliases and pending changes indexed by the version they hold, which every
+    chunk of a sweep's claim asks, on a new ledger and an old one."""
 
     INDEXES = frozenset({"idx_names_version", "idx_aliases_version", "idx_pending_version"})
 
@@ -2537,12 +2537,8 @@ class TestTheHoldTablesIndexes:
         finally:
             conn.close()
 
-        dialect = PostgresDialect(postgres_dsn)
+        reopened = ArtifactStore(tmp_path / "artifacts", dialect=PostgresDialect(postgres_dsn))
         try:
-            reopened = ArtifactStore(tmp_path / "artifacts", dialect=dialect)
-            try:
-                assert self._present(reopened) == self.INDEXES
-            finally:
-                reopened.close()
+            assert self._present(reopened) == self.INDEXES
         finally:
-            dialect.close()
+            reopened.close()

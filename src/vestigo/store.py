@@ -1140,14 +1140,16 @@ def _index_pointers(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute(_POINTER_INDEX_SQL)
 
 
-# What holds a version, which a sweep's selection and every chunk of its claim ask by
-# (artifact_id, version): unindexed, each asking scanned all three tables.
+# What holds a version, which every chunk of a sweep's claim asks by (artifact_id,
+# version) (_held_among): unindexed, each chunk scanned all three tables. Pending changes
+# hold only as _HOLD_SOURCES says, so only those are indexed.
 _NAME_VERSION_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_names_version ON artifact_names(artifact_id, version)"
 )
 _REFERENCE_VERSION_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_aliases_version ON artifact_aliases(artifact_id, version)",
-    "CREATE INDEX IF NOT EXISTS idx_pending_version ON registry_pending(artifact_id, version)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_version ON registry_pending(artifact_id, version) "
+    "WHERE action = 'set' AND artifact_id IS NOT NULL",
 )
 
 
@@ -1155,7 +1157,7 @@ def _index_holds(conn: StoreConnection, dialect: SqlDialect) -> None:
     """Names, aliases and pending changes indexed by the version they hold."""
     # A ledger a killed 0.4.0 first boot left without its names table gets the table,
     # and this index with it, from the repair after the migrations.
-    if dialect.column_exists(conn, "artifact_names", "artifact_id"):
+    if dialect.schema_exists(conn, "artifact_names"):
         conn.execute(_NAME_VERSION_INDEX_SQL)
     for ddl in _REFERENCE_VERSION_INDEX_SQL:
         conn.execute(ddl)
@@ -1389,6 +1391,9 @@ CREATE TABLE IF NOT EXISTS registry_pending (
     PRIMARY KEY (tenant, name, alias)
 );
 """
+# Beside their tables, so every path that makes the tables makes them; migration 19 for
+# a ledger made before them.
+_REGISTRY_SCHEMA_SQL += "".join(ddl + ";\n" for ddl in _REFERENCE_VERSION_INDEX_SQL)
 
 # Publications: opt-in, per-artifact-version public read grants.
 #
@@ -1630,8 +1635,6 @@ class ArtifactStore:
                 self._dialect.execute_ddl(conn, _REGISTRY_SCHEMA_SQL)
                 self._dialect.execute_ddl(conn, _PUBLICATION_SCHEMA_SQL)
                 conn.execute(_ACTIVE_PUBLICATION_INDEX_SQL)
-                for ddl in _REFERENCE_VERSION_INDEX_SQL:
-                    conn.execute(ddl)
                 # Created from the constants, which are the latest shape, so it
                 # is already current and must not replay migrations that would
                 # add what it was born with.
@@ -1754,7 +1757,6 @@ class ArtifactStore:
                     + _PUBLICATION_SCHEMA_SQL
                     + _ACTIVE_PUBLICATION_INDEX_SQL
                     + ";"
-                    + "".join(ddl + ";" for ddl in _REFERENCE_VERSION_INDEX_SQL)
                     + _SCHEMA_VERSION_SQL,
                 )
                 self._stamp_schema_version(conn, _LATEST_SCHEMA_VERSION)

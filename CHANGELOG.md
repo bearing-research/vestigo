@@ -32,12 +32,14 @@ All notable changes to vestigo are recorded here. The format follows
   17 as older (#81).
 
 - Migration 19 indexes names, aliases and pending alias changes by the version they
-  point at (`idx_names_version`, `idx_aliases_version`, `idx_pending_version`). A sweep
-  asks them of every version it selects and every chunk it claims, and scanned each
-  table every time: with 20000 of each holding other versions, sweeping 2000 versions
-  took 21 s on SQLite and 23 s on Postgres; with the indexes, under 2 s and 7 s. As with
-  migration 18, the first writer of this version to open a store builds them under the
-  schema lock, and every process upgrades together (#95).
+  point at (`idx_names_version`, `idx_aliases_version`, `idx_pending_version`, the last
+  only for pending moves). A sweep's claim asks them of every chunk of versions, and
+  scanned each table every time: with 20000 of each holding other versions, sweeping
+  2000 versions took 21 s on SQLite and 23 s on Postgres; with the indexes, under 2 s
+  and 7 s. As with migration 18, the first writer of this version to open a store
+  builds them under the schema lock, so writes to names, aliases and pending changes
+  wait for it (and, on a store at schema 17, for migration 18 too), and every process
+  upgrades together (#95).
 
 - On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
   create a hold (a version, its lineage, a name, an alias or a pending change, a
