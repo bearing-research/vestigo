@@ -104,7 +104,7 @@ All notable changes to vestigo are recorded here. The format follows
   batch (#94).
 - A release (`prepare`, `apply`) asked for under a tenant other than its build's is
   refused without naming the build's tenant: `build ... is not in tenant 'other'`, as
-  a caller from another tenant may not learn it.
+  a caller from another tenant may not learn it (#96).
 
 ## 0.5.0 - 2026-11-08
 
