@@ -2680,17 +2680,39 @@ class ArtifactStore:
         """Write :meth:`promote_version`'s copy and leave it ``building``, under *release_id*.
 
         A revert whose outputs must become current together, or not at all, stages a
-        copy of each and has :meth:`ReleaseStore.accept <vestigo.releases.ReleaseStore.accept>`
-        promote them in one transaction. Returns the :class:`StagedVersion` to accept, or
-        ``None``, writing nothing, when the source version or its blob is gone or the
-        source is not a result. A copy whose bytes fail to write raises and leaves its row
-        ``building`` under the release, which then cannot be accepted: a partial revert
-        is abandoned, never made current.
+        copy of each under a ``final`` release and has
+        :meth:`ReleaseStore.accept <vestigo.releases.ReleaseStore.accept>` promote them in
+        one transaction. Returns the :class:`StagedVersion` to accept, or ``None``,
+        writing nothing, when the source version or its blob is gone or the source is not
+        a result. A copy whose bytes fail to write raises and leaves its row ``building``
+        under the release, which then cannot be accepted: a partial revert is abandoned,
+        never made current.
 
         Raises:
             ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
                 as :meth:`create_artifact` refuses.
+            ValueError: If *release_id* is not an unsettled ``final`` release. A copy is
+                its id's current value once accepted, and a checkpoint's outputs are
+                what ``collectable_checkpoints`` hands a sweep when a newer one lands.
         """
+        if release_id is not None:
+            conn = self._get_connection()
+            try:
+                release = conn.execute(
+                    "SELECT kind, state FROM build_releases WHERE release_id = ?", (release_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if (
+                release is None
+                or release["kind"] != "final"
+                or release["state"]
+                not in (
+                    "preparing",
+                    "prepared",
+                )
+            ):
+                raise ValueError(f"release {release_id} is not an unsettled final release")
         source = self.get_artifact(artifact_id, version)
         if source is None:
             return None

@@ -11,7 +11,9 @@ All notable changes to vestigo are recorded here. The format follows
   copy `promote_version` writes and leaves it `building` under a release, so a revert
   of several outputs makes them current together in that release's acceptance, fenced
   on its attempt's lease. `promote_version` is now the staged copy finalized on its
-  own, unchanged in what it writes. (#100)
+  own, unchanged in what it writes. (#100) The release must be an unsettled `final`:
+  a copy under a checkpoint would be a current value that `collectable_checkpoints`
+  hands a sweep once a newer checkpoint lands. (#101)
 - Types for what the public API takes and returns (#82):
   - `vestigo.torch`'s signatures name torch's types: a model is a
     `torch.nn.Module`, an optimizer a `torch.optim.Optimizer`, `checkpointing` a
@@ -26,6 +28,13 @@ All notable changes to vestigo are recorded here. The format follows
     without one.
 
 ### Changed
+
+- `ReleaseStore.accept` rejects a release one of whose outputs' ids already has a
+  newer ready or superseded version, raising `ReleaseOvertaken` (a `ReleaseRejected`).
+  Accepted, the release left that id at the newer value while its other outputs
+  became current, so its outputs were not current together. Each id's versions from
+  the output's up are locked in one order first, so on Postgres two acceptances
+  crossing on the same ids queue and one of them is rejected. (#101)
 
 - Migration 18 indexes `artifact_versions.superseded_by`. A sweep looked up each row's
   pointers by scanning every version: 20000 versions of one id, each reading the one
