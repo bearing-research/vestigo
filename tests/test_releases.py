@@ -37,6 +37,7 @@ from vestigo.releases import (
     ReleaseError,
     ReleaseIncomplete,
     ReleaseOutOfOrder,
+    ReleaseOvertaken,
     ReleaseRejected,
     ReleaseStore,
 )
@@ -1119,6 +1120,75 @@ class TestPromotionsInARelease:
         assert ledger.releases.abandon(release.release_id, "a1")
         for artifact_id in ("x", "y"):
             assert ledger.store.get_latest_version(artifact_id).version == 2
+
+    def test_an_output_with_a_newer_value_rejects_the_release(self, ledger: Ledger):
+        """Another writer makes a newer y current first: x must not revert alone."""
+        release, staged = self._reverted(ledger)
+        _value(ledger, "y", "y-k3", b"y3")
+
+        with pytest.raises(ReleaseOvertaken, match="y@v=3"):
+            ledger.releases.accept(
+                release.release_id, staged, [AdvanceReference("cell", release.release_id)]
+            )
+
+        assert ledger.store.get_latest_version("x").provenance_hash == "x-k2"
+        assert ledger.store.get_latest_version("y").provenance_hash == "y-k3"
+        assert ledger.releases.get(release.release_id).state == "rejected"
+        assert ledger.releases.reference("cell") is None
+        assert all(_state(ledger, item) == "building" for item in staged)
+
+    def test_two_releases_crossing_on_two_ids_have_one_winner(self, ledger: Ledger):
+        """A revert and a run stage x and y in opposite version order; one set is current."""
+        for artifact_id in ("x", "y"):
+            _value(ledger, artifact_id, f"{artifact_id}-k1", f"{artifact_id}1".encode())
+            _value(ledger, artifact_id, f"{artifact_id}-k2", f"{artifact_id}2".encode())
+        revert = ledger.releases.prepare(_build(ledger), "a1", "final")
+        run = ledger.releases.prepare(_build(ledger), "a1", "final")
+
+        def computed(artifact_id: str) -> StagedVersion:
+            data = f"{artifact_id}3".encode()
+            version = ledger.store.create_artifact(
+                artifact_id, f"{artifact_id}-k3", SPEC, release_id=run.release_id
+            )
+            ledger.store.write_blob(artifact_id, version, data)
+            return _staged_row(artifact_id, version, data)
+
+        def copied(artifact_id: str) -> StagedVersion:
+            item = ledger.store.stage_promotion(artifact_id, 1, release_id=revert.release_id)
+            assert item is not None
+            return item
+
+        # x: the revert's copy is v3, the run's v4; y: the run's v3, the revert's v4.
+        reverted, ran = [copied("x")], [computed("x")]
+        ran.append(computed("y"))
+        reverted.append(copied("y"))
+
+        first, second, _ = _interleave(
+            ledger,
+            lambda ledger_: ledger_.releases.accept(revert.release_id, reverted),
+            lambda other: other.releases.accept(run.release_id, ran),
+            after=AFTER_FENCE,
+        )
+
+        (winner,) = [r for r in (first, second) if isinstance(r, ReleaseBundle)]
+        (loser,) = [r for r in (first, second) if isinstance(r, ReleaseOvertaken)]
+        key = "k1" if winner.release.release_id == revert.release_id else "k3"
+        for artifact_id in ("x", "y"):
+            latest = ledger.store.get_latest_version(artifact_id)
+            assert latest.provenance_hash == f"{artifact_id}-{key}", str(loser)
+
+    def test_a_copy_is_staged_only_under_an_unsettled_final(self, ledger: Ledger):
+        """A copy under a checkpoint would be a current value its collector hands out."""
+        _value(ledger, "x", "x-k1", b"x1")
+        _value(ledger, "x", "x-k2", b"x2")
+        checkpoint = ledger.releases.prepare(_build(ledger), "a1", "checkpoint")
+        settled = ledger.releases.prepare(_build(ledger), "a1", "final")
+        ledger.releases.accept(settled.release_id, [])
+
+        for release_id in (checkpoint.release_id, settled.release_id, "no-such-release"):
+            with pytest.raises(ValueError, match="unsettled final"):
+                ledger.store.stage_promotion("x", 1, release_id=release_id)
+        assert ledger.store.get_artifact("x", 3) is None
 
     def test_nothing_is_staged_from_a_version_that_is_not_a_result(self, ledger: Ledger):
         """A missing or still building version, or one whose bytes are gone, leaves no row."""

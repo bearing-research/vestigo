@@ -207,12 +207,16 @@ releases.accept(
 
 `accept` checks that the attempt still holds the lease, that every staged output's
 bytes are stored at their declared size, and that no earlier release of the same kind
-is still unsettled. Then it makes every output `ready` in one transaction. A release that cannot be
-accepted is `abandon`ed, and its outputs never become current.
+is still unsettled, and that no output's id already has a newer ready version, which
+another writer committed meanwhile: accepting then would leave that id at the newer
+value beside the rest of the release, so the release is rejected with
+`ReleaseOvertaken` instead. Then it makes every output `ready` in one transaction. A
+release that cannot be accepted is `abandon`ed, and its outputs never become current.
 
 An output can also be an earlier version made current again, as a revert to an
 earlier input does: `store.stage_promotion(output_id, old_version,
-release_id=release.release_id)` copies it as a `building` row and returns its
+release_id=final.release_id)`, under an unsettled `final` release, copies it as a
+`building` row and returns its
 `StagedVersion`, or `None` when the old version or its bytes are gone. Accepted with
 the rest, the copies become current together; `promote_version` makes one current on
 its own.

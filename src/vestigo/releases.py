@@ -55,6 +55,13 @@ class ReleaseRejected(ReleaseError):
     """The release's attempt no longer holds the build's lease; the release is rejected."""
 
 
+class ReleaseOvertaken(ReleaseRejected):
+    """An output's id has a newer value than the output; the release is rejected.
+
+    Accepting it would make the rest of its outputs current beside that newer value.
+    """
+
+
 class ReleaseIncomplete(ReleaseError):
     """An output's bytes are not where the staged row says; the release stays unsettled."""
 
@@ -327,6 +334,9 @@ class ReleaseStore:
             ReleaseRejected: the attempt lost the lease, or the build stopped
                 building under it; the release is now rejected.
             ReleaseOutOfOrder: an earlier release of the kind is still unsettled.
+            ReleaseOvertaken: an output's id already has a newer ready or superseded
+                version, so the release would not make its outputs current together; the
+                release is now rejected.
             ReleaseIncomplete: an output is not staged under this release, its
                 bytes are missing or the wrong size, or a row staged under the
                 release is not in *staged*.
@@ -373,6 +383,13 @@ class ReleaseStore:
                     f"{release.build_id} are unsettled"
                 )
             self._check_outputs(conn, release, staged, sizes)
+            overtaken = self._overtaken(conn, staged)
+            if overtaken:
+                conn.rollback()
+                self._settle(release_id, "rejected")
+                raise ReleaseOvertaken(
+                    f"release {release_id}: a newer value is current for " + ", ".join(overtaken)
+                )
             try:
                 # Version rows before the audit lock an audited operation takes, as the
                 # store orders them: a hit holding a holder's row while it waits for that
@@ -765,6 +782,26 @@ class ReleaseStore:
             (item.artifact_id, item.version): blobs.blob_size(item.artifact_id, item.version)
             for item in staged
         }
+
+    def _overtaken(self, conn: StoreConnection, staged: Sequence[StagedVersion]) -> list[str]:
+        """The outputs whose id already has a newer ready or superseded version.
+
+        Every version of an output's id from the output's up is locked first, in one
+        order (id, then version), so a writer making a newer one ready either committed
+        before this read or waits for the acceptance, and two acceptances crossing on
+        the same ids queue instead of deadlocking. SQLite's write lock does the same.
+        """
+        lock = "" if self._dialect.name == "sqlite" else " FOR UPDATE"
+        overtaken = []
+        for artifact_id, version in sorted((s.artifact_id, s.version) for s in staged):
+            rows = conn.execute(
+                "SELECT version, state FROM artifact_versions WHERE id = ? AND version >= ? "
+                f"ORDER BY version{lock}",
+                (artifact_id, version),
+            ).fetchall()
+            if any(r["version"] > version and r["state"] in ("ready", "superseded") for r in rows):
+                overtaken.append(f"{artifact_id}@v={version}")
+        return overtaken
 
     def _check_outputs(
         self,
