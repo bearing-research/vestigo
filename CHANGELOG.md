@@ -7,6 +7,11 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Added
 
+- `ArtifactStore.stage_promotion(artifact_id, version, release_id=...)` writes the
+  copy `promote_version` writes and leaves it `building` under a release, so a revert
+  of several outputs makes them current together in that release's acceptance, fenced
+  on its attempt's lease. `promote_version` is now the staged copy finalized on its
+  own, unchanged in what it writes. (#100)
 - Types for what the public API takes and returns (#82):
   - `vestigo.torch`'s signatures name torch's types: a model is a
     `torch.nn.Module`, an optimizer a `torch.optim.Optimizer`, `checkpointing` a

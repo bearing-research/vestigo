@@ -1036,6 +1036,108 @@ class TestReferencesAndAuthorities:
         assert actions[-2:] == [("release.accept", "alice"), ("name_set", "bob")]
 
 
+def _value(ledger: Ledger, artifact_id: str, provenance_hash: str, data: bytes) -> int:
+    """A ready version of *artifact_id* holding *data*, outside any build: an id's value."""
+    version = ledger.store.create_artifact(
+        artifact_id, provenance_hash, SPEC, computation_key=PARENT
+    )
+    ledger.store.write_blob(artifact_id, version, data)
+    ledger.store.finalize_artifact(artifact_id, version, "{}", row_count=None, byte_size=len(data))
+    return version
+
+
+class TestPromotionsInARelease:
+    """A revert stages copies of earlier versions, and a release makes them current together."""
+
+    def _reverted(self, ledger: Ledger) -> tuple[Release, list[StagedVersion]]:
+        """Two ids at their second values, with copies of their first staged in a final."""
+        for artifact_id in ("x", "y"):
+            _value(ledger, artifact_id, f"{artifact_id}-k1", f"{artifact_id}1".encode())
+            _value(ledger, artifact_id, f"{artifact_id}-k2", f"{artifact_id}2".encode())
+        release = ledger.releases.prepare(_build(ledger), "a1", "final")
+        staged = [
+            ledger.store.stage_promotion(artifact_id, 1, release_id=release.release_id)
+            for artifact_id in ("x", "y")
+        ]
+        assert all(item is not None for item in staged)
+        return release, [item for item in staged if item is not None]
+
+    def test_staged_copies_become_current_together_on_accept(self, ledger: Ledger):
+        release, staged = self._reverted(ledger)
+        for item in staged:
+            assert _state(ledger, item) == "building"
+            assert ledger.store.get_latest_version(item.artifact_id).version == 2
+
+        bundle = ledger.releases.accept(
+            release.release_id, staged, [AdvanceReference("cell", release.release_id)]
+        )
+
+        for artifact_id in ("x", "y"):
+            latest = ledger.store.get_latest_version(artifact_id)
+            assert (latest.version, latest.provenance_hash) == (3, f"{artifact_id}-k1")
+            assert latest.computation_key == PARENT
+            assert ledger.store.read_blob(artifact_id, 3) == f"{artifact_id}1".encode()
+            assert ledger.store.get_artifact(artifact_id, 1).state == "superseded"
+        assert {(o.id, o.version) for o in bundle.outputs} == {("x", 3), ("y", 3)}
+        roots = ledger.store.retention_roots(kind=HEAD_ROOT_KIND)
+        assert {(r["artifact_id"], r["version"]) for r in roots} == {("x", 3), ("y", 3)}
+
+    def test_a_rejected_release_makes_no_copy_current(self, ledger: Ledger):
+        """The lease lapses before acceptance: both ids keep their second values."""
+        release, staged = self._reverted(ledger)
+        ledger.clock.now += 120
+
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.accept(release.release_id, staged)
+
+        for item in staged:
+            assert _state(ledger, item) == "building"
+            latest = ledger.store.get_latest_version(item.artifact_id)
+            assert (latest.version, latest.provenance_hash) == (2, f"{item.artifact_id}-k2")
+
+    def test_a_copy_that_fails_to_write_keeps_the_release_from_being_accepted(
+        self, ledger: Ledger, monkeypatch
+    ):
+        """The second copy's bytes fail: the first alone cannot become current."""
+        for artifact_id in ("x", "y"):
+            _value(ledger, artifact_id, f"{artifact_id}-k1", f"{artifact_id}1".encode())
+            _value(ledger, artifact_id, f"{artifact_id}-k2", f"{artifact_id}2".encode())
+        release = ledger.releases.prepare(_build(ledger), "a1", "final")
+        first = ledger.store.stage_promotion("x", 1, release_id=release.release_id)
+        assert first is not None
+
+        def unwritable(artifact_id: str, version: int):
+            raise OSError(f"disk full writing {artifact_id}@v={version}")
+
+        monkeypatch.setattr(ledger.store.blob_store, "open_blob_writer", unwritable)
+        with pytest.raises(OSError, match="disk full"):
+            ledger.store.stage_promotion("y", 1, release_id=release.release_id)
+        monkeypatch.undo()
+
+        with pytest.raises(ReleaseIncomplete, match="not declared: y@v=3"):
+            ledger.releases.accept(release.release_id, [first])
+        assert ledger.releases.abandon(release.release_id, "a1")
+        for artifact_id in ("x", "y"):
+            assert ledger.store.get_latest_version(artifact_id).version == 2
+
+    def test_nothing_is_staged_from_a_version_that_is_not_a_result(self, ledger: Ledger):
+        """A missing or still building version, or one whose bytes are gone, leaves no row."""
+        _value(ledger, "x", "x-k1", b"x1")
+        building = ledger.store.create_artifact("x", "x-k2", SPEC)
+        _value(ledger, "z", "z-k1", b"z1")
+        ledger.store.blob_store.delete_blob("z", 1)
+        release = ledger.releases.prepare(_build(ledger), "a1", "final")
+
+        for artifact_id, version in (("x", 9), ("x", building), ("z", 1)):
+            staged = ledger.store.stage_promotion(
+                artifact_id, version, release_id=release.release_id
+            )
+            assert staged is None
+        assert ledger.store.get_artifact("x", building + 1) is None
+        assert ledger.store.get_artifact("z", 2) is None
+        assert ledger.releases.bundle(release.release_id).outputs == []
+
+
 class TestCheckpointRetention:
     """What a sweep may take: collectable checkpoints and the roots that hold them."""
 
