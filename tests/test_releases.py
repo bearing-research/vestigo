@@ -1095,6 +1095,31 @@ class TestPromotionsInARelease:
             latest = ledger.store.get_latest_version(item.artifact_id)
             assert (latest.version, latest.provenance_hash) == (2, f"{item.artifact_id}-k2")
 
+    def test_a_copy_that_fails_to_write_keeps_the_release_from_being_accepted(
+        self, ledger: Ledger, monkeypatch
+    ):
+        """The second copy's bytes fail: the first alone cannot become current."""
+        for artifact_id in ("x", "y"):
+            _value(ledger, artifact_id, f"{artifact_id}-k1", f"{artifact_id}1".encode())
+            _value(ledger, artifact_id, f"{artifact_id}-k2", f"{artifact_id}2".encode())
+        release = ledger.releases.prepare(_build(ledger), "a1", "final")
+        first = ledger.store.stage_promotion("x", 1, release_id=release.release_id)
+        assert first is not None
+
+        def unwritable(artifact_id: str, version: int):
+            raise OSError(f"disk full writing {artifact_id}@v={version}")
+
+        monkeypatch.setattr(ledger.store.blob_store, "open_blob_writer", unwritable)
+        with pytest.raises(OSError, match="disk full"):
+            ledger.store.stage_promotion("y", 1, release_id=release.release_id)
+        monkeypatch.undo()
+
+        with pytest.raises(ReleaseIncomplete, match="not declared: y@v=3"):
+            ledger.releases.accept(release.release_id, [first])
+        assert ledger.releases.abandon(release.release_id, "a1")
+        for artifact_id in ("x", "y"):
+            assert ledger.store.get_latest_version(artifact_id).version == 2
+
     def test_nothing_is_staged_from_a_version_that_is_not_a_result(self, ledger: Ledger):
         """A missing or still building version, or one whose bytes are gone, leaves no row."""
         _value(ledger, "x", "x-k1", b"x1")

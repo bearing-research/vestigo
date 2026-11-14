@@ -2683,7 +2683,9 @@ class ArtifactStore:
         copy of each and has :meth:`ReleaseStore.accept <vestigo.releases.ReleaseStore.accept>`
         promote them in one transaction. Returns the :class:`StagedVersion` to accept, or
         ``None``, writing nothing, when the source version or its blob is gone or the
-        source is not a result.
+        source is not a result. A copy whose bytes fail to write raises and leaves its row
+        ``building`` under the release, which then cannot be accepted: a partial revert
+        is abandoned, never made current.
 
         Raises:
             ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
