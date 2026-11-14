@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.6.0 - 2026-11-14
+
 ### Added
 
 - `ArtifactStore.stage_promotion(artifact_id, version, release_id=...)` writes the
@@ -35,7 +37,6 @@ All notable changes to vestigo are recorded here. The format follows
   became current, so its outputs were not current together. Each id's versions from
   the output's up are locked in one order first, so on Postgres two acceptances
   crossing on the same ids queue and one of them is rejected. (#101)
-
 - Migration 18 indexes `artifact_versions.superseded_by`. A sweep looked up each row's
   pointers by scanning every version: 20000 versions of one id, each reading the one
   before, held the write lock for 29 s in one go, and 1.7 s with the index; 20000 lone
@@ -44,7 +45,6 @@ All notable changes to vestigo are recorded here. The format follows
   it. Afterwards a 0.5.0 process refuses the store as newer, so upgrade every process
   together; until a writer has opened it, a read-only open refuses a store at schema
   17 as older (#81).
-
 - Migration 19 indexes names, aliases and pending alias changes by the version they
   point at (`idx_names_version`, `idx_aliases_version`, `idx_pending_version`, the last
   only for pending moves). A sweep's claim asks them of every chunk of versions, and
@@ -54,7 +54,6 @@ All notable changes to vestigo are recorded here. The format follows
   builds them under the schema lock, so writes to names, aliases and pending changes
   wait for it (and, on a store at schema 17, for migration 18 too), and every process
   upgrades together (#95).
-
 - On Postgres a sweep batch takes the sweep's key exclusively, and every writer that can
   create a hold (a version, its lineage, a name, an alias or a pending change, a
   pointer, a publication, a root, a required edge, a release's acceptance or operations)
@@ -95,7 +94,7 @@ All notable changes to vestigo are recorded here. The format follows
   `Run.finish` waits for its save in flight tells the other ranks, which raise it,
   instead of leaving them waiting at the finish until the group's timeout (#83).
 - `vestigo.torch`: `Ledger.observations` raises `ValueError` for an id that is no
-  execution, a derivation's build included, as `execution` does; it returned `[]` (#83).
+  execution, a derivation's build included, as `execution` does; for a derivation's build it returned `[]` (#83).
 - On Postgres, accepting a release with an `InsertAuditEvent` while a cache hit
   (`find_ready_and_set_name`, `set_name`, `set_alias`, `set_tag`) named the version
   the release supersedes could deadlock, and Postgres aborted one of them:

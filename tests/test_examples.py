@@ -78,6 +78,25 @@ def test_the_releases_example_fences_the_stalled_worker(tmp_path: Path):
         store.close()
 
 
+def test_the_revert_example_moves_both_ids_or_neither(tmp_path: Path):
+    root = tmp_path / "ledger"
+    result = _example("revert.py", str(root))
+
+    assert "overtaken: rejected" in result.stdout
+    store = ArtifactStore(root)
+    try:
+        latest = {i: store.get_latest_version(i) for i in ("model", "report")}
+        assert {i: (v.version, v.provenance_hash) for i, v in latest.items() if v} == {
+            "model": (3, "model:first"),
+            "report": (5, "report:third"),
+        }
+        # The overtaken revert's copies stay building: neither id moved to them.
+        assert store.get_artifact("model", 4).state == "building"
+        assert store.get_artifact("report", 4).state == "building"
+    finally:
+        store.close()
+
+
 def test_the_readme_s_first_look_counts_a_file_once(tmp_path: Path):
     """The README's example, as pasted: a rerun finds, an edit recounts, a revert finds again."""
     readme = (EXAMPLES.parent.parent / "README.md").read_text(encoding="utf-8")

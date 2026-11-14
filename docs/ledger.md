@@ -11,14 +11,16 @@ uv add vestigo             # no dependencies beyond the stdlib
 uv add "vestigo[postgres]" # PostgreSQL metadata; [s3], [gcs], [azure] for each blob backend
 ```
 
-Two runnable scripts go with this guide, and the suite runs both
+Three runnable scripts go with this guide, and the suite runs them
 (`tests/test_examples.py`):
 
 - [`examples/ledger/cache.py`](../examples/ledger/cache.py): dedup by provenance,
   names, lineage;
 - [`examples/ledger/releases.py`](../examples/ledger/releases.py): a build with
   checkpoints, a stalled worker fenced by a resume, a head moved with compare-and-set,
-  a final release.
+  a final release;
+- [`examples/ledger/revert.py`](../examples/ledger/revert.py): two outputs reverted
+  together under a final release, and a revert another writer overtakes.
 
 For PyTorch training, [`vestigo.torch`](torch.md) builds all of this into
 torch-checkpointing.
@@ -216,10 +218,10 @@ release that cannot be accepted is `abandon`ed, and its outputs never become cur
 An output can also be an earlier version made current again, as a revert to an
 earlier input does: `store.stage_promotion(output_id, old_version,
 release_id=final.release_id)`, under an unsettled `final` release, copies it as a
-`building` row and returns its
-`StagedVersion`, or `None` when the old version or its bytes are gone. Accepted with
-the rest, the copies become current together; `promote_version` makes one current on
-its own.
+`building` row and returns its `StagedVersion`, or `None`, writing nothing, when the
+old version or its bytes are gone or it is no result (`building` or `failed`).
+Accepted with the rest, the copies become current together; `promote_version` makes
+one current on its own.
 
 A checkpoint output gets its own key (`checkpoint_output_key`), so it is never the
 cache hit for the computation itself. The final release attaches the build's target
@@ -257,10 +259,11 @@ store.retain("train", 7, kind="pin", holder="paper-figure-3")  # a root
 store.garbage_collect(keep_superseded=2, max_idle_days=30, min_idle_seconds=600)
 ```
 
-`garbage_collect` keeps every named or aliased version, every version reachable from
-a root, and each id's current value (except a minted id's). It also keeps whatever a kept version requires,
-and anything used within `min_idle_seconds`. Of the rest, it collects what the
-policies you pass select:
+`garbage_collect` keeps every named, aliased or published version, the target of a
+pending alias change, every version reachable from a root, and each id's current
+value (except a minted id's). It also keeps whatever a kept version requires, and
+anything used within `min_idle_seconds`. Of the rest, it collects what the policies
+you pass select:
 
 - `max_idle_days`: versions idle that long;
 - `max_bytes`: the least recently used, down to 80% of the cap;

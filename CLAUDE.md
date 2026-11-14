@@ -80,7 +80,7 @@ to PyPI and attaches the same files to a GitHub release. ty checks `src` only.
 | `releases` | `ReleaseStore`: a build's checkpoint and final releases, fenced on the attempt's lease, accepted only once every output's bytes are stored |
 | `operations` | the typed operations a release runs in its transaction (`CheckBuildLease`, `AssertReferenceRevision`, `AssignAuthority`, `AdvanceReference`, `InsertAuditEvent`) |
 | `graph` | `GraphStore` (reached as `ArtifactStore.graph`), `NodeSpec`, `Edge`, `Link` (a relation outside any id, `reconstructed_from` among them), `Traversal`, the `CGN1`/`CGD1` encoders |
-| `sql_backend` | `SqliteDialect`, `PostgresDialect`, the `SqlDialect` and `StoreConnection` protocols, `begin_write` keyed serialization, `execute_ddl` (a schema script in the open transaction; SQLite's `executescript` commits first) |
+| `sql_backend` | `SqliteDialect`, `PostgresDialect`, the `SqlDialect` and `StoreConnection` protocols, `begin_write` keyed serialization and `share_write` (the key held shared), `execute_ddl` (a schema script in the open transaction; SQLite's `executescript` commits first), `one` and `StoreCursor`, `create_tables` for a consumer's own tables |
 | `blob_store` | `BlobSettings`, `LocalBlobStore`, `S3BlobStore`, `GCSBlobStore`, `AzureBlobStore`; presigned GET, PUT and POST |
 | `provenance` | `TransformSpec`, `compute_provenance_hash`, `derive_subkey` and the labelled output keys |
 | `uris` | the URI grammar and the per-process scheme (`set_uri_scheme`, default `vestigo`) |
@@ -129,7 +129,9 @@ entry point, and the README's overview when a capability is added.
 - Gate 2 (ADR 002 §8) is `tests/test_releases.py`; its `ledger` fixture runs every test
   on SQLite and Postgres through `backend_store` (conftest), which any store test can take.
 - `tests/conftest.py` holds fixtures only (singleton resets, the credential scrub, the
-  suite's validator, the session's Postgres container); a helper lives in the module that
+  suite's validator, the session's Postgres and object-store containers, and a garbage
+  collection after each test that fails the test that leaked a file, socket or
+  connection); a helper lives in the module that
   uses it, and imports sit at the top of the module.
 - Fixtures yield and close their stores; a test closes any connection or
   response body it opens. Warnings are errors (`filterwarnings` in pyproject); keep it so.
