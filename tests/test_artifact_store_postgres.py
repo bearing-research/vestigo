@@ -463,6 +463,7 @@ class TestASweepBatchHoldsOffHoldWriters:
         "import_artifact",
         "import_artifact_lineage",
         "promote_version",
+        "stage_promotion",
         "set_name",
         "find_ready_and_set_name",
         "finalize_artifact",
@@ -509,6 +510,7 @@ class TestASweepBatchHoldsOffHoldWriters:
                 replace(cached, input_versions=lineage), b"bytes"
             ),
             "promote_version": lambda: store.promote_version("v", version),
+            "stage_promotion": lambda: store.stage_promotion("v", version),
             "set_name": lambda: store.set_name("n", "v", version),
             "find_ready_and_set_name": lambda: store.find_ready_and_set_name("prov-v", "n"),
             "finalize_artifact": lambda: store.finalize_artifact(

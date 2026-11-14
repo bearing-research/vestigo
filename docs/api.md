@@ -15,6 +15,9 @@ The package exports nothing at its top level; a consumer imports each module.
   leaves out the versions whose id starts with it (a consumer's bookkeeping);
   `finalize_canonical_together` for the `StagedVersion` records (a `building`
   version whose bytes are written) that a release's `accept` also takes;
+  `promote_version`, which makes a copy of an earlier version the id's latest, and
+  `stage_promotion`, the same copy left `building` under `release_id=` for a
+  release to make current with the rest of its outputs;
   `register_validator(content_type, validate)`; the
   `ArtifactVersion` record; `ALL_TENANTS` (an `AllTenants`), the whole-store
   reads' default tenant; the results as `TypedDict`s (`AuditEntry`,

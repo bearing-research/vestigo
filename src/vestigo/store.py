@@ -2653,7 +2653,37 @@ class ArtifactStore:
         blob, then finalizes it, superseding the source; the result matches a recompute
         without the computing. It keeps the source's ``computation_key`` but belongs to
         no release (``release_id`` is ``None``). Returns ``None`` when the source version
-        or its blob is gone, so the caller recomputes.
+        or its blob is gone, so the caller recomputes. :meth:`stage_promotion` writes the
+        same copy for a release to make current with others.
+
+        Raises:
+            ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
+                as :meth:`create_artifact` refuses.
+        """
+        staged = self.stage_promotion(artifact_id, version, tenant=tenant)
+        if staged is None:
+            return None
+        # Canonical, not finalize_artifact: the caller resolves by *this* id, and dedup onto
+        # another id holding the provenance (two notebooks running the same cell) would drop the
+        # copy just written for that id's bytes.
+        (finalized,) = self.finalize_canonical_together([staged])
+        return finalized
+
+    def stage_promotion(
+        self,
+        artifact_id: str,
+        version: int,
+        *,
+        release_id: str | None = None,
+        tenant: str | None = None,
+    ) -> StagedVersion | None:
+        """Write :meth:`promote_version`'s copy and leave it ``building``, under *release_id*.
+
+        A revert whose outputs must become current together, or not at all, stages a
+        copy of each and has :meth:`ReleaseStore.accept <vestigo.releases.ReleaseStore.accept>`
+        promote them in one transaction. Returns the :class:`StagedVersion` to accept, or
+        ``None``, writing nothing, when the source version or its blob is gone or the
+        source is not a result.
 
         Raises:
             ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
@@ -2685,13 +2715,13 @@ class ArtifactStore:
                     INSERT INTO artifact_versions
                         (id, version, state, provenance_hash, created_at,
                          transform_spec, input_versions, tenant, principal, minted,
-                         computation_key, definition_id)
-                    VALUES (?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?,
+                         computation_key, release_id, definition_id)
+                    VALUES (?, ?, 'building', ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         (SELECT definition_id FROM artifact_versions
                          WHERE id = ? AND version = ?))
                     """,
-                    # No release_id: a promote is no release, and readers of one (its
-                    # bundle, the checkpoints a sweep may collect) would count the copy.
+                    # A release_id only for a release that makes the copy current: readers
+                    # of one (its bundle, the checkpoints a sweep may collect) count it.
                     # The node that produced the source produced the copy.
                     (
                         artifact_id,
@@ -2704,6 +2734,7 @@ class ArtifactStore:
                         source.principal,
                         was_minted,
                         source.computation_key,
+                        release_id,
                         artifact_id,
                         version,
                     ),
@@ -2736,22 +2767,14 @@ class ArtifactStore:
                     hasher.update(chunk)
                     copied += len(chunk)
 
-        # Canonical, not finalize_artifact: the caller resolves by *this* id, and dedup onto
-        # another id holding the provenance (two notebooks running the same cell) would drop the
-        # copy just written for that id's bytes.
-        (finalized,) = self.finalize_canonical_together(
-            [
-                StagedVersion(
-                    artifact_id=artifact_id,
-                    version=new_version,
-                    schema_json=source.schema_json or "",
-                    row_count=source.row_count,
-                    byte_size=copied,
-                    content_sha256=hasher.hexdigest(),
-                )
-            ]
+        return StagedVersion(
+            artifact_id=artifact_id,
+            version=new_version,
+            schema_json=source.schema_json or "",
+            row_count=source.row_count,
+            byte_size=copied,
+            content_sha256=hasher.hexdigest(),
         )
-        return finalized
 
     def _reclaim_blob(
         self, canonical_blob: tuple[str, int], ref: str, artifact_id: str, version: int

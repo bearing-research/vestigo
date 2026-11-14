@@ -210,6 +210,13 @@ bytes are stored at their declared size, and that no earlier release of the same
 is still unsettled. Then it makes every output `ready` in one transaction. A release that cannot be
 accepted is `abandon`ed, and its outputs never become current.
 
+An output can also be an earlier version made current again, as a revert to an
+earlier input does: `store.stage_promotion(output_id, old_version,
+release_id=release.release_id)` copies it as a `building` row and returns its
+`StagedVersion`, or `None` when the old version or its bytes are gone. Accepted with
+the rest, the copies become current together; `promote_version` makes one current on
+its own.
+
 A checkpoint output gets its own key (`checkpoint_output_key`), so it is never the
 cache hit for the computation itself. The final release attaches the build's target
 row (`attach`) and completes the build. A final with no outputs ends the build without
