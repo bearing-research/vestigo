@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
 from vestigo import uris
+from vestigo.build_store import OPEN_BUILD_INDEX_SQL
 from vestigo.graph import (
     GRAPH_DDL,
     LINK_DDL,
@@ -1202,6 +1203,17 @@ def _key_roots_by_tenant(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_retention_roots_tenant ON retention_roots(tenant)")
 
 
+def _index_open_builds(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """``idx_build_computation`` widened to ``idx_build_open``, where a ``BuildStore`` has
+    made its table; one made later, or given the column later, is born with the index."""
+    if not dialect.schema_exists(conn, "artifact_builds") or not dialect.column_exists(
+        conn, "artifact_builds", "computation_key"
+    ):
+        return
+    conn.execute("DROP INDEX IF EXISTS idx_build_computation")
+    conn.execute(OPEN_BUILD_INDEX_SQL)
+
+
 _MIGRATIONS: list[_Migration] = [
     _Migration(1, "artifact_versions.content_sha256", _add_content_sha256),
     _Migration(2, "artifact_publications.authors + external_ids", _add_publication_credits),
@@ -1226,6 +1238,7 @@ _MIGRATIONS: list[_Migration] = [
     _Migration(17, "retention_roots keyed by tenant", _key_roots_by_tenant),
     _Migration(18, "idx_versions_superseded_by", _index_pointers),
     _Migration(19, "idx_names_version, idx_aliases_version, idx_pending_version", _index_holds),
+    _Migration(20, "idx_build_open replaces idx_build_computation", _index_open_builds),
 ]
 
 RETENTION_SCHEMA_VERSION = 12

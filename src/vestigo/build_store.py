@@ -61,8 +61,8 @@ CREATE TABLE IF NOT EXISTS artifact_builds (
     FOREIGN KEY (artifact_id, version) REFERENCES artifact_versions(id, version)
 );
 
--- Index for finding the open build of a computation (a resume)
-CREATE INDEX IF NOT EXISTS idx_build_computation ON artifact_builds(computation_key);
+-- Index for finding the open build of a computation (a resume): OPEN_BUILD_INDEX_SQL
+CREATE INDEX IF NOT EXISTS idx_build_open ON artifact_builds(computation_key, state, created_at);
 
 -- Index for state queries (e.g., find pending builds)
 CREATE INDEX IF NOT EXISTS idx_build_state ON artifact_builds(state);
@@ -76,6 +76,14 @@ CREATE INDEX IF NOT EXISTS idx_build_artifact ON artifact_builds(artifact_id, ve
 -- Index for expired lease queries (orphan recovery)
 CREATE INDEX IF NOT EXISTS idx_build_lease_expires ON artifact_builds(state, lease_expires_at);
 """
+
+# A computation's builds by state, newest last: find_open_build probes the open ones in
+# order. On computation_key alone the planner took the state index instead, walking every
+# open build in the store, and a build whose run died stays open so it can be resumed.
+OPEN_BUILD_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_build_open "
+    "ON artifact_builds(computation_key, state, created_at)"
+)
 
 # Every blob key a build attempt may write. The BlobStore interface lists no keys
 # (only the object stores have objects()), so this is the only way to find an
@@ -416,9 +424,7 @@ class BuildStore:
                         "WHERE params LIKE ? ESCAPE '\\'",
                         (f"%{_EXTERNAL_DISPATCH_LIKE}%",),
                     )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_build_computation ON artifact_builds(computation_key)"
-        )
+        conn.execute(OPEN_BUILD_INDEX_SQL)
         for statement in _LINEAGE_INDEXES:
             conn.execute(statement)
         conn.commit()

@@ -1311,6 +1311,48 @@ class TestCheckpointRetention:
         ledger.releases.accept(final.release_id, [_stage(ledger, final, "model", b"done")])
         assert ledger.releases.collectable_checkpoints(keep=2) == rows(*checkpoints)
 
+    def test_collectable_checkpoints_do_not_count_every_later_checkpoint(self, tmp_path):
+        """Each checkpoint asks whether *keep* newer ones exist, not how many there are:
+        twice the checkpoints is twice the work, where a count of the later ones is four times.
+        """
+        store = ArtifactStore(tmp_path / "artifacts")
+        clock = Clock()
+        builds = BuildStore(store.db_path, dialect=store.dialect, clock=clock)
+        ledger = Ledger(store, builds, ReleaseStore(store, builds, clock=clock), clock)
+        build_id = _build(ledger)
+
+        def steps() -> int:
+            """The SQLite VM instructions one read runs."""
+            ran = 0
+
+            def count() -> int:
+                nonlocal ran
+                ran += 1
+                return 0
+
+            connect = ledger.releases._connect
+
+            def counting():
+                conn = connect()
+                conn.set_progress_handler(count, 1)
+                return conn
+
+            ledger.releases._connect = counting
+            try:
+                ledger.releases.collectable_checkpoints(keep=2)
+            finally:
+                ledger.releases._connect = connect
+            return ran
+
+        for _ in range(60):
+            _checkpoint(ledger, build_id)
+        sixty = steps()
+        for _ in range(60):
+            _checkpoint(ledger, build_id)
+
+        assert steps() < 2.5 * sixty
+        store.close()
+
     def test_a_builds_checkpoints_stay_collectable_once_its_row_is_gone(self, ledger: Ledger):
         """Old builds are cleaned up, and an empty final's placeholder takes its build row."""
 
