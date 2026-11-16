@@ -21,6 +21,31 @@ All notable changes to vestigo are recorded here. The format follows
   quadratic in its checkpoints. 20 builds of 1000 checkpoints each took 0.95 s on
   SQLite and 2.0 s on Postgres, and take 0.04 s and 0.2 s; the rows returned are the
   same. (#103)
+- On SQLite a store keeps up to 8 connections open between calls and reuses them,
+  where every call opened one, set its PRAGMAs and closed it: a lookup on a store
+  nobody else had open took 0.7 ms, nearly all of it the connection, and takes 5 µs.
+  A closed connection is rolled back, its cursors are closed and its busy handler is
+  turned back on before the next call has it, a nested call still gets a connection
+  of its own, and a use after `close()` still raises `sqlite3.ProgrammingError`.
+  `SqliteDialect.connect()` returns a `StoreConnection` that passes
+  `sqlite3.Connection`'s other attributes through to read or call, not a
+  `sqlite3.Connection`: it is no context manager and takes no attribute assignment. The connections close on `ArtifactStore.close()` (after
+  which each call opens and closes its own, as before), or when the store is collected
+  or the process exits, so an unclosed store now holds the database file open, with its
+  `-wal` and `-shm` files: close it before deleting or copying the file, which Windows
+  refuses while it is open. A forked child opens its own connections. (#104)
+- `BuildStore.close()` closes the store's dialect when it made its own (given none),
+  and `reset_build_store()` calls it, as `reset_artifact_store()` closes its store: a
+  `BuildStore(db_path)` on SQLite now keeps connections open too. A dialect passed in
+  is left to whoever made it. (#104)
+
+### Fixed
+
+- `vestigo.torch`: a run's `close()` ends its lease with `lapse_lease`, where it renewed
+  the lease to zero seconds, which left it live through that clock reading. A
+  `Ledger.resume` in the same reading was refused with "another attempt's lease on it
+  is live": on Windows before Python 3.13 the clock ticks every 15.6 ms, and with
+  SQLite connections reused a resume now follows a close within one tick. (#104)
 
 ## 0.6.0 - 2026-11-14
 

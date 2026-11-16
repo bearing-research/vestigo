@@ -89,6 +89,27 @@ SUBSECOND_LEASES = pytest.mark.skipif(
 POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX file modes")
 
 
+# Before Python 3.13, Windows' time.time() ticks every 15.6 ms.
+_COARSE_CLOCK = sys.platform == "win32" and sys.version_info < (3, 13)
+
+
+@pytest.fixture(autouse=True)
+def _a_run_starts_in_a_clock_reading_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests order executions by when they started and lapse a lease by renewing it
+    to zero seconds, each of which takes the clock to tick before the next start or
+    resume: on a coarse clock, wait out a tick."""
+    if not _COARSE_CLOCK:
+        return
+    for name in ("start", "resume"):
+        real = getattr(Ledger, name)
+
+        def after_a_tick(*args, _real=real, **kwargs):
+            time.sleep(0.032)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(Ledger, name, after_a_tick)
+
+
 @pytest.fixture(
     params=[
         "sqlite",
@@ -4185,6 +4206,21 @@ def test_a_stale_attempt_cannot_record_an_observation(ledger: Ledger):
 
     staged = ledger.store.list_versions_by_id_prefix(f"torch_{first.execution_id}@observed=")
     assert [(v.version, v.state) for v in staged] == [(recorded.version, "ready")]
+
+
+def test_a_closed_run_resumes_within_the_same_clock_reading(ledger: Ledger):
+    """A clock that ticks every 16 ms (Windows before Python 3.13) reads the same for the
+    close and a resume right after it, and a lease is live through its deadline."""
+    trainer = Trainer(ledger)
+    run = ledger.start(trainer.program)
+    trainer.train(run, 1)
+    reading = time.time() + 1
+    ledger.builds._clock = ledger.releases._clock = lambda: reading
+
+    run.close()
+
+    with ledger.resume(run.execution_id) as resumed:
+        assert resumed.restores_from == run.release_of(1).release_id
 
 
 def test_a_finished_run_says_so_when_it_observes(ledger: Ledger):

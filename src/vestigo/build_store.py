@@ -328,8 +328,16 @@ class BuildStore:
         """
         self.db_path = db_path
         self._dialect: SqlDialect = dialect if dialect is not None else SqliteDialect(db_path)
+        self._owns_dialect = dialect is None
         self._clock = clock
         self._init_schema()
+
+    def close(self) -> None:
+        """Close the connections kept open between calls, when the dialect is this
+        store's own. One passed in is closed by whoever made it (``ArtifactStore.close``
+        for the artifact store's). Idempotent."""
+        if self._owns_dialect:
+            self._dialect.close()
 
     def _get_connection(self) -> StoreConnection:
         """Open a connection configured by the active dialect."""
@@ -1393,6 +1401,8 @@ def get_build_store(
 
 
 def reset_build_store() -> None:
-    """Reset the build store singleton (for testing)."""
+    """Close and drop the build store singleton (for testing)."""
     global _build_store
+    if _build_store is not None:
+        _build_store.close()
     _build_store = None

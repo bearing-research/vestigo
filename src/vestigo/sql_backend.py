@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -24,9 +25,16 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
+from weakref import WeakSet, finalize
 
-# Mirrors ``sqlite3.connect(timeout=30.0)``: a contended writer gives up, not blocks forever.
+# Mirrors SQLite's busy timeout: a contended writer gives up, not blocks forever.
 _LOCK_TIMEOUT_MS = 30_000
+# Open SQLite connections a dialect keeps between calls. A thread's calls nest two or three
+# deep, and each idle connection holds file descriptors, so the bound is small.
+_SQLITE_IDLE_CONNECTIONS = 8
+# A forked process's copies of its parent's idle connections. SQLite forbids using one, so
+# they are held here untouched for as long as the child runs.
+_INHERITED_ACROSS_FORK: list[sqlite3.Connection] = []
 _CONNECT_TIMEOUT_SECONDS = 10
 # How long a SQLite open waits out another process making the same new file.
 _WAL_RETRY_SECONDS = 30.0
@@ -275,7 +283,7 @@ class SqlDialect(Protocol):
         ...
 
     def close(self) -> None:
-        """Release any resources the dialect holds. Idempotent; a no-op on SQLite."""
+        """Release any resources the dialect holds. Idempotent."""
         ...
 
     def resync_autoincrement(self, conn: StoreConnection, table: str, column: str) -> None:
@@ -312,18 +320,142 @@ class SqlDialect(Protocol):
         ...
 
 
+class _SqliteConnection:
+    """One checkout of a pooled SQLite connection: the :class:`StoreConnection` surface.
+
+    A use after :meth:`close` raises, as on a closed ``sqlite3.Connection``: the raw
+    connection may be another caller's by then.
+    """
+
+    __slots__ = ("_cursors", "_dialect", "_raw")
+
+    def __init__(self, dialect: SqliteDialect, raw: sqlite3.Connection) -> None:
+        self._dialect = dialect
+        self._raw: sqlite3.Connection | None = raw
+        self._cursors: WeakSet[sqlite3.Cursor] = WeakSet()
+
+    def _checked(self) -> sqlite3.Connection:
+        if self._raw is None:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        return self._raw
+
+    def execute(self, sql: str, params: Sequence[SqlValue] = (), /) -> sqlite3.Cursor:
+        cursor = self._checked().execute(sql, params)
+        self._cursors.add(cursor)
+        return cursor
+
+    def executescript(self, sql: str, /) -> object:
+        return self._checked().executescript(sql)
+
+    def commit(self) -> None:
+        self._checked().commit()
+
+    def rollback(self) -> None:
+        self._checked().rollback()
+
+    def close(self) -> None:
+        """Hand the connection back for the next call. Idempotent."""
+        raw = self._raw
+        if raw is None:
+            return
+        self._raw = None
+        # A cursor read part way keeps its statement's snapshot open, which the next
+        # caller's reads on this connection would share.
+        for cursor in list(self._cursors):
+            cursor.close()
+        self._dialect._release(raw)
+
+    def __getattr__(self, name: str) -> Any:
+        # ``sqlite3.Connection``'s other attributes, to read or call (``in_transaction``,
+        # ``executemany``); a cursor made through one is the caller's to finish.
+        return getattr(self._checked(), name)
+
+
+class _IdleConnections:
+    """The open connections a :class:`SqliteDialect` holds between calls.
+
+    No lock: a list's ``pop`` and ``append`` are atomic, and a lock held by another
+    thread at a fork would stay held in the child for good.
+    """
+
+    __slots__ = ("closed", "connections", "pid")
+
+    def __init__(self) -> None:
+        self.connections: list[sqlite3.Connection] = []
+        # The process that opened them.
+        self.pid = os.getpid()
+        self.closed = False
+
+    def take(self) -> sqlite3.Connection | None:
+        if self.pid != os.getpid():
+            inherited, self.connections = self.connections, []
+            _INHERITED_ACROSS_FORK.extend(inherited)
+            self.pid = os.getpid()
+        try:
+            return self.connections.pop()
+        except IndexError:
+            return None
+
+    def give(self, raw: sqlite3.Connection) -> bool:
+        """Keep *raw*, unless closed, full, or it is another process's."""
+        if (
+            self.closed
+            or self.pid != os.getpid()
+            or len(self.connections) >= _SQLITE_IDLE_CONNECTIONS
+        ):
+            return False
+        self.connections.append(raw)
+        if self.closed:
+            # A close ran between the check and the append.
+            self.close()
+        return True
+
+    def close(self) -> None:
+        """Close them and keep none from now on. Also the dialect's finalizer, so a
+        call made later in interpreter shutdown closes its own."""
+        self.closed = True
+        if self.pid != os.getpid():
+            _INHERITED_ACROSS_FORK.extend(self.connections)
+            self.connections = []
+            return
+        while True:
+            try:
+                self.connections.pop().close()
+            except IndexError:
+                return
+
+
 class SqliteDialect:
-    """SQLite dialect: the store's PRAGMAs, row factory, timeout and ``BEGIN IMMEDIATE``."""
+    """SQLite dialect: the store's PRAGMAs, row factory, timeout and ``BEGIN IMMEDIATE``.
+
+    Opening a connection costs more than most of the store's queries (a database nobody
+    else has open maps its WAL anew each time), so :meth:`connect` reuses the connections
+    earlier calls closed, up to ``_SQLITE_IDLE_CONNECTIONS`` of them. They are closed by
+    :meth:`close`, or when the dialect is collected or the process exits.
+
+    A reused connection is reset only as far as the store changes one: its transaction,
+    the cursors ``execute`` returned, its busy handler. A caller that changes anything
+    else on a connection (another PRAGMA, a temporary table) puts it back before closing.
+    """
 
     name = "sqlite"
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._idle = _IdleConnections()
+        finalize(self, self._idle.close)
 
     def connect(self) -> StoreConnection:
-        # Handed across threads (acquired on one, closed on another) as on Postgres; never
-        # used from two at once.
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
+        """An open connection, each call its own: a nested call's is independent of the
+        outer's. Handed across threads (acquired on one, closed on another) as on
+        Postgres; never used from two at once."""
+        raw = self._idle.take()
+        return _SqliteConnection(self, raw if raw is not None else self._open())
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            str(self.db_path), timeout=_LOCK_TIMEOUT_MS / 1000, check_same_thread=False
+        )
         try:
             deadline = time.monotonic() + _WAL_RETRY_SECONDS
             while True:
@@ -343,6 +475,22 @@ class SqliteDialect:
             raise
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _release(self, raw: sqlite3.Connection) -> None:
+        """Keep a closed checkout's connection for the next, as a new one would be: no
+        open transaction, the busy handler on."""
+        try:
+            if raw.in_transaction:
+                raw.rollback()
+            # A caller may have turned it off (``ArtifactStore._note_use``).
+            raw.execute(f"PRAGMA busy_timeout = {_LOCK_TIMEOUT_MS}").close()
+        except sqlite3.Error as exc:
+            # A close has never raised; the connection is closed instead of kept.
+            logger.debug("a SQLite connection could not be reset for reuse: %s", exc)
+            raw.close()
+            return
+        if not self._idle.give(raw):
+            raw.close()
 
     def adapt_ddl(self, sql: str) -> str:
         return sql
@@ -393,8 +541,8 @@ class SqliteDialect:
         return row is not None
 
     def close(self) -> None:
-        # Nothing pooled: callers close their own connections.
-        return
+        # Later calls still work, each on a connection of its own that its close closes.
+        self._idle.close()
 
     def resync_autoincrement(self, conn: StoreConnection, table: str, column: str) -> None:
         # SQLite derives the next rowid from the table; no sequence to drift.

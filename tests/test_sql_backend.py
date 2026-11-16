@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import sqlite3
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,11 +16,14 @@ import pytest
 from psycopg.pq import TransactionStatus
 
 from vestigo import sql_backend
-from vestigo.build_store import BuildStore
+from vestigo.build_store import BuildStore, get_build_store, reset_build_store
 from vestigo.sql_backend import (
+    _INHERITED_ACROSS_FORK,
+    _SQLITE_IDLE_CONNECTIONS,
     SERVER_THREAD_LIMIT,
     PostgresDialect,
     SqliteDialect,
+    StoreConnection,
     _Lease,
     _PostgresConnection,
     _Row,
@@ -141,15 +146,211 @@ class TestSqliteDialectPreservesTodaysBehavior:
     def test_a_connection_acquired_on_one_thread_is_used_and_closed_on_another(self, tmp_path):
         # The same consumer code runs on Postgres, whose wrappers release from any thread.
         dialect = SqliteDialect(tmp_path / "artifacts.sqlite")
-        box: dict[str, object] = {}
+        box: dict[str, StoreConnection] = {}
         thread = threading.Thread(target=lambda: box.__setitem__("conn", dialect.connect()))
         thread.start()
         thread.join()
         conn = box["conn"]
-        assert isinstance(conn, sqlite3.Connection)
 
         assert conn.execute("SELECT 1").fetchone()[0] == 1
         conn.close()
+        dialect.close()
+
+
+@pytest.fixture
+def opened(monkeypatch: pytest.MonkeyPatch) -> list[sqlite3.Connection]:
+    """Every connection SQLite opens during the test, in order."""
+    connections: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def recording(*args, **kwargs) -> sqlite3.Connection:
+        connections.append(real(*args, **kwargs))
+        return connections[-1]
+
+    monkeypatch.setattr(sqlite3, "connect", recording)
+    return connections
+
+
+def _is_closed(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute("SELECT 1").close()
+    except sqlite3.ProgrammingError:
+        return True
+    return False
+
+
+class TestSqliteDialectKeepsConnectionsBetweenCalls:
+    """Opening a connection cost more than most queries (0.7 ms against a few
+    microseconds), which a pass of lookups paid once per lookup."""
+
+    @pytest.fixture
+    def dialect(self, tmp_path: Path) -> Iterator[SqliteDialect]:
+        dialect = SqliteDialect(tmp_path / "artifacts.sqlite")
+        conn = dialect.connect()
+        conn.execute("CREATE TABLE t (v INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1), (2)")
+        conn.commit()
+        conn.close()
+        yield dialect
+        dialect.close()
+
+    def test_calls_one_after_another_share_one_connection(self, dialect, opened):
+        for _ in range(5):
+            conn = dialect.connect()
+            assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+            conn.close()
+
+        assert opened == []  # the fixture's is reused
+
+    def test_a_nested_call_has_a_connection_of_its_own(self, dialect):
+        outer = dialect.connect()
+        dialect.begin_write(outer, "a1")
+        outer.execute("INSERT INTO t VALUES (3)")
+        inner = dialect.connect()
+        try:
+            # Not the outer's: it reads what is committed, and its close leaves the
+            # outer's transaction open.
+            assert inner.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+            inner.close()
+            assert outer.in_transaction
+            outer.commit()
+        finally:
+            inner.close()
+            outer.close()
+
+    def test_a_closed_connection_is_not_usable(self, dialect):
+        conn = dialect.connect()
+        conn.close()
+        conn.close()
+
+        # Its connection is the next caller's by now.
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            conn.execute("SELECT 1")
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            conn.commit()
+
+    def test_an_uncommitted_write_does_not_reach_the_next_caller(self, dialect):
+        conn = dialect.connect()
+        dialect.begin_write(conn, "a1")
+        conn.execute("INSERT INTO t VALUES (3)")
+        conn.close()
+
+        conn = dialect.connect()
+        try:
+            assert not conn.in_transaction
+            conn.commit()
+            assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+        finally:
+            conn.close()
+
+    def test_a_cursor_read_part_way_does_not_pin_the_next_caller_s_snapshot(self, dialect):
+        writer = dialect.connect()
+        reader = dialect.connect()
+        cursor = reader.execute("SELECT v FROM t")
+        assert cursor.fetchone()[0] == 1
+        reader.close()
+        writer.execute("INSERT INTO t VALUES (3)")
+        writer.commit()
+
+        # The reader's connection, whose statement was still on the first of two rows.
+        again = dialect.connect()
+        try:
+            assert again.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 3
+        finally:
+            again.close()
+            writer.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            cursor.fetchone()
+
+    def test_the_busy_handler_a_caller_turned_off_is_back_on_for_the_next(self, dialect):
+        conn = dialect.connect()
+        conn.execute("PRAGMA busy_timeout = 0")
+        conn.close()
+
+        conn = dialect.connect()
+        try:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+        finally:
+            conn.close()
+
+    def test_no_more_than_the_bound_stay_open(self, dialect, opened):
+        held = [dialect.connect() for _ in range(_SQLITE_IDLE_CONNECTIONS + 3)]
+        for conn in held:
+            conn.close()
+
+        # One was the fixture's; the last three closed found the pool full.
+        assert len(opened) == _SQLITE_IDLE_CONNECTIONS + 2
+        assert [_is_closed(conn) for conn in opened[-3:]] == [True, True, True]
+        assert not any(_is_closed(conn) for conn in opened[:-3])
+
+    def test_close_closes_them_and_later_calls_close_their_own(self, dialect, opened):
+        first, second = dialect.connect(), dialect.connect()
+        first.close()
+        dialect.close()
+        second.close()  # returned after the close: nothing is left to close it later
+
+        assert [_is_closed(conn) for conn in opened] == [True]
+        conn = dialect.connect()
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+        conn.close()
+        assert [_is_closed(conn) for conn in opened] == [True, True]
+
+    def test_a_dialect_never_closed_closes_them_when_it_is_collected(self, tmp_path, opened):
+        # A store on SQLite has always been safe to drop without close().
+        dialect = SqliteDialect(tmp_path / "dropped.sqlite")
+        dialect.connect().close()
+        assert [_is_closed(conn) for conn in opened] == [False]
+
+        del dialect
+        gc.collect()
+
+        assert [_is_closed(conn) for conn in opened] == [True]
+
+    def test_a_build_store_closes_the_dialect_it_made(self, tmp_path, opened):
+        builds = BuildStore(tmp_path / "builds.sqlite")
+        assert builds.get_build("none") is None
+        assert False in [_is_closed(conn) for conn in opened]
+
+        builds.close()
+        builds.close()
+
+        assert all(_is_closed(conn) for conn in opened)
+
+    def test_resetting_the_build_store_singleton_closes_it(self, tmp_path, opened):
+        # Dropped alone, one a fixture still holds keeps the file open, and Windows
+        # refuses to delete an open file.
+        held = get_build_store(tmp_path / "builds.sqlite")
+
+        reset_build_store()
+
+        assert held is not None
+        assert opened and all(_is_closed(conn) for conn in opened)
+
+    def test_a_build_store_leaves_a_dialect_it_was_given_open(self, dialect, opened):
+        builds = BuildStore(dialect.db_path, dialect=dialect)
+
+        builds.close()
+
+        # Still the artifact store's, or a consumer's, to use and to close.
+        dialect.connect().close()
+        dialect.connect().close()
+        assert opened == []
+
+    def test_a_forked_process_leaves_its_parent_s_connections_alone(
+        self, dialect, opened, monkeypatch
+    ):
+        # SQLite forbids a connection carried across a fork.
+        parent = os.getpid()
+        monkeypatch.setattr(os, "getpid", lambda: parent + 1)
+        conn = dialect.connect()
+        try:
+            assert len(opened) == 1  # its own, not the parent's idle one
+            assert len(_INHERITED_ACROSS_FORK) == 1
+            assert not _is_closed(_INHERITED_ACROSS_FORK[0])
+        finally:
+            conn.close()
+            dialect.close()
+            _INHERITED_ACROSS_FORK.pop().close()
 
 
 class _FakeInner:
