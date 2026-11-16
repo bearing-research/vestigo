@@ -63,6 +63,21 @@ def seed_build_targets(
 LINEAGE_INDEXES = {"idx_build_executor", "idx_attempt_resumed_from"}
 
 
+class _Capturing:
+    """A connection that records every statement it runs, with its parameters."""
+
+    def __init__(self, inner, statements: list[tuple[str, tuple]]):
+        self._inner = inner
+        self._statements = statements
+
+    def __getattr__(self, attr):
+        return getattr(self._inner, attr)
+
+    def execute(self, sql, params=()):
+        self._statements.append((sql, tuple(params)))
+        return self._inner.execute(sql, params)
+
+
 def _indexes(conn) -> set[str]:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
     return {row["name"] for row in rows}
@@ -859,6 +874,55 @@ class TestAttempts:
         assert build_store.find_open_build(key, tenant_id="acme").build_id == acme
         assert build_store.find_open_build(key).build_id == default
         assert build_store.find_open_build(key, tenant_id="other") is None
+
+    def test_find_open_build_probes_its_computations_open_builds(self, build_store):
+        """One index probe, already in creation order: not every open build in the store."""
+        statements: list[tuple[str, tuple]] = []
+        connect = build_store._get_connection
+        build_store._get_connection = lambda: _Capturing(connect(), statements)
+
+        build_store.find_open_build("computation-1")
+
+        ((sql, params),) = statements
+        with closing(sqlite3.connect(build_store.db_path)) as conn:
+            plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+        assert plan == [
+            "SEARCH artifact_builds USING INDEX idx_build_open (computation_key=? AND state=?)"
+        ]
+
+    def test_an_older_store_trades_the_computation_index_for_the_open_build_one(self, tmp_path):
+        """Migration 20, which finds ``artifact_builds`` there with its old index."""
+        seed_build_targets(tmp_path)
+        BuildStore(tmp_path / "artifacts.sqlite")
+        with closing(sqlite3.connect(tmp_path / "artifacts.sqlite")) as conn:
+            conn.execute("DROP INDEX idx_build_open")
+            conn.execute("CREATE INDEX idx_build_computation ON artifact_builds(computation_key)")
+            conn.execute("UPDATE schema_version SET version = 19")
+            conn.commit()
+
+        ArtifactStore(tmp_path).close()
+
+        with closing(sqlite3.connect(tmp_path / "artifacts.sqlite")) as conn:
+            conn.row_factory = sqlite3.Row
+            indexes = _indexes(conn)
+        assert "idx_build_open" in indexes and "idx_build_computation" not in indexes
+
+    def test_an_older_database_gains_the_computation_key_and_its_index(self, tmp_path, clock):
+        """Before the store's migration reaches it: the column and its index arrive together."""
+        seed_build_targets(tmp_path)
+        store = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+        with closing(store._get_connection()) as conn:
+            conn.execute("DROP INDEX idx_build_open")
+            conn.execute("ALTER TABLE artifact_builds DROP COLUMN computation_key")
+            conn.commit()
+
+        reopened = BuildStore(tmp_path / "artifacts.sqlite", clock=clock)
+
+        build_id = self._pending(reopened, computation_key="computation-1")
+        assert reopened.open_attempt(build_id, "a1", writable_until=clock() + 10)
+        assert reopened.find_open_build("computation-1").build_id == build_id
+        with closing(reopened._get_connection()) as conn:
+            assert "idx_build_open" in _indexes(conn)
 
     def test_a_claims_owner_opens_its_first_attempt(self, build_store, clock):
         """A claim has no attempt; its own owner opens one under the live lease, no one else."""

@@ -2544,3 +2544,36 @@ class TestTheHoldTablesIndexes:
             assert self._present(reopened) == self.INDEXES
         finally:
             reopened.close()
+
+
+class TestTheOpenBuildIndex:
+    """``find_open_build``'s index, on a new ledger and on one whose builds were indexed
+    by their computation alone."""
+
+    def _present(self, store) -> set[str]:
+        conn = store._get_connection()
+        try:
+            rows = conn.execute("SELECT indexname FROM pg_indexes").fetchall()
+        finally:
+            conn.close()
+        return {row["indexname"] for row in rows} & {"idx_build_open", "idx_build_computation"}
+
+    def test_a_new_ledger_has_it_and_an_older_one_trades_for_it(
+        self, store, postgres_dsn, tmp_path
+    ):
+        BuildStore(store.db_path, dialect=store.dialect)
+        assert self._present(store) == {"idx_build_open"}
+        conn = store._get_connection()
+        try:
+            conn.execute("DROP INDEX idx_build_open")
+            conn.execute("CREATE INDEX idx_build_computation ON artifact_builds(computation_key)")
+            conn.execute("DELETE FROM schema_version WHERE version >= 20")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "artifacts", dialect=PostgresDialect(postgres_dsn))
+        try:
+            assert self._present(reopened) == {"idx_build_open"}
+        finally:
+            reopened.close()

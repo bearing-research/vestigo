@@ -7,6 +7,20 @@ All notable changes to vestigo are recorded here. The format follows
 
 ### Changed
 
+- Migration 20 replaces `idx_build_computation` with `idx_build_open` on
+  `artifact_builds(computation_key, state, created_at)`. `find_open_build`, and
+  `vestigo.torch`'s lookup of a run's unfinished execution, read the open builds of one
+  computation, newest first. On the computation key alone the planner took a state
+  index instead and walked every open build in the store, and a build whose run died
+  stays open so it can be resumed: with 50000 open builds the lookup took 9.6 ms on
+  SQLite, and takes 0.006 ms. A store whose `BuildStore` has not made its table yet
+  is stamped and gains the index when it does. Afterwards a 0.6.0 process refuses the
+  store as newer, so upgrade every process together. (#103)
+- `ReleaseStore.collectable_checkpoints` asks of each checkpoint whether `keep` newer
+  accepted ones exist, where it counted every later one, so a build's read was
+  quadratic in its checkpoints. 20 builds of 1000 checkpoints each took 0.95 s on
+  SQLite and 2.0 s on Postgres, and take 0.04 s and 0.2 s; the rows returned are the
+  same. (#103)
 - On SQLite a store keeps up to 8 connections open between calls and reuses them,
   where every call opened one, set its PRAGMAs and closed it: a lookup on a store
   nobody else had open took 0.7 ms, nearly all of it the connection, and takes 5 µs.

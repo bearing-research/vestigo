@@ -624,11 +624,12 @@ class ReleaseStore:
                   AND NOT (
                     COALESCE(b.state, '') = 'building'
                     AND (
-                      (
-                        SELECT COUNT(*) FROM build_releases
+                      NOT EXISTS (
+                        SELECT 1 FROM build_releases
                         WHERE build_id = r.build_id AND kind = 'checkpoint'
                           AND state = 'accepted' AND sequence > r.sequence
-                      ) < ?
+                        ORDER BY sequence LIMIT 1 OFFSET ?
+                      )
                       OR EXISTS (
                         SELECT 1 FROM build_attempts a
                         WHERE a.build_id = b.build_id AND a.attempt = b.attempt
@@ -638,7 +639,9 @@ class ReleaseStore:
                   )
                 ORDER BY av.id, av.version
                 """,
-                (tenant, keep),
+                # The keep-th newer accepted checkpoint, if there is one: reading on to
+                # count them all made a long run's read quadratic in its checkpoints.
+                (tenant, keep - 1),
             ).fetchall()
         finally:
             conn.close()
