@@ -3062,7 +3062,8 @@ class Run:
             return
         builds = self.ledger.builds
         if self.ledger.releases.latest_accepted(self.execution_id) is not None:
-            builds.renew_lease(self.execution_id, self.attempt, lease_duration_seconds=0.0)
+            # Not a renewal to zero seconds, which is live through this clock reading.
+            builds.lapse_lease(self.execution_id, self.attempt)
         elif builds.fail_build(
             self.execution_id, "ended before a checkpoint", lease_owner=self.attempt
         ):

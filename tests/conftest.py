@@ -12,6 +12,7 @@ import gc
 import os
 import socket
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -85,6 +86,26 @@ def _collect_after_each_test(_collect_after_some_modules: None) -> Iterator[None
     yield
     gc.collect()
     gc.freeze()
+
+
+# Before Python 3.13, Windows' time.time() ticks every 15.6 ms.
+_COARSE_CLOCK = sys.platform == "win32" and sys.version_info < (3, 13)
+
+
+@pytest.fixture(autouse=True)
+def _a_zero_age_is_past_on_a_coarse_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test that collects or sweeps with a zero age means what it just wrote, which is
+    older than now only once the clock has ticked: on a coarse clock, wait out a tick."""
+    if not _COARSE_CLOCK:
+        return
+    for name in ("garbage_collect", "sweep_zombie_builds"):
+        real = getattr(ArtifactStore, name)
+
+        def after_a_tick(*args, _real=real, **kwargs):
+            time.sleep(0.032)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(ArtifactStore, name, after_a_tick)
 
 
 # The application registers its formats at startup; this suite stands in for one.

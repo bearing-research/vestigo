@@ -4187,6 +4187,21 @@ def test_a_stale_attempt_cannot_record_an_observation(ledger: Ledger):
     assert [(v.version, v.state) for v in staged] == [(recorded.version, "ready")]
 
 
+def test_a_closed_run_resumes_within_the_same_clock_reading(ledger: Ledger):
+    """A clock that ticks every 16 ms (Windows before Python 3.13) reads the same for the
+    close and a resume right after it, and a lease is live through its deadline."""
+    trainer = Trainer(ledger)
+    run = ledger.start(trainer.program)
+    trainer.train(run, 1)
+    reading = time.time() + 1
+    ledger.builds._clock = ledger.releases._clock = lambda: reading
+
+    run.close()
+
+    with ledger.resume(run.execution_id) as resumed:
+        assert resumed.restores_from == run.release_of(1).release_id
+
+
 def test_a_finished_run_says_so_when_it_observes(ledger: Ledger):
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:

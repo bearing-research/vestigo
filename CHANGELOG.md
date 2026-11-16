@@ -34,6 +34,14 @@ All notable changes to vestigo are recorded here. The format follows
   `-wal` and `-shm` files: close it before deleting or copying the file, which Windows
   refuses while it is open. A forked child opens its own connections. (#104)
 
+### Fixed
+
+- `vestigo.torch`: a run's `close()` ends its lease with `lapse_lease`, where it renewed
+  the lease to zero seconds, which left it live through that clock reading. A
+  `Ledger.resume` in the same reading was refused with "another attempt's lease on it
+  is live": on Windows before Python 3.13 the clock ticks every 15.6 ms, and with
+  SQLite connections reused a resume now follows a close within one tick. (#104)
+
 ## 0.6.0 - 2026-11-14
 
 ### Added
