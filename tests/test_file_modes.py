@@ -91,18 +91,22 @@ class TestTheArtifactStore:
         held = _held_open(db)
         assert all(p.exists() for p in _journals(db))
         real_narrow = vestigo.file_modes.narrow
+        deleted: list[bool] = []
 
         def narrow_after_the_other_process_closes(path, mode):
             if path in _journals(db):
                 held.close()
+                deleted.append(not path.exists())
             real_narrow(path, mode)
 
         monkeypatch.setattr(vestigo.file_modes, "narrow", narrow_after_the_other_process_closes)
 
         store = ArtifactStore(tmp_path / "artifacts")
 
-        assert not any(p.exists() for p in _journals(db))
+        # Asked here, not afterwards: the store's own connections, kept open, make new ones.
+        assert deleted == [True, True]
         assert store.create_artifact("fig", "prov") == 1
+        store.close()
 
 
 class TestNeverLooser:

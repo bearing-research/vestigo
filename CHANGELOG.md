@@ -5,6 +5,21 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- On SQLite a store keeps up to 8 connections open between calls and reuses them,
+  where every call opened one, set its PRAGMAs and closed it: a lookup on a store
+  nobody else had open took 0.7 ms, nearly all of it the connection, and takes 5 µs.
+  A closed connection is rolled back, its cursors are closed and its busy handler is
+  turned back on before the next call has it, a nested call still gets a connection
+  of its own, and a use after `close()` still raises `sqlite3.ProgrammingError`.
+  `SqliteDialect.connect()` returns a wrapper with `sqlite3.Connection`'s surface,
+  not a `sqlite3.Connection`. The connections close on `ArtifactStore.close()` (after
+  which each call opens and closes its own, as before), or when the store is collected
+  or the process exits, so an unclosed store now holds the database file open, with its
+  `-wal` and `-shm` files: close it before deleting or copying the file, which Windows
+  refuses while it is open. A forked child opens its own connections.
+
 ## 0.6.0 - 2026-11-14
 
 ### Added

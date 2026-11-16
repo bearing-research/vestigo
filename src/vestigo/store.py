@@ -1591,9 +1591,11 @@ class ArtifactStore:
         return self._dialect
 
     def close(self) -> None:
-        """Release backend resources. Idempotent, and safe to skip on SQLite.
+        """Release backend resources. Idempotent.
 
-        Needed for Postgres, whose pool runs worker threads that outlive the store.
+        Needed for Postgres, whose pool runs worker threads that outlive the store. On
+        SQLite it closes the connections kept open between calls, which otherwise close
+        when the store is collected: close first to delete or copy the database file.
         """
         self._dialect.close()
 
@@ -3499,7 +3501,7 @@ class ArtifactStore:
         succeeds, and it never waits for a writer: a lookup or a read must not stall
         behind a sweep. SQLite skips the note while another holds the file, Postgres
         while another holds the row. Run it last on *conn*: on SQLite it leaves the
-        busy handler off, and it commits.
+        busy handler off until the connection is closed, and it commits.
         """
         now = time.time()
         if last_used_at is not None and now - last_used_at < _USE_RESOLUTION_SECONDS:
@@ -3507,7 +3509,8 @@ class ArtifactStore:
         try:
             if self._dialect.name == "sqlite":
                 # The connection is this operation's own and runs nothing after the note,
-                # so the busy handler it loses here is not missed by a later statement.
+                # so the busy handler it loses here is not missed by a later statement;
+                # its close turns the handler back on for the next caller.
                 conn.execute("PRAGMA busy_timeout = 0")
                 conn.execute(
                     "UPDATE artifact_versions SET last_used_at = ? WHERE id = ? AND version = ?",
