@@ -32,8 +32,8 @@ _LOCK_TIMEOUT_MS = 30_000
 # Open SQLite connections a dialect keeps between calls. A thread's calls nest two or three
 # deep, and each idle connection holds file descriptors, so the bound is small.
 _SQLITE_IDLE_CONNECTIONS = 8
-# A process forked from one that had idle connections: SQLite forbids using them, and closing
-# them here could checkpoint under the parent, so they are kept, never touched.
+# A forked process's copies of its parent's idle connections. SQLite forbids using one, so
+# they are held here untouched for as long as the child runs.
 _INHERITED_ACROSS_FORK: list[sqlite3.Connection] = []
 _CONNECT_TIMEOUT_SECONDS = 10
 # How long a SQLite open waits out another process making the same new file.
@@ -321,7 +321,7 @@ class SqlDialect(Protocol):
 
 
 class _SqliteConnection:
-    """One checkout of a pooled SQLite connection, the surface of ``sqlite3.Connection``.
+    """One checkout of a pooled SQLite connection: the :class:`StoreConnection` surface.
 
     A use after :meth:`close` raises, as on a closed ``sqlite3.Connection``: the raw
     connection may be another caller's by then.
@@ -366,19 +366,63 @@ class _SqliteConnection:
         self._dialect._release(raw)
 
     def __getattr__(self, name: str) -> Any:
-        # The rest of ``sqlite3.Connection`` (``in_transaction``, ``executemany``).
+        # ``sqlite3.Connection``'s other attributes, to read or call (``in_transaction``,
+        # ``executemany``); a cursor made through one is the caller's to finish.
         return getattr(self._checked(), name)
 
 
-def _close_idle(idle: list[sqlite3.Connection], lock: threading.Lock, pid: list[int]) -> None:
-    with lock:
-        connections = idle[:]
-        idle.clear()
-    if pid[0] != os.getpid():
-        _INHERITED_ACROSS_FORK.extend(connections)
-        return
-    for conn in connections:
-        conn.close()
+class _IdleConnections:
+    """The open connections a :class:`SqliteDialect` holds between calls.
+
+    No lock: a list's ``pop`` and ``append`` are atomic, and a lock held by another
+    thread at a fork would stay held in the child for good.
+    """
+
+    __slots__ = ("closed", "connections", "pid")
+
+    def __init__(self) -> None:
+        self.connections: list[sqlite3.Connection] = []
+        # The process that opened them.
+        self.pid = os.getpid()
+        self.closed = False
+
+    def take(self) -> sqlite3.Connection | None:
+        if self.pid != os.getpid():
+            inherited, self.connections = self.connections, []
+            _INHERITED_ACROSS_FORK.extend(inherited)
+            self.pid = os.getpid()
+        try:
+            return self.connections.pop()
+        except IndexError:
+            return None
+
+    def give(self, raw: sqlite3.Connection) -> bool:
+        """Keep *raw*, unless closed, full, or it is another process's."""
+        if (
+            self.closed
+            or self.pid != os.getpid()
+            or len(self.connections) >= _SQLITE_IDLE_CONNECTIONS
+        ):
+            return False
+        self.connections.append(raw)
+        if self.closed:
+            # A close ran between the check and the append.
+            self.close()
+        return True
+
+    def close(self) -> None:
+        """Close them and keep none from now on. Also the dialect's finalizer, so a
+        call made later in interpreter shutdown closes its own."""
+        self.closed = True
+        if self.pid != os.getpid():
+            _INHERITED_ACROSS_FORK.extend(self.connections)
+            self.connections = []
+            return
+        while True:
+            try:
+                self.connections.pop().close()
+            except IndexError:
+                return
 
 
 class SqliteDialect:
@@ -388,28 +432,24 @@ class SqliteDialect:
     else has open maps its WAL anew each time), so :meth:`connect` reuses the connections
     earlier calls closed, up to ``_SQLITE_IDLE_CONNECTIONS`` of them. They are closed by
     :meth:`close`, or when the dialect is collected or the process exits.
+
+    A reused connection is reset only as far as the store changes one: its transaction,
+    the cursors ``execute`` returned, its busy handler. A caller that changes anything
+    else on a connection (another PRAGMA, a temporary table) puts it back before closing.
     """
 
     name = "sqlite"
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self._idle: list[sqlite3.Connection] = []
-        self._idle_lock = threading.Lock()
-        # The process that opened what is idle, in a list the finalizer shares.
-        self._pid = [os.getpid()]
-        self._closed = False
-        finalize(self, _close_idle, self._idle, self._idle_lock, self._pid)
+        self._idle = _IdleConnections()
+        finalize(self, self._idle.close)
 
     def connect(self) -> StoreConnection:
         """An open connection, each call its own: a nested call's is independent of the
         outer's. Handed across threads (acquired on one, closed on another) as on
         Postgres; never used from two at once."""
-        if self._pid[0] != os.getpid():
-            _close_idle(self._idle, self._idle_lock, self._pid)
-            self._pid[0] = os.getpid()
-        with self._idle_lock:
-            raw = self._idle.pop() if self._idle else None
+        raw = self._idle.take()
         return _SqliteConnection(self, raw if raw is not None else self._open())
 
     def _open(self) -> sqlite3.Connection:
@@ -449,15 +489,7 @@ class SqliteDialect:
             logger.debug("a SQLite connection could not be reset for reuse: %s", exc)
             raw.close()
             return
-        with self._idle_lock:
-            keep = (
-                not self._closed
-                and self._pid[0] == os.getpid()
-                and len(self._idle) < _SQLITE_IDLE_CONNECTIONS
-            )
-            if keep:
-                self._idle.append(raw)
-        if not keep:
+        if not self._idle.give(raw):
             raw.close()
 
     def adapt_ddl(self, sql: str) -> str:
@@ -510,9 +542,7 @@ class SqliteDialect:
 
     def close(self) -> None:
         # Later calls still work, each on a connection of its own that its close closes.
-        with self._idle_lock:
-            self._closed = True
-        _close_idle(self._idle, self._idle_lock, self._pid)
+        self._idle.close()
 
     def resync_autoincrement(self, conn: StoreConnection, table: str, column: str) -> None:
         # SQLite derives the next rowid from the table; no sequence to drift.

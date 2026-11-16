@@ -27,12 +27,17 @@ All notable changes to vestigo are recorded here. The format follows
   A closed connection is rolled back, its cursors are closed and its busy handler is
   turned back on before the next call has it, a nested call still gets a connection
   of its own, and a use after `close()` still raises `sqlite3.ProgrammingError`.
-  `SqliteDialect.connect()` returns a wrapper with `sqlite3.Connection`'s surface,
-  not a `sqlite3.Connection`. The connections close on `ArtifactStore.close()` (after
+  `SqliteDialect.connect()` returns a `StoreConnection` that passes
+  `sqlite3.Connection`'s other attributes through to read or call, not a
+  `sqlite3.Connection`: it is no context manager and takes no attribute assignment. The connections close on `ArtifactStore.close()` (after
   which each call opens and closes its own, as before), or when the store is collected
   or the process exits, so an unclosed store now holds the database file open, with its
   `-wal` and `-shm` files: close it before deleting or copying the file, which Windows
   refuses while it is open. A forked child opens its own connections. (#104)
+- `BuildStore.close()` closes the store's dialect when it made its own (given none),
+  and `reset_build_store()` calls it, as `reset_artifact_store()` closes its store: a
+  `BuildStore(db_path)` on SQLite now keeps connections open too. A dialect passed in
+  is left to whoever made it. (#104)
 
 ### Fixed
 

@@ -39,6 +39,7 @@ The package exports nothing at its top level; a consumer imports each module.
   each object's key, size and a name for its bytes, which `vestigo.torch` pins a
   `Remote` input to.
 - `vestigo.build_store`: `BuildStore(db_path, dialect=None, clock=time.time)`,
+  whose `close()` closes the dialect it made when none was passed,
   the builds with their leases and attempts (`create_build`, `open_attempt` with
   the attempt's `principal`, `open_attempt_within`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `complete_attempt_within`, `list_runnable_builds` for the

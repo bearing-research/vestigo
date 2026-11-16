@@ -16,7 +16,7 @@ import pytest
 from psycopg.pq import TransactionStatus
 
 from vestigo import sql_backend
-from vestigo.build_store import BuildStore
+from vestigo.build_store import BuildStore, get_build_store, reset_build_store
 from vestigo.sql_backend import (
     _INHERITED_ACROSS_FORK,
     _SQLITE_IDLE_CONNECTIONS,
@@ -306,11 +306,40 @@ class TestSqliteDialectKeepsConnectionsBetweenCalls:
 
         assert [_is_closed(conn) for conn in opened] == [True]
 
+    def test_a_build_store_closes_the_dialect_it_made(self, tmp_path, opened):
+        builds = BuildStore(tmp_path / "builds.sqlite")
+        assert builds.get_build("none") is None
+        assert False in [_is_closed(conn) for conn in opened]
+
+        builds.close()
+        builds.close()
+
+        assert all(_is_closed(conn) for conn in opened)
+
+    def test_resetting_the_build_store_singleton_closes_it(self, tmp_path, opened):
+        # Dropped alone, one a fixture still holds keeps the file open, and Windows
+        # refuses to delete an open file.
+        held = get_build_store(tmp_path / "builds.sqlite")
+
+        reset_build_store()
+
+        assert held is not None
+        assert opened and all(_is_closed(conn) for conn in opened)
+
+    def test_a_build_store_leaves_a_dialect_it_was_given_open(self, dialect, opened):
+        builds = BuildStore(dialect.db_path, dialect=dialect)
+
+        builds.close()
+
+        # Still the artifact store's, or a consumer's, to use and to close.
+        dialect.connect().close()
+        dialect.connect().close()
+        assert opened == []
+
     def test_a_forked_process_leaves_its_parent_s_connections_alone(
         self, dialect, opened, monkeypatch
     ):
-        # SQLite forbids a connection carried across a fork, and closing one in the
-        # child could checkpoint under the parent.
+        # SQLite forbids a connection carried across a fork.
         parent = os.getpid()
         monkeypatch.setattr(os, "getpid", lambda: parent + 1)
         conn = dialect.connect()
