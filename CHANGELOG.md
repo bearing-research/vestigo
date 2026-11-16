@@ -18,7 +18,7 @@ All notable changes to vestigo are recorded here. The format follows
   which each call opens and closes its own, as before), or when the store is collected
   or the process exits, so an unclosed store now holds the database file open, with its
   `-wal` and `-shm` files: close it before deleting or copying the file, which Windows
-  refuses while it is open. A forked child opens its own connections.
+  refuses while it is open. A forked child opens its own connections. (#104)
 
 ## 0.6.0 - 2026-11-14
 
