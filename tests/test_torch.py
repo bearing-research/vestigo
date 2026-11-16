@@ -89,6 +89,27 @@ SUBSECOND_LEASES = pytest.mark.skipif(
 POSIX_MODES = pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX file modes")
 
 
+# Before Python 3.13, Windows' time.time() ticks every 15.6 ms.
+_COARSE_CLOCK = sys.platform == "win32" and sys.version_info < (3, 13)
+
+
+@pytest.fixture(autouse=True)
+def _a_run_starts_in_a_clock_reading_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests order executions by when they started and lapse a lease by renewing it
+    to zero seconds, each of which takes the clock to tick before the next start or
+    resume: on a coarse clock, wait out a tick."""
+    if not _COARSE_CLOCK:
+        return
+    for name in ("start", "resume"):
+        real = getattr(Ledger, name)
+
+        def after_a_tick(*args, _real=real, **kwargs):
+            time.sleep(0.032)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(Ledger, name, after_a_tick)
+
+
 @pytest.fixture(
     params=[
         "sqlite",
