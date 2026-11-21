@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.7.0 - 2026-11-21
+
 ### Changed
 
 - Migration 20 replaces `idx_build_computation` with `idx_build_open` on
