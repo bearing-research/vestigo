@@ -22,7 +22,8 @@ consumer, and imports nothing of it. *Vestigo* is Latin for "I track down, I tra
 - **Builds and releases.** A long computation is a build. Its workers hold leased
   attempts, and their checkpoint and final releases are accepted only while the
   lease is live and only once every output's bytes are stored, so a stalled worker
-  is fenced and a crashed one is resumed.
+  is fenced and a crashed one is resumed. Two processes that open one computation
+  at once through `open_build` get one build between them.
 - **References.** A mutable reference (a head) moves with
   compare-and-set and approval, in the same transaction as the release it points at.
 - **Retention.** Pins, retention roots and required edges hold versions; garbage

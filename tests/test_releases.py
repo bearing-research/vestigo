@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from vestigo.build_store import BuildStore
+from vestigo.build_store import BuildState, BuildStore
 from vestigo.operations import (
     AdvanceReference,
     AssertReferenceRevision,
@@ -110,6 +110,41 @@ def _build(
             build_id, attempt, writable_until=ledger.clock() + 3600, lease_owner="runner-1"
         )
     return build_id
+
+
+def _open(
+    ledger: Ledger,
+    key: str,
+    attempt: str = "a1",
+    *,
+    occurrence: str | None = None,
+    tenant: str | None = None,
+) -> tuple[str, BuildState]:
+    """``open_build`` of a new build of *key* under *attempt* (runner-1's 60 s lease): the new
+    build's id, and the computation's open build the call returned."""
+    build_id = uuid.uuid4().hex
+    target = f"final-{build_id}"
+    version = ledger.store.create_artifact(
+        target,
+        run_output_key(key, build_id, "model"),
+        SPEC,
+        tenant=tenant,
+        computation_key=key,
+        minted=True,
+    )
+    build = ledger.builds.open_build(
+        build_id,
+        target,
+        version,
+        attempt,
+        computation_key=key,
+        executor_ref="train@v1",
+        writable_until=ledger.clock() + 3600,
+        lease_owner="runner-1",
+        occurrence=occurrence,
+        tenant_id=tenant,
+    )
+    return build_id, build
 
 
 def _resume(ledger: Ledger, build_id: str, attempt: str, **kwargs) -> int:
@@ -872,6 +907,60 @@ class TestAttemptsAndFences:
 
         assert events[: events.index(f"key:{build_id}")] == ["size", "size"]
         assert {_state(ledger, v) for v in staged} == {"ready"}
+
+
+class TestOneOpenExecution:
+    """``open_build``: of two opens of one computation that both found nothing open, the
+    second returns the first's build and writes nothing."""
+
+    def test_a_second_open_returns_the_first_and_writes_nothing(self, ledger: Ledger):
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        first_id, first = _open(ledger, key)
+        assert (first.build_id, first.state, first.attempt) == (first_id, "building", "a1")
+        assert (first.lease_owner, first.dispatch) == ("runner-1", "external")
+        assert ledger.builds.get_attempt(first_id, "a1") is not None
+
+        second_id, second = _open(ledger, key, "a2")
+
+        assert second == first
+        assert ledger.builds.get_build(second_id) is None
+        assert ledger.builds.get_attempt(first_id, "a2") is None
+        assert ledger.builds.find_open_build(key) == first
+
+    def test_each_occurrence_and_tenant_is_an_execution_of_its_own(self, ledger: Ledger):
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        for occurrence, tenant in ((None, None), ("variant=a", None), (None, "acme")):
+            build_id, build = _open(ledger, key, occurrence=occurrence, tenant=tenant)
+            assert build.build_id == build_id
+            assert (
+                ledger.builds.find_open_build(key, occurrence=occurrence, tenant_id=tenant) == build
+            )
+
+    def test_a_build_that_is_not_building_leaves_the_computation_free(self, ledger: Ledger):
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        _build(ledger, None, computation_key=key)  # pending
+        failed = _build(ledger, computation_key=key)
+        assert ledger.builds.fail_build(failed, "crashed")
+        finished = _build(ledger, computation_key=key)
+        final = ledger.releases.prepare(finished, "a1", "final")
+        ledger.releases.accept(final.release_id, [])
+
+        build_id, build = _open(ledger, key)
+
+        assert build.build_id == build_id
+
+    def test_a_lapsed_open_build_comes_back_with_its_lease(self, ledger: Ledger):
+        """What the caller resumes rather than open beside."""
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        first_id, first = _open(ledger, key)
+        ledger.clock.now += 120
+
+        _, found = _open(ledger, key, "a2")
+
+        assert found.build_id == first_id
+        assert found.lease_expires_at == first.lease_expires_at
+        assert found.lease_expires_at is not None and found.lease_expires_at < ledger.clock()
+        assert _resume(ledger, first_id, "a2") == 0
 
 
 class TestReferencesAndAuthorities:

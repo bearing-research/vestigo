@@ -1359,7 +1359,23 @@ class Ledger:
         definition: Sequence[NodeSpec] = (),
     ) -> tuple[str, str, int]:
         """A new build of the computation *key* under *executor*, pending: its id, and its
-        placeholder's id and version.
+        placeholder's id and version."""
+        build_id, placeholder, version = self._placeholder(key, spec, label, definition)
+        self.builds.create_build(
+            build_id,
+            placeholder,
+            version,
+            executor_ref=executor,
+            params=spec.params,
+            computation_key=key,
+            dispatch="external",
+        )
+        return build_id, placeholder, version
+
+    def _placeholder(
+        self, key: str, spec: TransformSpec, label: str, definition: Sequence[NodeSpec] = ()
+    ) -> tuple[str, str, int]:
+        """A new build's id, and the id and version of the placeholder it targets.
 
         A build references a version, so one whose outputs do not exist yet targets a
         placeholder its final release fails.
@@ -1373,15 +1389,6 @@ class Ledger:
             minted=True,
             definition=definition,
             computation_key=key,
-        )
-        self.builds.create_build(
-            build_id,
-            placeholder,
-            version,
-            executor_ref=executor,
-            params=spec.params,
-            computation_key=key,
-            dispatch="external",
         )
         return build_id, placeholder, version
 
@@ -1419,49 +1426,42 @@ class Ledger:
     ) -> Run:
         """A new execution in its first attempt. With *alone*, only if no other execution
         of the computation is unfinished as it opens: that one is resumed instead
-        (refused while its lease is live), and the new one is failed unopened."""
+        (refused while its lease is live), and the new one's placeholder is failed."""
         spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
-        build_id, placeholder, version = self._new_build(
-            key, spec, EXECUTOR, "run", definition=[program.spec]
-        )
         attempt = uuid.uuid4().hex
-        conn = self.store._get_connection()
-        try:
-            # Keyed on the computation, so of two runs that both found nothing to resume
-            # one opens and the other sees it.
-            self.store.dialect.begin_write(conn, f"{ROOT}/{key}")
-            # As find_open_build, on this transaction: Postgres lends no second
-            # connection while it holds the lock.
-            other = (
-                conn.execute(
-                    "SELECT build_id FROM artifact_builds"
-                    " WHERE computation_key = ? AND state = 'building'"
-                    " ORDER BY created_at DESC LIMIT 1",
-                    (key,),
-                ).fetchone()
-                if alone
-                else None
+        now = time.time()
+        if alone:
+            build_id, placeholder, version = self._placeholder(
+                key, spec, "run", definition=[program.spec]
             )
-            now = time.time()
-            opened = other is None and self.builds.open_attempt_within(
-                conn,
+            build = self.builds.open_build(
+                build_id,
+                placeholder,
+                version,
+                attempt,
+                computation_key=key,
+                executor_ref=EXECUTOR,
+                writable_until=now + self.config.writable_seconds,
+                lease_owner=attempt,
+                lease_duration_seconds=self.lease_seconds,
+                params=spec.params,
+            )
+            if build.build_id != build_id:
+                self.store.fail_artifact(placeholder, version)
+                return self._resume(build.build_id, None, inputs, checkpointing, ranks)
+        else:
+            build_id, placeholder, version = self._new_build(
+                key, spec, EXECUTOR, "run", definition=[program.spec]
+            )
+            if not self.builds.open_attempt(
                 build_id,
                 attempt,
                 writable_until=now + self.config.writable_seconds,
                 lease_owner=attempt,
-                lease_expires_at=now + self.lease_seconds,
-                now=now,
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        if other is not None:
-            self.builds.fail_build(build_id, f"execution {other['build_id']} opened first")
-            self.store.fail_artifact(placeholder, version)
-            return self._resume(other["build_id"], None, inputs, checkpointing, ranks)
-        if not opened:
-            raise RuntimeError(f"execution {build_id} did not open its first attempt")
+                lease_duration_seconds=self.lease_seconds,
+            ):
+                raise RuntimeError(f"execution {build_id} did not open its first attempt")
         checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )

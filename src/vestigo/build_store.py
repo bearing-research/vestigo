@@ -269,6 +269,49 @@ _BUILD_FIELDS = (
 _BUILD_COLUMNS = ", ".join(_BUILD_FIELDS)
 
 
+# A computation's open build at an occurrence, for a tenant: what find_open_build returns
+# and open_build checks for, one statement so the two cannot drift.
+_OPEN_BUILD_SQL = f"""
+    SELECT {_BUILD_COLUMNS}
+    FROM artifact_builds
+    WHERE computation_key = ? AND state = 'building'
+      AND COALESCE(occurrence, '') = COALESCE(?, '')
+      AND COALESCE(tenant_id, '') = COALESCE(?, '')
+    ORDER BY created_at DESC
+    LIMIT 1
+"""
+
+
+def _insert_build(conn: StoreConnection, build: BuildState) -> None:
+    """Insert *build*'s row, as given, on the caller's transaction."""
+    conn.execute(
+        """
+        INSERT INTO artifact_builds
+            (build_id, artifact_id, version, state, executor_ref,
+             executor_url, tenant_id, principal_id, created_at,
+             input_uris, params, name, occurrence, computation_key, dispatch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            build.build_id,
+            build.artifact_id,
+            build.version,
+            build.state,
+            build.executor_ref,
+            build.executor_url,
+            build.tenant_id,
+            build.principal_id,
+            build.created_at,
+            json.dumps(build.input_uris) if build.input_uris else None,
+            json.dumps(build.params) if build.params else None,
+            build.name,
+            build.occurrence,
+            build.computation_key,
+            build.dispatch,
+        ),
+    )
+
+
 def _fence(conn: StoreConnection, build_id: str, attempt: str, now: float) -> None:
     """Mark *attempt* as taken over, so it never becomes the build's attempt again."""
     conn.execute(
@@ -469,56 +512,116 @@ class BuildStore:
         """
         if dispatch not in DISPATCHES:
             raise ValueError(f"dispatch must be one of {DISPATCHES}, not {dispatch!r}")
+        build = BuildState(
+            build_id=build_id,
+            artifact_id=artifact_id,
+            version=version,
+            state="pending",
+            executor_ref=executor_ref,
+            executor_url=executor_url,
+            tenant_id=tenant_id,
+            principal_id=principal_id,
+            created_at=self._clock(),
+            input_uris=input_uris,
+            params=params,
+            name=name,
+            occurrence=occurrence,
+            computation_key=computation_key,
+            dispatch=dispatch,
+        )
         conn = self._get_connection()
         try:
-            created_at = self._clock()
-            input_uris_json = json.dumps(input_uris) if input_uris else None
-            params_json = json.dumps(params) if params else None
+            _insert_build(conn, build)
+            conn.commit()
+            return build
+        finally:
+            conn.close()
 
-            conn.execute(
-                """
-                INSERT INTO artifact_builds
-                    (build_id, artifact_id, version, state, executor_ref,
-                     executor_url, tenant_id, principal_id, created_at,
-                     input_uris, params, name, occurrence, computation_key, dispatch)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    build_id,
-                    artifact_id,
-                    version,
-                    executor_ref,
-                    executor_url,
-                    tenant_id,
-                    principal_id,
-                    created_at,
-                    input_uris_json,
-                    params_json,
-                    name,
-                    occurrence,
-                    computation_key,
-                    dispatch,
+    def open_build(
+        self,
+        build_id: str,
+        artifact_id: str,
+        version: int,
+        attempt: str,
+        *,
+        computation_key: str,
+        executor_ref: str,
+        writable_until: float,
+        lease_owner: str | None = None,
+        lease_duration_seconds: float = 60.0,
+        occurrence: str | None = None,
+        tenant_id: str | None = None,
+        principal_id: str | None = None,
+        params: dict | None = None,
+        principal: str | None = None,
+    ) -> BuildState:
+        """Create an external build of a computation with *attempt* open on it, unless a
+        build of the computation is open already: the computation's open build either way.
+
+        Under one write keyed on the computation, either the newest ``building`` build of
+        (``computation_key``, ``occurrence``, ``tenant_id``), the one
+        :meth:`find_open_build` returns, comes back and nothing is written, or *build_id*
+        is created and opened as :meth:`create_build` with ``dispatch="external"`` and
+        then :meth:`open_attempt` would. The returned ``build_id`` is *build_id* exactly
+        when this call opened it. An open build whose lease has lapsed is still returned,
+        with its lease, so the caller decides between a resume and a refusal. Another
+        process's build is read under the computation's key, not its own, so it may finish
+        before the caller acts on it.
+
+        Raises:
+            RuntimeError: the new build's first attempt did not open.
+        """
+        conn = self._get_connection()
+        try:
+            # Keyed on the computation, so of two opens that both found nothing open one
+            # commits first and the other sees it.
+            self._dialect.begin_write(conn, f"open-build/{computation_key}")
+            # On this transaction, not through find_open_build: Postgres lends no second
+            # connection while it holds the lock.
+            row = conn.execute(_OPEN_BUILD_SQL, (computation_key, occurrence, tenant_id)).fetchone()
+            if row is not None:
+                conn.commit()
+                return _row_to_build_state(row)
+            now = self._clock()
+            _insert_build(
+                conn,
+                BuildState(
+                    build_id=build_id,
+                    artifact_id=artifact_id,
+                    version=version,
+                    state="pending",
+                    executor_ref=executor_ref,
+                    executor_url=None,
+                    tenant_id=tenant_id,
+                    principal_id=principal_id,
+                    created_at=now,
+                    params=params,
+                    occurrence=occurrence,
+                    computation_key=computation_key,
+                    dispatch="external",
                 ),
             )
-            conn.commit()
-
-            return BuildState(
-                build_id=build_id,
-                artifact_id=artifact_id,
-                version=version,
-                state="pending",
-                executor_ref=executor_ref,
-                executor_url=executor_url,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                created_at=created_at,
-                input_uris=input_uris,
-                params=params,
-                name=name,
-                occurrence=occurrence,
-                computation_key=computation_key,
-                dispatch=dispatch,
+            # Nothing outside this transaction knows build_id yet, so its own key need
+            # not be held: no claim or reclaim can reach the row before the commit.
+            if not self.open_attempt_within(
+                conn,
+                build_id,
+                attempt,
+                writable_until=writable_until,
+                lease_owner=lease_owner,
+                lease_expires_at=now + lease_duration_seconds,
+                now=now,
+                principal=principal,
+            ):
+                raise RuntimeError(f"build {build_id} did not open its first attempt")
+            opened = one(
+                conn.execute(
+                    f"SELECT {_BUILD_COLUMNS} FROM artifact_builds WHERE build_id = ?",
+                    (build_id,),
+                )
             )
+            conn.commit()
+            return _row_to_build_state(opened)
         finally:
             conn.close()
 
@@ -712,18 +815,7 @@ class BuildStore:
         """
         conn = self._get_connection()
         try:
-            row = conn.execute(
-                f"""
-                SELECT {_BUILD_COLUMNS}
-                FROM artifact_builds
-                WHERE computation_key = ? AND state = 'building'
-                  AND COALESCE(occurrence, '') = COALESCE(?, '')
-                  AND COALESCE(tenant_id, '') = COALESCE(?, '')
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (computation_key, occurrence, tenant_id),
-            ).fetchone()
+            row = conn.execute(_OPEN_BUILD_SQL, (computation_key, occurrence, tenant_id)).fetchone()
             return None if row is None else _row_to_build_state(row)
         finally:
             conn.close()
