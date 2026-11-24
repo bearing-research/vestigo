@@ -48,6 +48,11 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Run.finish`, retried after its final release was accepted but the
   reply lost, finds that release and finishes, where it raised `ReleaseRejected` and
   left the run unfinished. A second `finish` likewise returns. (#114)
+- `vestigo.torch` treats a release whose accept committed but whose reply was lost as
+  accepted: a checkpoint save returns it, `Ledger.derive` returns its bundle and
+  `Run.finish` finishes, where each reported a failure for what the ledger had stored.
+  Otherwise the release is abandoned as before, and an abandon that raises becomes a
+  note on the original error instead of replacing it. (#PR)
 
 ## 0.7.0 - 2026-11-21
 
