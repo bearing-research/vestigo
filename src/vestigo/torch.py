@@ -1924,9 +1924,12 @@ class Ledger:
             params=spec.params,
             beside=True,
         )
-        release = self.releases.prepare(build_id, attempt, "final")
+        release: Release | None = None
         created: list[tuple[str, int]] = []
         try:
+            # In the try: a prepare that raises would leave the build and its placeholder
+            # building, with no release for collect to tie them to.
+            release = self.releases.prepare(build_id, attempt, "final")
             for label in outputs:
                 artifact_id = f"{prefix}{quote(label, safe='')}"
                 version = self.store.create_artifact(
@@ -1949,7 +1952,8 @@ class Ledger:
             ]
             return self.releases.accept(release.release_id, staged)
         except BaseException:
-            self.releases.abandon(release.release_id, attempt)
+            if release is not None:
+                self.releases.abandon(release.release_id, attempt)
             for artifact_id, version in created:
                 self.store.fail_artifact(artifact_id, version)
             # Failed, not left building: nothing would ever settle it.

@@ -474,6 +474,29 @@ def test_an_open_that_committed_before_its_error_keeps_its_placeholder(
     assert _placeholders(ledger) == {build.artifact_id: "building"}
 
 
+def test_a_derivation_whose_prepare_fails_is_failed(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """With no release, nothing ties its build and placeholder to anything collect sweeps."""
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    lost = ledger.store.dialect.operational_error
+
+    def dropped(*args: object, **kwargs: object) -> Release:
+        raise lost("the connection dropped")
+
+    monkeypatch.setattr(ReleaseStore, "prepare", dropped)
+    with pytest.raises(lost, match="the connection dropped"):
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+    [build] = ledger.builds.builds_of(DERIVE_EXECUTOR)
+    assert build.state == "failed"
+    assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:
