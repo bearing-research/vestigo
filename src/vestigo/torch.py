@@ -125,6 +125,8 @@ class CollectResult(GcResult):
 
 EXECUTOR = "vestigo.torch/train@v1"
 DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
+# How many opens a run tries when each finds an execution that finishes before its resume.
+_OPEN_ROUNDS = 3
 MODEL_DOMAIN = "torch/model"
 PROGRAM_DOMAIN = "torch/training-program"
 # The root of every checkpoint id; a path under it names no file on any disk.
@@ -1213,7 +1215,8 @@ class Ledger:
                 ``lease_seconds`` ago), *from_release* is not an accepted checkpoint, or
                 a rank's model, program, inputs or *from_release* are not rank 0's.
             InputChanged: a rank's copy of a ``Path`` input has other bytes.
-            RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up.
+            RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up, or
+                each of three opens found an execution that finished before its resume.
         """
         model_payload = _model_payload(model, version)
         program_payload = _program_payload(loss, optimizer, config)
@@ -1223,7 +1226,9 @@ class Ledger:
             program = self._program(self._model(model_payload), program_payload)
             execution = self._find(program, resolved, from_release)
             if execution is not None:
-                return self._resume(execution, None, resolved, checkpointing, ranks)
+                run = self._resume_unfinished(execution, resolved, checkpointing, ranks)
+                if run is not None:
+                    return run
             if from_release is not None:
                 return self._branch(
                     program, from_release, resolved, checkpointing, ranks, alone=True
@@ -1410,24 +1415,37 @@ class Ledger:
         attempt = uuid.uuid4().hex
         now = time.time()
         if alone:
-            build_id, placeholder, version = self._placeholder(
-                key, spec, "run", definition=[program.spec]
-            )
-            build = self.builds.open_build(
-                build_id,
-                placeholder,
-                version,
-                attempt,
-                computation_key=key,
-                executor_ref=EXECUTOR,
-                writable_until=now + self.config.writable_seconds,
-                lease_owner=attempt,
-                lease_duration_seconds=self.lease_seconds,
-                params=spec.params,
-            )
-            if build.build_id != build_id:
+            # An open build that finishes before its resume leaves the computation free:
+            # open again. Each round's placeholder is failed before the resume, so a
+            # refusal or an error in it leaves none building.
+            for _ in range(_OPEN_ROUNDS):
+                build_id, placeholder, version = self._placeholder(
+                    key, spec, "run", definition=[program.spec]
+                )
+                now = time.time()
+                build = self.builds.open_build(
+                    build_id,
+                    placeholder,
+                    version,
+                    attempt,
+                    computation_key=key,
+                    executor_ref=EXECUTOR,
+                    writable_until=now + self.config.writable_seconds,
+                    lease_owner=attempt,
+                    lease_duration_seconds=self.lease_seconds,
+                    params=spec.params,
+                )
+                if build.build_id == build_id:
+                    break
                 self.store.fail_artifact(placeholder, version)
-                return self._resume(build.build_id, None, inputs, checkpointing, ranks)
+                run = self._resume_unfinished(build.build_id, inputs, checkpointing, ranks)
+                if run is not None:
+                    return run
+            else:
+                raise RuntimeError(
+                    f"computation {key}: {_OPEN_ROUNDS} opens each found an execution that "
+                    "finished before its resume"
+                )
         else:
             build_id, placeholder, version = self._placeholder(
                 key, spec, "run", definition=[program.spec]
@@ -1498,6 +1516,29 @@ class Ledger:
             ),
             checkpointing,
         )
+
+    def _resume_unfinished(
+        self,
+        execution_id: str,
+        inputs: _Inputs,
+        checkpointing: CheckpointManager.Config | None,
+        ranks: _Ranks,
+    ) -> Run | None:
+        """Resume the execution a run found open, or None if it has finished since.
+
+        The find read it under no lock of its own, so its final release or a fail may
+        have committed before the resume.
+
+        Raises:
+            ValueError: as :meth:`resume`, while the execution is still unfinished.
+        """
+        try:
+            return self._resume(execution_id, None, inputs, checkpointing, ranks)
+        except ValueError:
+            build = self.builds.get_build(execution_id)
+            if build is not None and build.state == "building":
+                raise
+            return None
 
     def _resume(
         self,
