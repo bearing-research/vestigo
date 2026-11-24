@@ -3059,6 +3059,11 @@ class Run:
             self.restores_from,
         )
         operations = [AdvanceReference(f"{ROOT}/{self.execution_id}", ended_on)] if ended_on else []
+        # As before a checkpoint: a final release this attempt prepared whose reply was
+        # lost is unsettled, and would refuse this one as out of order.
+        for stale in self.ledger.releases.releases_of(self.execution_id, "final"):
+            if stale.attempt == self.attempt and stale.state in UNSETTLED:
+                self.ledger.releases.abandon(stale.release_id, self.attempt)
         release = self.ledger.releases.prepare(self.execution_id, self.attempt, "final")
         try:
             with self._renewing:
