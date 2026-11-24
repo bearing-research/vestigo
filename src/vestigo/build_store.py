@@ -554,6 +554,7 @@ class BuildStore:
         principal_id: str | None = None,
         params: dict | None = None,
         principal: str | None = None,
+        beside: bool = False,
     ) -> BuildState:
         """Create an external build of a computation with *attempt* open on it, unless a
         build of the computation is open already: the computation's open build either way.
@@ -573,22 +574,34 @@ class BuildStore:
         attempt, its own build would come back held by the earlier call's live lease,
         which no resume can take until it lapses.
 
+        With *beside*, the build opens whatever else of the computation is open: no check
+        and no lock on the computation, only the create and the open in one transaction,
+        so an open that fails leaves no pending build behind. Nothing is looked up, so a
+        retry with the same *build_id* raises the integrity error even while its build is
+        open: the caller reads :meth:`get_build` to see whether the first call committed.
+
         Raises:
             RuntimeError: the new build's first attempt did not open.
-            integrity_error: the dialect's, when no build of the computation is open and
-                *build_id* is taken, as a retry finds once the earlier call's build finished.
+            integrity_error: the dialect's, when *build_id* is taken and, without
+                *beside*, no build of the computation is open, as a retry finds once the
+                earlier call's build finished.
         """
         conn = self._get_connection()
         try:
-            # Keyed on the computation, so of two opens that both found nothing open one
-            # commits first and the other sees it.
-            self._dialect.begin_write(conn, f"open-build/{computation_key}")
-            # On this transaction, not through find_open_build: Postgres lends no second
-            # connection while it holds the lock.
-            row = conn.execute(_OPEN_BUILD_SQL, (computation_key, occurrence, tenant_id)).fetchone()
-            if row is not None:
-                conn.commit()
-                return _row_to_build_state(row)
+            if beside:
+                self._dialect.begin_write(conn, build_id)
+            else:
+                # Keyed on the computation, so of two opens that both found nothing open
+                # one commits first and the other sees it.
+                self._dialect.begin_write(conn, f"open-build/{computation_key}")
+                # On this transaction, not through find_open_build: Postgres lends no
+                # second connection while it holds the lock.
+                row = conn.execute(
+                    _OPEN_BUILD_SQL, (computation_key, occurrence, tenant_id)
+                ).fetchone()
+                if row is not None:
+                    conn.commit()
+                    return _row_to_build_state(row)
             now = self._clock()
             _insert_build(
                 conn,
