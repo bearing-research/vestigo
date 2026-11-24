@@ -79,24 +79,22 @@ def main() -> None:
         version = store.create_artifact(
             target, run_output_key(KEY, build_id, "model"), SPEC, minted=True, computation_key=KEY
         )
-        builds.create_build(
+        # The first worker: a short lease, which it stops renewing. A live worker calls
+        # builds.renew_lease(build_id, "first") well inside the lease. open_build creates
+        # the build and opens the attempt in one step, unless a build of KEY is open
+        # already, which it returns instead.
+        opened = builds.open_build(
             build_id,
             target,
             version,
-            executor_ref="train@v1",
-            computation_key=KEY,
-            dispatch="external",
-        )
-
-        # The first worker: a short lease, which it stops renewing. A live worker calls
-        # builds.renew_lease(build_id, "first") well inside the lease.
-        builds.open_attempt(
-            build_id,
             "first",
+            computation_key=KEY,
+            executor_ref="train@v1",
             writable_until=time.time() + 3600,
             lease_owner="first",
             lease_duration_seconds=1.0,
         )
+        assert opened.build_id == build_id, "an earlier run left its build open: use a new ledger"
         for step in (1, 2):
             checkpoint(store, releases, build_id, "first", {"step": step, "loss": 1 / step})
         time.sleep(1.5)

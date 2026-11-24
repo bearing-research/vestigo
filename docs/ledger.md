@@ -175,6 +175,31 @@ The build's target is the row its final release makes current. `dispatch="extern
 says the caller runs the work itself. The default, `runner`, lists the build for a
 runner that claims it (`list_runnable_builds`, `claim_build`).
 
+`find_open_build` and then `create_build` leave a gap: two processes can both find
+nothing open and each open a build of one computation. To keep one execution per
+computation, `builds.open_build` creates an external build and opens its first attempt
+in one transaction, locked on the computation:
+
+```python
+build = builds.open_build(
+    build_id,
+    target,
+    target_version,
+    "worker-1",
+    computation_key=key,
+    executor_ref="train@v1",
+    writable_until=time.time() + 3600,
+    lease_owner="worker-1",
+)
+if build.build_id != build_id:
+    store.fail_artifact(target, target_version)  # this call's target, now unused
+    ...  # another process's build is open: resume it, or refuse while its lease is live
+```
+
+It returns the computation's open build at that `occurrence` for that `tenant_id`. That
+is the new build when this call opened it. Otherwise it is the build that was already
+open, whose lease may have lapsed, and nothing is written.
+
 An attempt holds the build under a lease, which the worker renews with
 `builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
 lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,

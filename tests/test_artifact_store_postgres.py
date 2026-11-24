@@ -19,6 +19,7 @@ import anyio.to_thread
 import psycopg
 import pytest
 
+import vestigo.build_store
 from vestigo.build_store import BuildStore
 from vestigo.graph import Edge, NodeSpec, Traversal
 from vestigo.operations import AuditEvent, InsertAuditEvent
@@ -1556,6 +1557,59 @@ class TestTheAttemptLedgerOnPostgres:
             assert store.settled_attempts() == []
         finally:
             dialect.close()
+
+
+class TestOneOpenExecutionOnPostgres:
+    """``open_build`` checks for an open build under the computation's lock, so an open that
+    waited on another's sees the build it committed."""
+
+    def test_an_open_that_waited_returns_the_build_the_holder_opened(self, store, monkeypatch):
+        builds = BuildStore(store.db_path, dialect=store.dialect)
+        key = hashlib.sha256(secrets.token_bytes(16)).hexdigest()
+        inserted, release = threading.Event(), threading.Event()
+        insert = vestigo.build_store._insert_build
+
+        def inserting(conn, build):
+            insert(conn, build)
+            if build.build_id == holder_id:
+                inserted.set()
+                assert release.wait(30)
+
+        monkeypatch.setattr(vestigo.build_store, "_insert_build", inserting)
+        outcomes: dict[str, str] = {}
+
+        holder_id, waiter_id = secrets.token_hex(16), secrets.token_hex(16)
+        # Created first, so the waiter's only wait is open_build's.
+        versions = {
+            build_id: store.create_artifact(f"run-{build_id}", f"prov-{build_id}", _spec())
+            for build_id in (holder_id, waiter_id)
+        }
+
+        def opening(build_id: str) -> None:
+            opened = builds.open_build(
+                build_id,
+                f"run-{build_id}",
+                versions[build_id],
+                "a1",
+                computation_key=key,
+                executor_ref="x",
+                writable_until=time.time() + 3600,
+            )
+            outcomes[build_id] = opened.build_id
+
+        # Each on its own thread: connections are shared per thread.
+        holder = threading.Thread(target=opening, args=(holder_id,))
+        holder.start()
+        assert inserted.wait(30)
+        waiter = threading.Thread(target=opening, args=(waiter_id,))
+        waiter.start()
+        _until_it_waits(store, waiter)
+        release.set()
+        holder.join(30)
+        waiter.join(30)
+
+        assert outcomes == {holder_id: holder_id, waiter_id: holder_id}
+        assert builds.get_build(waiter_id) is None
 
 
 class TestTimestampPrecision:

@@ -329,9 +329,9 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             # The other found the first one's execution as it opened, and its lease live.
             [refused] = [each for each in outcomes if isinstance(each, ValueError)]
             assert "lease on it is live" in str(refused)
+            # The other wrote no build of its own.
             builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
-            assert builds.pop(run.execution_id) == "building"
-            assert list(builds.values()) == ["failed"]
+            assert builds == {run.execution_id: "building"}
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):

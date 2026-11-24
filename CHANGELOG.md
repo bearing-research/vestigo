@@ -5,6 +5,23 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `BuildStore.open_build` creates an external build of a computation and opens its first
+  attempt in one transaction, under a lock keyed on the computation. If a build of the
+  computation is already open at that occurrence for that tenant, it returns that build
+  and writes nothing. `find_open_build` followed by `create_build` and `open_attempt` ran
+  as three transactions, so two processes that both found nothing open could each open a
+  build and run the computation twice. (#106)
+
+### Changed
+
+- `vestigo.torch`'s `Ledger.run` opens a new execution through `open_build`. A run that
+  loses the race to another resumes the other's execution, as before, but no longer
+  leaves a failed build of its own behind. On Postgres the lock it takes is now
+  `open-build/<key>`, not `vestigo-torch/<key>`, so a 0.7.0 process and a newer one on
+  one store do not serialize their opens: upgrade every process together. (#106)
+
 ## 0.7.0 - 2026-11-21
 
 ### Changed
