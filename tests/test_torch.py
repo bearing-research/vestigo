@@ -56,6 +56,7 @@ from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
 from vestigo.torch import (
+    DERIVE_EXECUTOR,
     EXECUTOR,
     Attempt,
     Definition,
@@ -332,6 +333,32 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             # The other wrote no build of its own.
             builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
             assert builds == {run.execution_id: "building"}
+
+
+def test_a_first_attempt_that_does_not_open_fails_its_build_and_placeholder(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    monkeypatch.setattr(BuildStore, "open_attempt", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+        ledger.start(trainer.program)
+    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+    refused = [
+        build
+        for executor in (EXECUTOR, DERIVE_EXECUTOR)
+        for build in ledger.builds.builds_of(executor)
+        if build.build_id != run.execution_id
+    ]
+    assert [build.state for build in refused] == ["failed", "failed"]
+    for build in refused:
+        assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
