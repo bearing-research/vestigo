@@ -125,6 +125,8 @@ class CollectResult(GcResult):
 
 EXECUTOR = "vestigo.torch/train@v1"
 DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
+# How many times a run opens again when the open execution it found finished first.
+_OPEN_ROUNDS = 3
 MODEL_DOMAIN = "torch/model"
 PROGRAM_DOMAIN = "torch/training-program"
 # The root of every checkpoint id; a path under it names no file on any disk.
@@ -1223,7 +1225,9 @@ class Ledger:
             program = self._program(self._model(model_payload), program_payload)
             execution = self._find(program, resolved, from_release)
             if execution is not None:
-                return self._resume(execution, None, resolved, checkpointing, ranks)
+                run = self._resume_unfinished(execution, resolved, checkpointing, ranks)
+                if run is not None:
+                    return run
             if from_release is not None:
                 return self._branch(
                     program, from_release, resolved, checkpointing, ranks, alone=True
@@ -1435,21 +1439,32 @@ class Ledger:
             build_id, placeholder, version = self._placeholder(
                 key, spec, "run", definition=[program.spec]
             )
-            build = self.builds.open_build(
-                build_id,
-                placeholder,
-                version,
-                attempt,
-                computation_key=key,
-                executor_ref=EXECUTOR,
-                writable_until=now + self.config.writable_seconds,
-                lease_owner=attempt,
-                lease_duration_seconds=self.lease_seconds,
-                params=spec.params,
-            )
-            if build.build_id != build_id:
+            # An open build that finishes before its resume leaves the computation free:
+            # open again, with the same id and placeholder, since nothing was written.
+            for _ in range(_OPEN_ROUNDS):
+                build = self.builds.open_build(
+                    build_id,
+                    placeholder,
+                    version,
+                    attempt,
+                    computation_key=key,
+                    executor_ref=EXECUTOR,
+                    writable_until=now + self.config.writable_seconds,
+                    lease_owner=attempt,
+                    lease_duration_seconds=self.lease_seconds,
+                    params=spec.params,
+                )
+                if build.build_id == build_id:
+                    break
+                run = self._resume_unfinished(build.build_id, inputs, checkpointing, ranks)
+                if run is not None:
+                    self.store.fail_artifact(placeholder, version)
+                    return run
+            else:
                 self.store.fail_artifact(placeholder, version)
-                return self._resume(build.build_id, None, inputs, checkpointing, ranks)
+                raise RuntimeError(
+                    f"computation {key}: {_OPEN_ROUNDS} executions finished as this one opened"
+                )
         else:
             build_id, placeholder, version = self._new_build(
                 key, spec, EXECUTOR, "run", definition=[program.spec]
@@ -1515,6 +1530,29 @@ class Ledger:
             ),
             checkpointing,
         )
+
+    def _resume_unfinished(
+        self,
+        execution_id: str,
+        inputs: _Inputs,
+        checkpointing: CheckpointManager.Config | None,
+        ranks: _Ranks,
+    ) -> Run | None:
+        """Resume the execution a run found open, or None if it has finished since.
+
+        The find read it under no lock of its own, so its final release or a fail may
+        have committed before the resume.
+
+        Raises:
+            ValueError: as :meth:`resume`, while the execution is still unfinished.
+        """
+        try:
+            return self._resume(execution_id, None, inputs, checkpointing, ranks)
+        except ValueError:
+            build = self.builds.get_build(execution_id)
+            if build is not None and build.state == "building":
+                raise
+            return None
 
     def _resume(
         self,

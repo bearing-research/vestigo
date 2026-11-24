@@ -193,6 +193,7 @@ does, change `version`. Then it looks the computation up in the ledger:
 
 Two processes that start the same computation at once open one execution between them:
 the second finds the first's as it opens, and raises `ValueError` as its lease is live.
+If the execution a run found finishes before the run resumes it, the run starts a new one.
 
 While the block runs, the run holds the execution with a lease that a background
 thread renews, so no other process can save to it. That is why the same script trains

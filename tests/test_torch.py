@@ -334,6 +334,51 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             assert builds == {run.execution_id: "building"}
 
 
+def test_a_run_whose_found_execution_finished_first_opens_a_new_one(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as first:
+        trainer.train(first, 1)  # then the process stops, leaving it to resume
+    find = Ledger._find
+
+    def finished_after_the_find(self: Ledger, *args: object) -> str | None:
+        execution = find(self, *args)
+        if execution is not None:
+            assert self.builds.fail_build(execution, "finished elsewhere")
+        return execution
+
+    monkeypatch.setattr(Ledger, "_find", finished_after_the_find)
+
+    with _run(ledger, Trainer(ledger)) as again:
+        assert again.execution_id != first.execution_id
+        assert again.restores_from is None
+
+
+def test_a_run_whose_opened_against_execution_finished_first_opens_again(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The execution open_build returned, rather than _find, finished before the resume."""
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as first:
+        trainer.train(first, 1)
+    monkeypatch.setattr(Ledger, "_find", lambda self, *args: None)
+    open_build = BuildStore.open_build
+
+    def finished_after_the_open(self: BuildStore, build_id: str, *args, **kwargs):
+        build = open_build(self, build_id, *args, **kwargs)
+        if build.build_id != build_id:
+            assert self.fail_build(build.build_id, "finished elsewhere")
+        return build
+
+    monkeypatch.setattr(BuildStore, "open_build", finished_after_the_open)
+
+    with _run(ledger, Trainer(ledger)) as again:
+        assert again.execution_id != first.execution_id
+        builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
+        assert builds == {first.execution_id: "failed", again.execution_id: "building"}
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:
