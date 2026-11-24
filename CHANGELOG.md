@@ -52,7 +52,7 @@ All notable changes to vestigo are recorded here. The format follows
   accepted: a checkpoint save returns it, `Ledger.derive` returns its bundle and
   `Run.finish` finishes, where each reported a failure for what the ledger had stored.
   Otherwise the release is abandoned as before, and an abandon that raises becomes a
-  note on the original error instead of replacing it. (#PR)
+  note on the original error instead of replacing it. (#115)
 
 ## 0.7.0 - 2026-11-21
 
