@@ -1356,14 +1356,16 @@ class Ledger:
         )
 
     def _settle(self, release_id: str, attempt: str, error: BaseException) -> bool:
-        """After *error* from a release's accept: True if it was accepted all the same (the
-        commit landed and only its reply was lost); otherwise abandon it and return False.
-        A cleanup that raises becomes a note on *error*."""
+        """After *error* from a release's accept: abandon it and return False, or True if
+        it was accepted all the same (the commit landed and only its reply was lost). A
+        cleanup that raises becomes a note on *error*."""
         try:
+            # Abandon first: it waits on the key an accept holds to its commit, so a
+            # commit still landing settles before it, and a read before it could miss it.
+            if self.releases.abandon(release_id, attempt):
+                return False
             release = self.releases.get(release_id)
-            if release is not None and release.state == "accepted":
-                return True
-            self.releases.abandon(release_id, attempt)
+            return release is not None and release.state == "accepted"
         except Exception as cleanup:
             error.add_note(f"release {release_id} is left unsettled: {cleanup!r}")
         return False
@@ -3112,9 +3114,10 @@ class Run:
             raise
         except Exception as error:
             # Left preparing, it would refuse every later final release as out of order.
-            if not self.ledger._settle(release.release_id, self.attempt, error):
-                raise
+            # Under the renewal's lock: a renewal of the finished build would warn.
             with self._renewing:
+                if not self.ledger._settle(release.release_id, self.attempt, error):
+                    raise
                 self.finished = True
                 self._stop.set()
 
