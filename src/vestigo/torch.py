@@ -1372,33 +1372,6 @@ class Ledger:
         )
         return build_id, placeholder, version
 
-    def _first_attempt(
-        self,
-        build_id: str,
-        placeholder: str,
-        version: int,
-        attempt: str,
-        *,
-        writable_until: float,
-        lease_seconds: float,
-    ) -> None:
-        """Open a new build's first attempt, or fail the build and its placeholder and raise.
-
-        Raises:
-            RuntimeError: the attempt did not open.
-        """
-        if self.builds.open_attempt(
-            build_id,
-            attempt,
-            writable_until=writable_until,
-            lease_owner=attempt,
-            lease_duration_seconds=lease_seconds,
-        ):
-            return
-        self.builds.fail_build(build_id, f"attempt {attempt} did not open")
-        self.store.fail_artifact(placeholder, version)
-        raise RuntimeError(f"execution {build_id} did not open its first attempt")
-
     def _placeholder(
         self, key: str, spec: TransformSpec, label: str, definition: Sequence[NodeSpec] = ()
     ) -> tuple[str, str, int]:
@@ -1462,8 +1435,6 @@ class Ledger:
             build_id, placeholder, version = self._placeholder(
                 key, spec, "run", definition=[program.spec]
             )
-            # A placeholder left building when open_build raises is the zombie sweep's:
-            # a cleanup on the connection that just failed would hide the first error.
             build = self.builds.open_build(
                 build_id,
                 placeholder,
@@ -1483,14 +1454,14 @@ class Ledger:
             build_id, placeholder, version = self._new_build(
                 key, spec, EXECUTOR, "run", definition=[program.spec]
             )
-            self._first_attempt(
+            if not self.builds.open_attempt(
                 build_id,
-                placeholder,
-                version,
                 attempt,
                 writable_until=now + self.config.writable_seconds,
-                lease_seconds=self.lease_seconds,
-            )
+                lease_owner=attempt,
+                lease_duration_seconds=self.lease_seconds,
+            ):
+                raise RuntimeError(f"execution {build_id} did not open its first attempt")
         checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )
@@ -1899,14 +1870,14 @@ class Ledger:
         attempt = uuid.uuid4().hex
         # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
         # however long the uploads take.
-        self._first_attempt(
+        if not self.builds.open_attempt(
             build_id,
-            placeholder,
-            target,
             attempt,
             writable_until=time.time() + self.config.writable_seconds,
-            lease_seconds=self.config.writable_seconds,
-        )
+            lease_owner=attempt,
+            lease_duration_seconds=self.config.writable_seconds,
+        ):
+            raise RuntimeError(f"derivation {build_id} did not open its first attempt")
         release = self.releases.prepare(build_id, attempt, "final")
         created: list[tuple[str, int]] = []
         try:
