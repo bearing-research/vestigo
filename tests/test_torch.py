@@ -499,6 +499,8 @@ def test_a_finish_whose_prepare_reply_was_lost_finishes_when_retried(
         run.finish()
 
     assert ledger.builds.get_build(run.execution_id).state == "ready"
+    finals = ledger.releases.releases_of(run.execution_id, "final")
+    assert [release.state for release in finals] == ["abandoned", "accepted"]
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
