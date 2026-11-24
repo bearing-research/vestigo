@@ -26,7 +26,7 @@ All notable changes to vestigo are recorded here. The format follows
 
 - `vestigo.torch`'s `Ledger.run` starts a new execution when the unfinished one it found
   finishes before its resume, as a run over only finished executions does, where it
-  raised `ValueError`. It opens again at most 3 times.
+  raised `ValueError`. It opens again at most 3 times. (#109)
 
 ## 0.7.0 - 2026-11-21
 
