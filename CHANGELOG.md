@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.8.0 - 2026-11-24
+
 ### Added
 
 - `BuildStore.open_build` creates an external build of a computation and opens its first
