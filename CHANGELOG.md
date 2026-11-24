@@ -39,6 +39,9 @@ All notable changes to vestigo are recorded here. The format follows
   `building`, and `Ledger.collect` never sweeps a building placeholder no build names.
   The open's own error is the one raised, and a placeholder a committed build targets is
   left alone. (#111)
+- `vestigo.torch`'s `Ledger.derive` fails its build and placeholder when preparing its
+  release raises, as it does for a failure after it. With no release, nothing tied them
+  to anything `Ledger.collect` sweeps, so both stayed `building`. (#112)
 - `vestigo.torch`'s `Run.finish` abandons a final release its own attempt left unsettled
   before preparing another, as a checkpoint does. A prepare whose reply was lost left it
   `preparing`, and a retried `finish` was refused as out of order until a resume. (#113)
