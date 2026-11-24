@@ -30,7 +30,7 @@ import time
 import uuid
 import warnings
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import closing
 from datetime import timedelta
@@ -550,33 +550,166 @@ def test_a_derivation_whose_cleanup_fails_raises_its_own_error(
     assert any("the database is down" in note for note in raised.value.__notes__)
 
 
-def test_a_finish_whose_accept_reply_was_lost_is_finished_when_retried(
-    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
-):
-    """The final release was accepted, then the reply lost: the retry finds it accepted."""
+def _lose_accept_reply(
+    monkeypatch: pytest.MonkeyPatch, ledger: Ledger, kind: str, down: dict[str, bool] | None = None
+) -> type[Exception]:
+    """Make the next accept of a *kind* release commit and then raise, as a reply lost on
+    the way back; with *down*, the database also stays down (``down["now"]``) after it."""
     lost = ledger.store.dialect.operational_error
-    accept = ReleaseStore.accept
+    accept, get, abandon = ReleaseStore.accept, ReleaseStore.get, ReleaseStore.abandon
     replies = {"lost": 1}
 
     def committed_then_dropped(self: ReleaseStore, release_id: str, *args, **kwargs):
         bundle = accept(self, release_id, *args, **kwargs)
-        if bundle.release.kind == "final" and replies["lost"]:
+        if bundle.release.kind == kind and replies["lost"]:
             replies["lost"] -= 1
+            if down is not None:
+                down["now"] = True
             raise lost("the reply was lost")
         return bundle
 
+    def unreachable(self: ReleaseStore, release_id: str) -> Release | None:
+        if down is not None and down["now"]:
+            raise lost("the database is down")
+        return get(self, release_id)
+
+    def unreachable_abandon(self: ReleaseStore, release_id: str, attempt: str) -> bool:
+        if down is not None and down["now"]:
+            raise lost("the database is down")
+        return abandon(self, release_id, attempt)
+
     monkeypatch.setattr(ReleaseStore, "accept", committed_then_dropped)
+    monkeypatch.setattr(ReleaseStore, "get", unreachable)
+    monkeypatch.setattr(ReleaseStore, "abandon", unreachable_abandon)
+    return lost
+
+
+def test_a_finish_whose_accept_reply_was_lost_is_finished_when_retried(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The final release was accepted, the reply lost and the database down a while, so
+    the finish could not tell: the retry finds it accepted."""
+    down = {"now": False}
+    lost = _lose_accept_reply(monkeypatch, ledger, "final", down)
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
         trainer.train(run, 1)
-        with pytest.raises(lost, match="the reply was lost"):
+        with pytest.raises(lost, match="the reply was lost") as raised:
             run.finish()
+        assert any("the database is down" in note for note in raised.value.__notes__)
+        down["now"] = False
         run.finish()
         assert run._stop.is_set(), "the renewal stops with the finish"
 
     assert ledger.builds.get_build(run.execution_id).state == "ready"
     finals = ledger.releases.releases_of(run.execution_id, "final")
     assert [release.state for release in finals] == ["accepted"]
+
+
+def test_a_finish_whose_accept_reply_was_lost_has_finished(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    _lose_accept_reply(monkeypatch, ledger, "final")
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        run.finish()
+        assert run._stop.is_set(), "the renewal stops with the finish"
+
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+
+
+def test_a_save_whose_accept_reply_was_lost_returns_its_release(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    _lose_accept_reply(monkeypatch, ledger, "checkpoint")
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        release = run.save(1, {"model": trainer.model})
+        assert release.state == "accepted"
+        assert release == run.release_of(1)
+
+
+def test_a_save_whose_accept_commits_after_it_raised_returns_its_release(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The client gave up on an accept the server was still committing: the commit lands
+    while the save settles, after a read would have found the release prepared."""
+    lost = ledger.store.dialect.operational_error
+    accept, abandon = ReleaseStore.accept, ReleaseStore.abandon
+    timed_out = {"once": False}
+    landing: list[Callable[[], object]] = []  # the accept the client gave up on
+
+    def gave_up(self: ReleaseStore, release_id: str, *args, **kwargs):
+        if self.get(release_id).kind == "checkpoint" and not timed_out["once"]:
+            timed_out["once"] = True
+            landing.append(lambda: accept(self, release_id, *args, **kwargs))
+            raise lost("the client timed out")
+        return accept(self, release_id, *args, **kwargs)
+
+    def after_the_commit(self: ReleaseStore, release_id: str, attempt: str) -> bool:
+        while landing:
+            landing.pop()()
+        return abandon(self, release_id, attempt)
+
+    monkeypatch.setattr(ReleaseStore, "accept", gave_up)
+    monkeypatch.setattr(ReleaseStore, "abandon", after_the_commit)
+    trainer = Trainer(ledger)
+    with _run(ledger, trainer) as run:
+        release = run.save(1, {"model": trainer.model})
+        assert release.state == "accepted"
+
+
+def test_a_derivation_whose_accept_failed_abandons_its_release_unread(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The accept did fail and reading the release fails too: it is abandoned all the same."""
+    lost = ledger.store.dialect.operational_error
+    get = ReleaseStore.get
+    reads = {"down": False}
+
+    def failed(self: ReleaseStore, release_id: str, *args, **kwargs):
+        reads["down"] = True
+        raise lost("the accept failed")
+
+    def unreachable(self: ReleaseStore, release_id: str) -> Release | None:
+        if reads["down"]:
+            raise lost("the database is down")
+        return get(self, release_id)
+
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    monkeypatch.setattr(ReleaseStore, "accept", failed)
+    monkeypatch.setattr(ReleaseStore, "get", unreachable)
+
+    with pytest.raises(lost, match="the accept failed"):
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+    reads["down"] = False
+    [build] = ledger.builds.builds_of(DERIVE_EXECUTOR)
+    finals = ledger.releases.releases_of(build.build_id, "final")
+    assert [release.state for release in finals] == ["abandoned"]
+
+
+def test_a_derivation_whose_accept_reply_was_lost_returns_its_bundle(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    _lose_accept_reply(monkeypatch, ledger, "final")
+
+    bundle = ledger.derive(source, "eval", {"metrics": b"1"})
+
+    assert bundle.release.state == "accepted"
+    assert ledger.derived(source, "eval") == bundle
+    [build] = ledger.builds.builds_of(DERIVE_EXECUTOR)
+    assert build.state == "ready"
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):

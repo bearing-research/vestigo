@@ -1355,6 +1355,21 @@ class Ledger:
             checkpointing,
         )
 
+    def _settle(self, release_id: str, attempt: str, error: BaseException) -> bool:
+        """After *error* from a release's accept: abandon it and return False, or True if
+        it was accepted all the same (the commit landed and only its reply was lost). A
+        cleanup that raises becomes a note on *error*."""
+        try:
+            # Abandon first: it waits on the key an accept holds to its commit, so a
+            # commit still landing settles before it, and a read before it could miss it.
+            if self.releases.abandon(release_id, attempt):
+                return False
+            release = self.releases.get(release_id)
+            return release is not None and release.state == "accepted"
+        except Exception as cleanup:
+            error.add_note(f"release {release_id} is left unsettled: {cleanup!r}")
+        return False
+
     def _open_build(
         self, build_id: str, placeholder: str, version: int, attempt: str, **kwargs: Any
     ) -> BuildState:
@@ -1952,8 +1967,17 @@ class Ledger:
             ]
             return self.releases.accept(release.release_id, staged)
         except BaseException as error:
+            # Not an interrupt: returning would swallow it.
+            if (
+                isinstance(error, Exception)
+                and release is not None
+                and self._settle(release.release_id, attempt, error)
+            ):
+                bundle = self.releases.bundle(release.release_id)
+                assert bundle is not None
+                return bundle
             try:
-                if release is not None:
+                if release is not None and not isinstance(error, Exception):
                     self.releases.abandon(release.release_id, attempt)
                 for artifact_id, version in created:
                     self.store.fail_artifact(artifact_id, version)
@@ -2428,11 +2452,11 @@ class Ledger:
             self.releases.accept(release.release_id, staged)
         except ReleaseRejected:
             raise
-        except Exception:
+        except Exception as error:
             # Any error, of the database, a blob SDK or the signer: the release must not
             # stay prepared, and each raises its own types.
-            self.releases.abandon(release.release_id, at.attempt)
-            raise
+            if not self._settle(release.release_id, at.attempt, error):
+                raise
         logger.info("Accepted step %d of execution %s", at.step, at.execution_id)
         accepted = self.releases.get(release.release_id)
         assert accepted is not None
@@ -3088,10 +3112,14 @@ class Run:
                 self._stop.set()
         except ReleaseRejected:
             raise
-        except Exception:
+        except Exception as error:
             # Left preparing, it would refuse every later final release as out of order.
-            self.ledger.releases.abandon(release.release_id, self.attempt)
-            raise
+            # Under the renewal's lock: a renewal of the finished build would warn.
+            with self._renewing:
+                if not self.ledger._settle(release.release_id, self.attempt, error):
+                    raise
+                self.finished = True
+                self._stop.set()
 
     def _drain(self) -> None:
         """Wait for the save in flight and close the manager.
