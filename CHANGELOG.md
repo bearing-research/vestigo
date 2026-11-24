@@ -41,7 +41,7 @@ All notable changes to vestigo are recorded here. The format follows
   left alone. (#111)
 - `vestigo.torch`'s `Ledger.derive` fails its build and placeholder when preparing its
   release raises, as it does for a failure after it. With no release, nothing tied them
-  to anything `Ledger.collect` sweeps, so both stayed `building`. (#PR)
+  to anything `Ledger.collect` sweeps, so both stayed `building`. (#112)
 
 ## 0.7.0 - 2026-11-21
 
