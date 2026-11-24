@@ -119,10 +119,12 @@ def _open(
     *,
     occurrence: str | None = None,
     tenant: str | None = None,
+    build_id: str | None = None,
+    beside: bool = False,
 ) -> tuple[str, BuildState]:
     """``open_build`` of a new build of *key* under *attempt* (runner-1's 60 s lease): the new
     build's id, and the computation's open build the call returned."""
-    build_id = uuid.uuid4().hex
+    build_id = build_id or uuid.uuid4().hex
     target = f"final-{build_id}"
     version = ledger.store.create_artifact(
         target,
@@ -143,6 +145,7 @@ def _open(
         lease_owner="runner-1",
         occurrence=occurrence,
         tenant_id=tenant,
+        beside=beside,
     )
     return build_id, build
 
@@ -961,6 +964,48 @@ class TestOneOpenExecution:
         assert found.lease_expires_at == first.lease_expires_at
         assert found.lease_expires_at is not None and found.lease_expires_at < ledger.clock()
         assert _resume(ledger, first_id, "a2") == 0
+
+    def test_beside_opens_next_to_an_open_build(self, ledger: Ledger):
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        first_id, _ = _open(ledger, key)
+        ledger.clock.now += 1  # the newer, so find_open_build returns it
+
+        second_id, second = _open(ledger, key, "a2", beside=True)
+
+        assert (second.build_id, second.attempt) == (second_id, "a2")
+        assert ledger.builds.get_build(first_id).state == "building"
+        assert ledger.builds.find_open_build(key) == second
+
+    @pytest.mark.parametrize("beside", [False, True])
+    def test_an_open_that_fails_leaves_no_build(
+        self, ledger: Ledger, monkeypatch: pytest.MonkeyPatch, beside: bool
+    ):
+        lost = ledger.store.dialect.operational_error
+
+        def dropped(*args: object, **kwargs: object) -> bool:
+            raise lost("the connection dropped")
+
+        monkeypatch.setattr(BuildStore, "open_attempt_within", dropped)
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        build_id = uuid.uuid4().hex
+        with pytest.raises(lost):
+            _open(ledger, key, build_id=build_id, beside=beside)
+
+        assert ledger.builds.get_build(build_id) is None
+
+    @pytest.mark.parametrize("beside", [False, True])
+    def test_a_refused_first_attempt_is_an_error_and_leaves_no_build(
+        self, ledger: Ledger, monkeypatch: pytest.MonkeyPatch, beside: bool
+    ):
+        """A build inserted a moment before cannot be refused: a broken invariant, and no
+        caller may go on to a release its attempt does not hold."""
+        monkeypatch.setattr(BuildStore, "open_attempt_within", lambda *args, **kwargs: False)
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        build_id = uuid.uuid4().hex
+        with pytest.raises(RuntimeError, match="did not open its first attempt"):
+            _open(ledger, key, build_id=build_id, beside=beside)
+
+        assert ledger.builds.get_build(build_id) is None
 
 
 class TestReferencesAndAuthorities:

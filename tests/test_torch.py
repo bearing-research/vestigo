@@ -56,6 +56,7 @@ from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
 from vestigo.torch import (
+    DERIVE_EXECUTOR,
     EXECUTOR,
     Attempt,
     Definition,
@@ -339,6 +340,30 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             }
             assert placeholders.pop(f"torch_{run.execution_id}") == "building"
             assert list(placeholders.values()) == ["failed"]
+
+
+def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.MonkeyPatch):
+    """The create and the open are one transaction, so a database error between them
+    leaves no pending build, which nothing would ever pick up or sweep."""
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    lost = ledger.store.dialect.operational_error
+
+    def dropped(*args: object, **kwargs: object) -> bool:
+        raise lost("the connection dropped")
+
+    monkeypatch.setattr(BuildStore, "open_attempt_within", dropped)
+
+    with pytest.raises(lost, match="the connection dropped"):
+        ledger.start(trainer.program)
+    with pytest.raises(lost, match="the connection dropped"):
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+    assert [b.build_id for b in ledger.builds.builds_of(EXECUTOR)] == [run.execution_id]
+    assert ledger.builds.builds_of(DERIVE_EXECUTOR) == []
 
 
 def test_a_run_whose_found_execution_finished_first_opens_a_new_one(
