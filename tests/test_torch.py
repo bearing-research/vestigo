@@ -474,6 +474,35 @@ def test_an_open_that_committed_before_its_error_keeps_its_placeholder(
     assert _placeholders(ledger) == {build.artifact_id: "building"}
 
 
+def test_a_finish_whose_prepare_reply_was_lost_finishes_when_retried(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The final release was prepared, then the reply lost: left unsettled, it refused the
+    retry as out of order until something resumed the execution."""
+    lost = ledger.store.dialect.operational_error
+    prepare = ReleaseStore.prepare
+    replies = {"lost": 1}
+
+    def committed_then_dropped(self: ReleaseStore, *args, **kwargs) -> Release:
+        release = prepare(self, *args, **kwargs)
+        if release.kind == "final" and replies["lost"]:
+            replies["lost"] -= 1
+            raise lost("the reply was lost")
+        return release
+
+    monkeypatch.setattr(ReleaseStore, "prepare", committed_then_dropped)
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        with pytest.raises(lost, match="the reply was lost"):
+            run.finish()
+        run.finish()
+
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+    finals = ledger.releases.releases_of(run.execution_id, "final")
+    assert [release.state for release in finals] == ["abandoned", "accepted"]
+
+
 def test_a_derivation_whose_prepare_fails_is_failed(
     ledger: Ledger, monkeypatch: pytest.MonkeyPatch
 ):
