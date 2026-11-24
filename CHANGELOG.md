@@ -27,7 +27,7 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Ledger.start` fails the new build and its placeholder when the
   build's first attempt does not open, where it raised and left them pending and
   building. `Ledger.derive` checks that its attempt opened and does the same, where it
-  went on to a release the attempt did not hold.
+  went on to a release the attempt did not hold. (#108)
 
 ## 0.7.0 - 2026-11-21
 
