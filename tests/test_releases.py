@@ -993,6 +993,20 @@ class TestOneOpenExecution:
 
         assert ledger.builds.get_build(build_id) is None
 
+    @pytest.mark.parametrize("beside", [False, True])
+    def test_a_refused_first_attempt_is_an_error_and_leaves_no_build(
+        self, ledger: Ledger, monkeypatch: pytest.MonkeyPatch, beside: bool
+    ):
+        """A build inserted a moment before cannot be refused: a broken invariant, and no
+        caller may go on to a release its attempt does not hold."""
+        monkeypatch.setattr(BuildStore, "open_attempt_within", lambda *args, **kwargs: False)
+        key = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        build_id = uuid.uuid4().hex
+        with pytest.raises(RuntimeError, match="did not open its first attempt"):
+            _open(ledger, key, build_id=build_id, beside=beside)
+
+        assert ledger.builds.get_build(build_id) is None
+
 
 class TestReferencesAndAuthorities:
     """The typed operations a release runs: heads by revision, slots all or none, audit order."""

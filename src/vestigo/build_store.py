@@ -576,7 +576,9 @@ class BuildStore:
 
         With *beside*, the build opens whatever else of the computation is open: no check
         and no lock on the computation, only the create and the open in one transaction,
-        so an open that fails leaves no pending build behind.
+        so an open that fails leaves no pending build behind. Nothing is looked up, so a
+        retry with the same *build_id* raises the integrity error even while its build is
+        open: the caller reads :meth:`get_build` to see whether the first call committed.
 
         Raises:
             RuntimeError: the new build's first attempt did not open.

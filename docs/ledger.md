@@ -202,7 +202,9 @@ open, whose lease may have lapsed, and nothing is written. A caller that retries
 a call whose reply it lost passes the same build id and attempt: the build is its own
 when both come back. With `beside=True` it opens the new build whatever else of the
 computation is open, still in one transaction, so an open that fails leaves no pending
-build behind.
+build behind. It looks nothing up, so there a retry with the same build id raises the
+dialect's integrity error; `builds.get_build(build_id)` says whether the first call
+committed.
 
 An attempt holds the build under a lease, which the worker renews with
 `builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
