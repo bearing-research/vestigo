@@ -563,16 +563,20 @@ class BuildStore:
         :meth:`find_open_build` returns, comes back and nothing is written, or *build_id*
         is created and opened as :meth:`create_build` with ``dispatch="external"`` and
         then :meth:`open_attempt` would. The returned ``build_id`` is *build_id* when this
-        call opened it. A caller that retries with the same *build_id* after a call whose
-        commit it did not see may get its own build back under the earlier call's attempt,
-        so it compares ``attempt`` too and resumes the build when the two differ. An open
-        build whose lease has lapsed is still returned,
-        with its lease, so the caller decides between a resume and a refusal. Another
-        process's build is read under the computation's key, not its own, so it may finish
-        before the caller acts on it.
+        call opened it. An open build whose lease has lapsed is still returned, with its
+        lease, so the caller decides between a resume and a refusal. Another process's
+        build is read under the computation's key, not its own, so it may finish before
+        the caller acts on it.
+
+        A caller that retries a call whose commit it did not see passes the same
+        *build_id* and *attempt*: the build is its own when both come back. With a fresh
+        attempt, its own build would come back held by the earlier call's live lease,
+        which no resume can take until it lapses.
 
         Raises:
             RuntimeError: the new build's first attempt did not open.
+            integrity_error: the dialect's, when *build_id* names a build that is not
+                open, as a retry finds once the earlier call's build has finished.
         """
         conn = self._get_connection()
         try:
