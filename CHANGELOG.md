@@ -27,6 +27,10 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Ledger.derive` raises `RuntimeError` when its first attempt does not
   open, as `Ledger.start` does, where it went on to prepare a release the attempt did
   not hold. (#108)
+- `vestigo.torch`'s `Ledger.start`, `Ledger.branch` and `Ledger.derive` create a build and
+  open its first attempt in one transaction, through `BuildStore.open_build` with the new
+  `beside=True`, which skips the check for an open build. A database error between the
+  two used to leave a `pending` external build that nothing picks up or sweeps. (#PR)
 
 ## 0.7.0 - 2026-11-21
 

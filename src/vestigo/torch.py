@@ -1350,28 +1350,6 @@ class Ledger:
             checkpointing,
         )
 
-    def _new_build(
-        self,
-        key: str,
-        spec: TransformSpec,
-        executor: str,
-        label: str,
-        definition: Sequence[NodeSpec] = (),
-    ) -> tuple[str, str, int]:
-        """A new build of the computation *key* under *executor*, pending: its id, and its
-        placeholder's id and version."""
-        build_id, placeholder, version = self._placeholder(key, spec, label, definition)
-        self.builds.create_build(
-            build_id,
-            placeholder,
-            version,
-            executor_ref=executor,
-            params=spec.params,
-            computation_key=key,
-            dispatch="external",
-        )
-        return build_id, placeholder, version
-
     def _placeholder(
         self, key: str, spec: TransformSpec, label: str, definition: Sequence[NodeSpec] = ()
     ) -> tuple[str, str, int]:
@@ -1451,17 +1429,22 @@ class Ledger:
                 self.store.fail_artifact(placeholder, version)
                 return self._resume(build.build_id, None, inputs, checkpointing, ranks)
         else:
-            build_id, placeholder, version = self._new_build(
-                key, spec, EXECUTOR, "run", definition=[program.spec]
+            build_id, placeholder, version = self._placeholder(
+                key, spec, "run", definition=[program.spec]
             )
-            if not self.builds.open_attempt(
+            self.builds.open_build(
                 build_id,
+                placeholder,
+                version,
                 attempt,
+                computation_key=key,
+                executor_ref=EXECUTOR,
                 writable_until=now + self.config.writable_seconds,
                 lease_owner=attempt,
                 lease_duration_seconds=self.lease_seconds,
-            ):
-                raise RuntimeError(f"execution {build_id} did not open its first attempt")
+                params=spec.params,
+                beside=True,
+            )
         checkpoints = _Checkpoints(
             self.config, build_id, attempt, key, program.spec, inputs=inputs.held
         )
@@ -1866,18 +1849,23 @@ class Ledger:
         self._refuse_later(prefix, source, name)
         key, spec = self._derivation(from_release, name)
 
-        build_id, placeholder, target = self._new_build(key, spec, DERIVE_EXECUTOR, "derived")
+        build_id, placeholder, target = self._placeholder(key, spec, "derived")
         attempt = uuid.uuid4().hex
         # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
         # however long the uploads take.
-        if not self.builds.open_attempt(
+        self.builds.open_build(
             build_id,
+            placeholder,
+            target,
             attempt,
+            computation_key=key,
+            executor_ref=DERIVE_EXECUTOR,
             writable_until=time.time() + self.config.writable_seconds,
             lease_owner=attempt,
             lease_duration_seconds=self.config.writable_seconds,
-        ):
-            raise RuntimeError(f"derivation {build_id} did not open its first attempt")
+            params=spec.params,
+            beside=True,
+        )
         release = self.releases.prepare(build_id, attempt, "final")
         created: list[tuple[str, int]] = []
         try:

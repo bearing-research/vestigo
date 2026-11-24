@@ -56,6 +56,7 @@ from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
 from vestigo.torch import (
+    DERIVE_EXECUTOR,
     EXECUTOR,
     Attempt,
     Definition,
@@ -334,22 +335,28 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             assert builds == {run.execution_id: "building"}
 
 
-def test_a_first_attempt_that_does_not_open_is_an_error(
-    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
-):
-    """A build created a moment before cannot be refused, so a refusal is a broken
-    invariant: a derivation must not go on to a release its attempt does not hold."""
+def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.MonkeyPatch):
+    """The create and the open are one transaction, so a database error between them
+    leaves no pending build, which nothing would ever pick up or sweep."""
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
         trainer.train(run, 1)
         source = run.release_of(1).release_id
         run.finish()
-    monkeypatch.setattr(BuildStore, "open_attempt", lambda *args, **kwargs: False)
+    lost = ledger.store.dialect.operational_error
 
-    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+    def dropped(*args: object, **kwargs: object) -> bool:
+        raise lost("the connection dropped")
+
+    monkeypatch.setattr(BuildStore, "open_attempt_within", dropped)
+
+    with pytest.raises(lost, match="the connection dropped"):
         ledger.start(trainer.program)
-    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+    with pytest.raises(lost, match="the connection dropped"):
         ledger.derive(source, "eval", {"metrics": b"1"})
+
+    assert [b.build_id for b in ledger.builds.builds_of(EXECUTOR)] == [run.execution_id]
+    assert ledger.builds.builds_of(DERIVE_EXECUTOR) == []
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):

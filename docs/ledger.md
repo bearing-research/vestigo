@@ -200,7 +200,9 @@ It returns the computation's open build at that `occurrence` for that `tenant_id
 is the new build when this call opened it. Otherwise it is the build that was already
 open, whose lease may have lapsed, and nothing is written. A caller that retries after
 a call whose reply it lost passes the same build id and attempt: the build is its own
-when both come back.
+when both come back. With `beside=True` it opens the new build whatever else of the
+computation is open, still in one transaction, so an open that fails leaves no pending
+build behind.
 
 An attempt holds the build under a lease, which the worker renews with
 `builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that

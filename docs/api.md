@@ -43,7 +43,8 @@ The package exports nothing at its top level; a consumer imports each module.
   the builds with their leases and attempts (`create_build`, `open_attempt` with
   the attempt's `principal`, `open_attempt_within`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `open_build` (an external build with its first attempt open, unless
-  one of its computation is open, which it returns instead), `complete_attempt_within`,
+  one of its computation is open, which it returns instead; with `beside`, whatever is
+  open), `complete_attempt_within`,
   `list_runnable_builds` for the builds whose `dispatch` is `runner`; the lineage reads `builds_of(executor_ref)`,
   `attempts_of(build_id)` and `attempts_resumed_from(release_id)`); a runner's
   steps (`claim_build`, `start_build`, `update_build_output`, `complete_build`,
