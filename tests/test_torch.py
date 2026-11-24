@@ -334,6 +334,24 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             assert builds == {run.execution_id: "building"}
 
 
+def test_a_first_attempt_that_does_not_open_is_an_error(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """A build created a moment before cannot be refused, so a refusal is a broken
+    invariant: a derivation must not go on to a release its attempt does not hold."""
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    monkeypatch.setattr(BuildStore, "open_attempt", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+        ledger.start(trainer.program)
+    with pytest.raises(RuntimeError, match="did not open its first attempt"):
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:

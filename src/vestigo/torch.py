@@ -1870,13 +1870,14 @@ class Ledger:
         attempt = uuid.uuid4().hex
         # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
         # however long the uploads take.
-        self.builds.open_attempt(
+        if not self.builds.open_attempt(
             build_id,
             attempt,
             writable_until=time.time() + self.config.writable_seconds,
             lease_owner=attempt,
             lease_duration_seconds=self.config.writable_seconds,
-        )
+        ):
+            raise RuntimeError(f"derivation {build_id} did not open its first attempt")
         release = self.releases.prepare(build_id, attempt, "final")
         created: list[tuple[str, int]] = []
         try:

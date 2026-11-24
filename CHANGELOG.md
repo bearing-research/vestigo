@@ -22,6 +22,12 @@ All notable changes to vestigo are recorded here. The format follows
   `open-build/<key>`, not `vestigo-torch/<key>`, so a 0.7.0 process and a newer one on
   one store do not serialize their opens: upgrade every process together. (#106)
 
+### Fixed
+
+- `vestigo.torch`'s `Ledger.derive` raises `RuntimeError` when its first attempt does not
+  open, as `Ledger.start` does, where it went on to prepare a release the attempt did
+  not hold. (#108)
+
 ## 0.7.0 - 2026-11-21
 
 ### Changed
