@@ -125,7 +125,7 @@ class CollectResult(GcResult):
 
 EXECUTOR = "vestigo.torch/train@v1"
 DERIVE_EXECUTOR = "vestigo.torch/derive@v1"
-# How many times a run opens again when the open execution it found finished first.
+# How many opens a run tries when each finds an execution that finishes before its resume.
 _OPEN_ROUNDS = 3
 MODEL_DOMAIN = "torch/model"
 PROGRAM_DOMAIN = "torch/training-program"
@@ -1215,7 +1215,8 @@ class Ledger:
                 ``lease_seconds`` ago), *from_release* is not an accepted checkpoint, or
                 a rank's model, program, inputs or *from_release* are not rank 0's.
             InputChanged: a rank's copy of a ``Path`` input has other bytes.
-            RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up.
+            RuntimeError: ``WORLD_SIZE`` names several ranks and the group is not up, or
+                each of three opens found an execution that finished before its resume.
         """
         model_payload = _model_payload(model, version)
         program_payload = _program_payload(loss, optimizer, config)
@@ -1436,12 +1437,14 @@ class Ledger:
         attempt = uuid.uuid4().hex
         now = time.time()
         if alone:
-            build_id, placeholder, version = self._placeholder(
-                key, spec, "run", definition=[program.spec]
-            )
             # An open build that finishes before its resume leaves the computation free:
-            # open again, with the same id and placeholder, since nothing was written.
+            # open again. Each round's placeholder is failed before the resume, so a
+            # refusal or an error in it leaves none building.
             for _ in range(_OPEN_ROUNDS):
+                build_id, placeholder, version = self._placeholder(
+                    key, spec, "run", definition=[program.spec]
+                )
+                now = time.time()
                 build = self.builds.open_build(
                     build_id,
                     placeholder,
@@ -1456,14 +1459,14 @@ class Ledger:
                 )
                 if build.build_id == build_id:
                     break
+                self.store.fail_artifact(placeholder, version)
                 run = self._resume_unfinished(build.build_id, inputs, checkpointing, ranks)
                 if run is not None:
-                    self.store.fail_artifact(placeholder, version)
                     return run
             else:
-                self.store.fail_artifact(placeholder, version)
                 raise RuntimeError(
-                    f"computation {key}: {_OPEN_ROUNDS} executions finished as this one opened"
+                    f"computation {key}: {_OPEN_ROUNDS} opens each found an execution that "
+                    "finished before its resume"
                 )
         else:
             build_id, placeholder, version = self._new_build(

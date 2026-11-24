@@ -329,9 +329,16 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
             # The other found the first one's execution as it opened, and its lease live.
             [refused] = [each for each in outcomes if isinstance(each, ValueError)]
             assert "lease on it is live" in str(refused)
-            # The other wrote no build of its own.
+            # The other wrote no build of its own, and failed its placeholder.
             builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
             assert builds == {run.execution_id: "building"}
+            placeholders = {
+                v.id: v.state
+                for v in ledger.store.list_versions_by_id_prefix("torch_")
+                if v.computation_key == run.computation_key
+            }
+            assert placeholders.pop(f"torch_{run.execution_id}") == "building"
+            assert list(placeholders.values()) == ["failed"]
 
 
 def test_a_run_whose_found_execution_finished_first_opens_a_new_one(
