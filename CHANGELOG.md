@@ -30,7 +30,7 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Ledger.start`, `Ledger.branch` and `Ledger.derive` create a build and
   open its first attempt in one transaction, through `BuildStore.open_build` with the new
   `beside=True`, which skips the check for an open build. A database error between the
-  two used to leave a `pending` external build that nothing picks up or sweeps. (#PR)
+  two used to leave a `pending` external build that nothing picks up or sweeps. (#110)
 
 ## 0.7.0 - 2026-11-21
 
