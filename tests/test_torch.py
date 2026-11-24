@@ -550,6 +550,35 @@ def test_a_derivation_whose_cleanup_fails_raises_its_own_error(
     assert any("the database is down" in note for note in raised.value.__notes__)
 
 
+def test_a_finish_whose_accept_reply_was_lost_is_finished_when_retried(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The final release was accepted, then the reply lost: the retry finds it accepted."""
+    lost = ledger.store.dialect.operational_error
+    accept = ReleaseStore.accept
+    replies = {"lost": 1}
+
+    def committed_then_dropped(self: ReleaseStore, release_id: str, *args, **kwargs):
+        bundle = accept(self, release_id, *args, **kwargs)
+        if bundle.release.kind == "final" and replies["lost"]:
+            replies["lost"] -= 1
+            raise lost("the reply was lost")
+        return bundle
+
+    monkeypatch.setattr(ReleaseStore, "accept", committed_then_dropped)
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        with pytest.raises(lost, match="the reply was lost"):
+            run.finish()
+        run.finish()
+        assert run.finished
+
+    assert ledger.builds.get_build(run.execution_id).state == "ready"
+    finals = ledger.releases.releases_of(run.execution_id, "final")
+    assert [release.state for release in finals] == ["accepted"]
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:

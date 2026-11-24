@@ -3053,6 +3053,13 @@ class Run:
         return tuple(each for each in self._checkpoints.inputs if each.remote is None)
 
     def _finish(self, everyone: Sequence[Mapping[str, Any]]) -> None:
+        finals = self.ledger.releases.releases_of(self.execution_id, "final")
+        if any(each.attempt == self.attempt and each.state == "accepted" for each in finals):
+            # An accept that committed before its reply was lost: the run has finished.
+            with self._renewing:
+                self.finished = True
+                self._stop.set()
+            return
         local = replace(self._checkpoints, inputs=self._local)
         for rank, seen in enumerate(everyone):
             where = "now" if len(everyone) == 1 else f"now on rank {rank}"
@@ -3068,7 +3075,7 @@ class Run:
         operations = [AdvanceReference(f"{ROOT}/{self.execution_id}", ended_on)] if ended_on else []
         # As before a checkpoint: a final release this attempt prepared whose reply was
         # lost is unsettled, and would refuse this one as out of order.
-        for stale in self.ledger.releases.releases_of(self.execution_id, "final"):
+        for stale in finals:
             if stale.attempt == self.attempt and stale.state in UNSETTLED:
                 self.ledger.releases.abandon(stale.release_id, self.attempt)
         release = self.ledger.releases.prepare(self.execution_id, self.attempt, "final")

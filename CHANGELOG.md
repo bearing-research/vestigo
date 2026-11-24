@@ -45,6 +45,9 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Run.finish` abandons a final release its own attempt left unsettled
   before preparing another, as a checkpoint does. A prepare whose reply was lost left it
   `preparing`, and a retried `finish` was refused as out of order until a resume. (#113)
+- `vestigo.torch`'s `Run.finish`, retried after its final release was accepted but the
+  reply lost, finds that release and finishes, where it raised `ReleaseRejected` and
+  left the run unfinished with its lease still renewing. (#PR)
 
 ## 0.7.0 - 2026-11-21
 
