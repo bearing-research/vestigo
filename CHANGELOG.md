@@ -47,7 +47,7 @@ All notable changes to vestigo are recorded here. The format follows
   `preparing`, and a retried `finish` was refused as out of order until a resume. (#113)
 - `vestigo.torch`'s `Run.finish`, retried after its final release was accepted but the
   reply lost, finds that release and finishes, where it raised `ReleaseRejected` and
-  left the run unfinished with its lease still renewing. (#114)
+  left the run unfinished. A second `finish` likewise returns. (#114)
 
 ## 0.7.0 - 2026-11-21
 

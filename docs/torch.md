@@ -233,7 +233,8 @@ a crash](#resume-after-a-crash)).
 
 **`run.finish()`** ends the execution: nothing resumes it, and the checkpoint it ended
 on stays. Run the script a third time and it trains from scratch as a new execution;
-the finished one stays in the ledger.
+the finished one stays in the ledger. Calling `finish()` again returns, so a retry after
+an error whose finish did commit is safe.
 
 **`ledger.execution(...)` and `ledger.final_checkpoint(...)`** read back what the
 ledger recorded: here two attempts of one execution, and the checkpoint it finished on.

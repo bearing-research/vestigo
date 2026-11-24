@@ -3020,7 +3020,9 @@ class Run:
 
         Waits first for the save in flight, which lands as a release before the final one;
         if it failed, its future reported why, and the run ends on its last accepted
-        checkpoint. In a process group every rank calls it, and rank 0 releases.
+        checkpoint. In a process group every rank calls it, and rank 0 releases. Called
+        again once this attempt's final release is accepted (a retry after its reply was
+        lost, or a second call), it returns.
 
         Raises:
             ReleaseRejected: this attempt no longer holds the execution.

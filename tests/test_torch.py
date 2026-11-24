@@ -572,7 +572,7 @@ def test_a_finish_whose_accept_reply_was_lost_is_finished_when_retried(
         with pytest.raises(lost, match="the reply was lost"):
             run.finish()
         run.finish()
-        assert run.finished
+        assert run._stop.is_set(), "the renewal stops with the finish"
 
     assert ledger.builds.get_build(run.execution_id).state == "ready"
     finals = ledger.releases.releases_of(run.execution_id, "final")
