@@ -51,7 +51,7 @@ import vestigo.digests
 import vestigo.torch
 from vestigo import checkpoint_files
 from vestigo.blob_store import BlobSettings
-from vestigo.build_store import BuildStore
+from vestigo.build_store import BuildState, BuildStore
 from vestigo.provenance import TransformSpec, compute_provenance_hash
 from vestigo.releases import Release, ReleaseRejected, ReleaseStore
 from vestigo.store import ArtifactStore, BuildLeaseLost, StagedVersion
@@ -344,7 +344,8 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
 
 def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.MonkeyPatch):
     """The create and the open are one transaction, so a database error between them
-    leaves no pending build, which nothing would ever pick up or sweep."""
+    leaves no pending build, which nothing would ever pick up or sweep; and the
+    placeholder committed before them is failed, which nothing would sweep either."""
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
         trainer.train(run, 1)
@@ -361,9 +362,14 @@ def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.
         ledger.start(trainer.program)
     with pytest.raises(lost, match="the connection dropped"):
         ledger.derive(source, "eval", {"metrics": b"1"})
+    with pytest.raises(lost, match="the connection dropped"):
+        _run(ledger, Trainer(ledger))
 
     assert [b.build_id for b in ledger.builds.builds_of(EXECUTOR)] == [run.execution_id]
     assert ledger.builds.builds_of(DERIVE_EXECUTOR) == []
+    placeholders = [v for v in ledger.store.list_versions_by_id_prefix("torch_") if "@" not in v.id]
+    assert len(placeholders) == 4  # the run's, then start's, derive's and run's
+    assert {v.state for v in placeholders} == {"failed"}
 
 
 def test_a_run_whose_found_execution_finished_first_opens_a_new_one(
@@ -409,6 +415,63 @@ def test_a_run_whose_opened_against_execution_finished_first_opens_again(
         assert again.execution_id != first.execution_id
         builds = {b.build_id: b.state for b in ledger.builds.builds_of(EXECUTOR)}
         assert builds == {first.execution_id: "failed", again.execution_id: "building"}
+
+
+def _placeholders(ledger: Ledger) -> dict[str, str]:
+    """Each torch placeholder's state, by id: a build's target, named by its build."""
+    return {
+        v.id: v.state for v in ledger.store.list_versions_by_id_prefix("torch_") if "@" not in v.id
+    }
+
+
+def test_an_interrupted_open_fails_its_placeholder(ledger: Ledger, monkeypatch: pytest.MonkeyPatch):
+    def interrupted(*args: object, **kwargs: object) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(BuildStore, "open_attempt_within", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        ledger.start(Trainer(ledger).program)
+
+    assert list(_placeholders(ledger).values()) == ["failed"]
+
+
+def test_an_open_whose_cleanup_fails_raises_its_own_error(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    lost = ledger.store.dialect.operational_error
+
+    def dropped(*args: object, **kwargs: object) -> bool:
+        raise lost("the connection dropped")
+
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise lost("the database is down")
+
+    monkeypatch.setattr(BuildStore, "open_attempt_within", dropped)
+    monkeypatch.setattr(ArtifactStore, "fail_artifact", unreachable)
+    with pytest.raises(lost, match="the connection dropped") as raised:
+        ledger.start(Trainer(ledger).program)
+
+    assert any("the database is down" in note for note in raised.value.__notes__)
+
+
+def test_an_open_that_committed_before_its_error_keeps_its_placeholder(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The reply was lost after the commit: the build is open on its target."""
+    lost = ledger.store.dialect.operational_error
+    open_build = BuildStore.open_build
+
+    def committed_then_dropped(self: BuildStore, *args, **kwargs) -> BuildState:
+        open_build(self, *args, **kwargs)
+        raise lost("the reply was lost")
+
+    monkeypatch.setattr(BuildStore, "open_build", committed_then_dropped)
+    with pytest.raises(lost):
+        ledger.start(Trainer(ledger).program)
+
+    [build] = ledger.builds.builds_of(EXECUTOR)
+    assert build.state == "building"
+    assert _placeholders(ledger) == {build.artifact_id: "building"}
 
 
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):

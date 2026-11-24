@@ -34,6 +34,11 @@ All notable changes to vestigo are recorded here. The format follows
 - `vestigo.torch`'s `Ledger.run` starts a new execution when the unfinished one it found
   finishes before its resume, as a run over only finished executions does, where it
   raised `ValueError`. It tries at most 3 opens. (#109)
+- `vestigo.torch` fails a new build's placeholder when `open_build` raises. The
+  placeholder is committed before the open, so a database error or an interrupt left it
+  `building`, and `Ledger.collect` never sweeps a building placeholder no build names.
+  The open's own error is the one raised, and a placeholder a committed build targets is
+  left alone. (#111)
 
 ## 0.7.0 - 2026-11-21
 

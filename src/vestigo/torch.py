@@ -1355,6 +1355,23 @@ class Ledger:
             checkpointing,
         )
 
+    def _open_build(
+        self, build_id: str, placeholder: str, version: int, attempt: str, **kwargs: Any
+    ) -> BuildState:
+        """:meth:`BuildStore.open_build` of a new build targeting *placeholder*, failed when
+        the open raises and no build names it: it was committed first, and
+        :meth:`collect` never sweeps a building placeholder no build names."""
+        try:
+            return self.builds.open_build(build_id, placeholder, version, attempt, **kwargs)
+        except BaseException as error:
+            try:
+                # An open whose commit landed before the error has a build on it.
+                if self.builds.get_build(build_id) is None:
+                    self.store.fail_artifact(placeholder, version)
+            except Exception as cleanup:
+                error.add_note(f"placeholder {placeholder} v{version} is left: {cleanup!r}")
+            raise
+
     def _placeholder(
         self, key: str, spec: TransformSpec, label: str, definition: Sequence[NodeSpec] = ()
     ) -> tuple[str, str, int]:
@@ -1423,7 +1440,7 @@ class Ledger:
                     key, spec, "run", definition=[program.spec]
                 )
                 now = time.time()
-                build = self.builds.open_build(
+                build = self._open_build(
                     build_id,
                     placeholder,
                     version,
@@ -1450,7 +1467,7 @@ class Ledger:
             build_id, placeholder, version = self._placeholder(
                 key, spec, "run", definition=[program.spec]
             )
-            self.builds.open_build(
+            self._open_build(
                 build_id,
                 placeholder,
                 version,
@@ -1894,7 +1911,7 @@ class Ledger:
         attempt = uuid.uuid4().hex
         # Nothing resumes or reclaims a derivation, so its lease lasts its write window,
         # however long the uploads take.
-        self.builds.open_build(
+        self._open_build(
             build_id,
             placeholder,
             target,
