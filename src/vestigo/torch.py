@@ -1359,11 +1359,17 @@ class Ledger:
         self, build_id: str, placeholder: str, version: int, attempt: str, **kwargs: Any
     ) -> BuildState:
         """:meth:`BuildStore.open_build` of a new build targeting *placeholder*, failed when
-        the open raises: it was committed first, and nothing sweeps one no build names."""
+        the open raises and no build names it: it was committed first, and
+        :meth:`collect` never sweeps a building placeholder no build names."""
         try:
             return self.builds.open_build(build_id, placeholder, version, attempt, **kwargs)
-        except Exception:
-            self.store.fail_artifact(placeholder, version)
+        except BaseException as error:
+            try:
+                # An open whose commit landed before the error has a build on it.
+                if self.builds.get_build(build_id) is None:
+                    self.store.fail_artifact(placeholder, version)
+            except Exception as cleanup:
+                error.add_note(f"placeholder {placeholder} v{version} is left: {cleanup!r}")
             raise
 
     def _placeholder(
