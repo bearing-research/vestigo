@@ -344,7 +344,8 @@ def test_two_runs_that_both_found_nothing_to_resume_open_one_execution(
 
 def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.MonkeyPatch):
     """The create and the open are one transaction, so a database error between them
-    leaves no pending build, which nothing would ever pick up or sweep."""
+    leaves no pending build, which nothing would ever pick up or sweep; and the
+    placeholder committed before them is failed, which nothing would sweep either."""
     trainer = Trainer(ledger)
     with ledger.start(trainer.program) as run:
         trainer.train(run, 1)
@@ -361,9 +362,14 @@ def test_an_open_that_fails_leaves_no_build(ledger: Ledger, monkeypatch: pytest.
         ledger.start(trainer.program)
     with pytest.raises(lost, match="the connection dropped"):
         ledger.derive(source, "eval", {"metrics": b"1"})
+    with pytest.raises(lost, match="the connection dropped"):
+        _run(ledger, Trainer(ledger))
 
     assert [b.build_id for b in ledger.builds.builds_of(EXECUTOR)] == [run.execution_id]
     assert ledger.builds.builds_of(DERIVE_EXECUTOR) == []
+    placeholders = [v for v in ledger.store.list_versions_by_id_prefix("torch_") if "@" not in v.id]
+    assert len(placeholders) == 4  # the run's, then start's, derive's and run's
+    assert {v.state for v in placeholders} == {"failed"}
 
 
 def test_a_run_whose_found_execution_finished_first_opens_a_new_one(
