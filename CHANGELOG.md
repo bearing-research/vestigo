@@ -36,7 +36,7 @@ All notable changes to vestigo are recorded here. The format follows
   raised `ValueError`. It tries at most 3 opens. (#109)
 - `vestigo.torch` fails a new build's placeholder when `open_build` raises. The
   placeholder is committed before the open, so a database error left it `building`, and
-  `Ledger.collect` never sweeps a placeholder no build names. (#PR)
+  `Ledger.collect` never sweeps a placeholder no build names. (#111)
 
 ## 0.7.0 - 2026-11-21
 
