@@ -575,8 +575,8 @@ class BuildStore:
 
         Raises:
             RuntimeError: the new build's first attempt did not open.
-            integrity_error: the dialect's, when *build_id* names a build that is not
-                open, as a retry finds once the earlier call's build has finished.
+            integrity_error: the dialect's, when no build of the computation is open and
+                *build_id* is taken, as a retry finds once the earlier call's build finished.
         """
         conn = self._get_connection()
         try:
