@@ -1951,14 +1951,17 @@ class Ledger:
                 for (artifact_id, version), value in zip(created, outputs.values(), strict=True)
             ]
             return self.releases.accept(release.release_id, staged)
-        except BaseException:
-            if release is not None:
-                self.releases.abandon(release.release_id, attempt)
-            for artifact_id, version in created:
-                self.store.fail_artifact(artifact_id, version)
-            # Failed, not left building: nothing would ever settle it.
-            self.store.fail_artifact(placeholder, target)
-            self.builds.fail_build(build_id, "derivation failed", lease_owner=attempt)
+        except BaseException as error:
+            try:
+                if release is not None:
+                    self.releases.abandon(release.release_id, attempt)
+                for artifact_id, version in created:
+                    self.store.fail_artifact(artifact_id, version)
+                # Failed, not left building: nothing would ever settle it.
+                self.store.fail_artifact(placeholder, target)
+                self.builds.fail_build(build_id, "derivation failed", lease_owner=attempt)
+            except Exception as cleanup:
+                error.add_note(f"derivation {build_id} is left unsettled: {cleanup!r}")
             raise
 
     def _refuse_later(

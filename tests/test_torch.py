@@ -497,6 +497,30 @@ def test_a_derivation_whose_prepare_fails_is_failed(
     assert ledger.store.get_artifact(build.artifact_id, build.version).state == "failed"
 
 
+def test_a_derivation_whose_cleanup_fails_raises_its_own_error(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    trainer = Trainer(ledger)
+    with ledger.start(trainer.program) as run:
+        trainer.train(run, 1)
+        source = run.release_of(1).release_id
+        run.finish()
+    lost = ledger.store.dialect.operational_error
+
+    def dropped(*args: object, **kwargs: object) -> Release:
+        raise lost("the connection dropped")
+
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise lost("the database is down")
+
+    monkeypatch.setattr(ReleaseStore, "prepare", dropped)
+    monkeypatch.setattr(ArtifactStore, "fail_artifact", unreachable)
+    with pytest.raises(lost, match="the connection dropped") as raised:
+        ledger.derive(source, "eval", {"metrics": b"1"})
+
+    assert any("the database is down" in note for note in raised.value.__notes__)
+
+
 def test_a_synchronous_save_returns_its_accepted_release(ledger: Ledger):
     trainer = Trainer(ledger)
     with _run(ledger, trainer) as run:
