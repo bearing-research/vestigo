@@ -6,11 +6,13 @@ artifact store's database.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
 import logging
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -158,6 +160,18 @@ class BlobStore(ABC):
                 if not chunk:
                     break
                 dst.write(chunk)
+
+    def adopt_blob_file(self, artifact_id: str, version: int, source_path: Path) -> None:
+        """Publish a complete local file as the blob and consume it.
+
+        Durable on return, as ``open_blob_writer`` is. The source is gone once this
+        returns and kept if it raises. The default publishes from the path and unlinks
+        the source; the local store renames it into place, so the caller must own it
+        alone: a writable descriptor still open on it could change the blob after it is
+        published. A symlink or a file with another hard link is copied instead.
+        """
+        self.publish_blob_from_path(artifact_id, version, source_path)
+        source_path.unlink()
 
     @abstractmethod
     def delete_blob(self, artifact_id: str, version: int) -> bool:
@@ -316,6 +330,33 @@ class LocalBlobStore(BlobStore):
                 raise
 
         return _writer()
+
+    def adopt_blob_file(self, artifact_id: str, version: int, source_path: Path) -> None:
+        """Rename ``source_path`` into place, moving no bytes; on another filesystem, copy it."""
+        from vestigo.file_modes import PRIVATE_FILE
+
+        path = self._blob_path(artifact_id, version)
+        info = os.lstat(source_path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+            # A rename moves a symlink, not what it names, and keeps a hard link's other
+            # names on the blob's inode; either way the blob could still change.
+            super().adopt_blob_file(artifact_id, version, source_path)
+            return
+        # The mode open_blob_writer's mkstemp gives, whatever the producer's umask left.
+        os.chmod(source_path, PRIVATE_FILE)
+        fd = os.open(source_path, os.O_RDWR)  # Windows fsyncs only a writable descriptor
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.replace(source_path, path)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            super().adopt_blob_file(artifact_id, version, source_path)
+            return
+        _fsync_dir(path.parent)
 
     def blob_exists(self, artifact_id: str, version: int) -> bool:
         """Check if blob exists on local filesystem."""

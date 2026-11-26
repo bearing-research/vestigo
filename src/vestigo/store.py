@@ -3651,6 +3651,16 @@ class ArtifactStore:
         blob_id = attempt_blob_id(artifact_id, attempt) if attempt else artifact_id
         self.blob_store.publish_blob_from_path(blob_id, version, source_path)
 
+    def adopt_blob_file(
+        self, artifact_id: str, version: int, source_path: Path, attempt: str | None = None
+    ) -> None:
+        """Publish a complete local file as the blob and consume it (``BlobStore.adopt_blob_file``).
+
+        Blocking; call via ``anyio.to_thread.run_sync``. A build passes its ``attempt``.
+        """
+        blob_id = attempt_blob_id(artifact_id, attempt) if attempt else artifact_id
+        self.blob_store.adopt_blob_file(blob_id, version, source_path)
+
     def delete_attempt_blob(self, artifact_id: str, version: int, attempt: str) -> None:
         """Remove what a build attempt wrote, once it will never be promoted.
 
