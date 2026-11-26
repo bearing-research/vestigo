@@ -13,7 +13,7 @@ All notable changes to vestigo are recorded here. The format follows
   filesystem are copied and then unlinked, and the object stores upload the file and
   unlink it. The caller must own the file alone: a writable descriptor still open on it
   could change the blob after it is published. `ArtifactStore.adopt_blob_file` takes a
-  build's `attempt`, as `publish_blob_from_path` does. (#117)
+  build's `attempt`, as `publish_blob_from_path` does. (#118)
 
 ## 0.8.0 - 2026-11-24
 
