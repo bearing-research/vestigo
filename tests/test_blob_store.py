@@ -1,11 +1,13 @@
 """Tests for blob storage backends."""
 
+import errno
 import io
 import json
 import os
 import shutil
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -466,6 +468,164 @@ class TestPublishBlobFromPath:
         store.publish_blob_from_path("artifact-1", 1, staging)
 
         assert store.read_blob("artifact-1", 1) == b"v2-bytes"
+
+
+def _shm_source() -> Path | None:
+    """A new file on a tmpfs, or ``None`` where there is none."""
+    shm = Path("/dev/shm")
+    if not shm.is_dir():
+        return None
+    fd, name = tempfile.mkstemp(dir=shm, suffix=".bin")
+    os.close(fd)
+    return Path(name)
+
+
+class TestAdoptBlobFile:
+    def test_the_source_is_renamed_into_place_owner_only(self, tmp_path: Path):
+        """The blob is the source's inode, so no byte was copied, and it is 0600."""
+        store = LocalBlobStore(tmp_path / "blobs")
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"cell output " * 1000)
+        source.chmod(0o644)
+        inode = source.stat().st_ino
+
+        store.adopt_blob_file("artifact-1", 1, source)
+
+        assert not source.exists()
+        assert store.read_blob("artifact-1", 1) == b"cell output " * 1000
+        blob = store._blob_path("artifact-1", 1)
+        assert blob.stat().st_ino == inode
+        if os.name != "nt":
+            assert stat.S_IMODE(blob.stat().st_mode) == 0o600
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="directories cannot be fsynced there")
+    def test_the_file_is_fsynced_before_the_rename_and_the_directory_after(
+        self, tmp_path: Path, monkeypatch
+    ):
+        store = LocalBlobStore(tmp_path / "blobs")
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+        synced: list[tuple[bool, bool]] = []
+        real_fsync = os.fsync
+
+        def recording_fsync(fd):
+            is_dir = stat.S_ISDIR(os.fstat(fd).st_mode)
+            synced.append((is_dir, store.blob_exists("artifact-1", 1)))
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", recording_fsync)
+
+        store.adopt_blob_file("artifact-1", 1, source)
+
+        assert synced == [(False, False), (True, True)]
+
+    def test_a_source_on_another_filesystem_is_copied_and_unlinked(self, tmp_path: Path):
+        source = _shm_source()
+        if source is None:
+            pytest.skip("no tmpfs at /dev/shm")
+        try:
+            if source.stat().st_dev == tmp_path.stat().st_dev:
+                pytest.skip("/dev/shm is on the test directory's filesystem")
+            source.write_bytes(b"from tmpfs")
+            store = LocalBlobStore(tmp_path / "blobs")
+
+            store.adopt_blob_file("artifact-1", 1, source)
+
+            assert not source.exists()
+            assert store.read_blob("artifact-1", 1) == b"from tmpfs"
+        finally:
+            source.unlink(missing_ok=True)
+
+    def test_a_rename_refused_across_devices_copies_and_unlinks(self, tmp_path: Path, monkeypatch):
+        """The same path as a real second filesystem, where the platform has none to hand."""
+        store = LocalBlobStore(tmp_path / "blobs")
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+        real_replace = os.replace
+
+        def cross_device(src, dst):
+            if Path(src) == source:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", cross_device)
+
+        store.adopt_blob_file("artifact-1", 1, source)
+
+        assert not source.exists()
+        assert store.read_blob("artifact-1", 1) == b"payload"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="a symlink needs a privilege there")
+    def test_a_symlinked_source_is_copied_so_the_blob_is_no_link(self, tmp_path: Path):
+        store = LocalBlobStore(tmp_path / "blobs")
+        target = tmp_path / "cache.arrow"
+        target.write_bytes(b"payload")
+        target.chmod(0o644)
+        source = tmp_path / "output.arrow"
+        source.symlink_to(target)
+
+        store.adopt_blob_file("artifact-1", 1, source)
+        target.write_bytes(b"changed")
+
+        blob = store._blob_path("artifact-1", 1)
+        assert not blob.is_symlink()
+        assert store.read_blob("artifact-1", 1) == b"payload"
+        assert not source.is_symlink()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+    def test_a_hard_linked_source_is_copied_so_its_other_name_cannot_change_the_blob(
+        self, tmp_path: Path
+    ):
+        store = LocalBlobStore(tmp_path / "blobs")
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+        other = tmp_path / "other-name.arrow"
+        os.link(source, other)
+
+        store.adopt_blob_file("artifact-1", 1, source)
+        with open(other, "r+b") as f:
+            f.write(b"CHANGED")
+
+        assert not source.exists()
+        assert store.read_blob("artifact-1", 1) == b"payload"
+
+    def test_a_failed_rename_leaves_no_blob_and_keeps_the_source(self, tmp_path: Path, monkeypatch):
+        store = LocalBlobStore(tmp_path / "blobs")
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+
+        def refused(src, dst):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr(os, "replace", refused)
+
+        with pytest.raises(PermissionError):
+            store.adopt_blob_file("artifact-1", 1, source)
+
+        assert not store.blob_exists("artifact-1", 1)
+        assert source.read_bytes() == b"payload"
+
+    def test_an_object_store_uploads_and_unlinks(self, s3_store, tmp_path: Path):
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+
+        s3_store.adopt_blob_file("artifact-1", 1, source)
+
+        assert not source.exists()
+        assert s3_store.read_blob("artifact-1", 1) == b"payload"
+
+    def test_a_failed_upload_keeps_the_source(self, s3_store, tmp_path: Path):
+        source = tmp_path / "output.arrow"
+        source.write_bytes(b"payload")
+
+        def refused(*args, **kwargs):
+            raise _client_error(503, "SlowDown", "PutObject")
+
+        s3_store._client.upload_fileobj = refused
+        with pytest.raises(ClientError, match="SlowDown"):
+            s3_store.adopt_blob_file("artifact-1", 1, source)
+
+        assert source.read_bytes() == b"payload"
 
 
 def _client_error(status: int, code: str, operation: str):

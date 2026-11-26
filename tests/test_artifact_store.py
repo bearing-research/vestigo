@@ -4105,6 +4105,18 @@ class TestPublicCallablesTheSuiteMissed:
 
         assert store.read_blob("filed", version) == _ipc_bytes(3)
 
+    def test_an_adopted_file_is_the_attempt_s_blob_and_is_gone(self, store, tmp_path):
+        version = store.create_artifact("adopted", "prov-a")
+        source = tmp_path / "prepared"
+        source.write_bytes(_ipc_bytes(3))
+        attempt = "ab" * 8
+
+        store.adopt_blob_file("adopted", version, source, attempt=attempt)
+
+        assert not source.exists()
+        assert store.read_blob("adopted", version, attempt) == _ipc_bytes(3)
+        assert store.read_blob("adopted", version) is None
+
     def test_a_revoked_publication_lets_the_version_go(self, store):
         version = _finished(store, "pub", "prov-pub")
         publication = store.publish_artifact("pub", version)

@@ -37,7 +37,11 @@ The package exports nothing at its top level; a consumer imports each module.
   `GCSBlobStore`, `AzureBlobStore`; each object store's `objects(path)` lists a
   key, or a prefix ending in `/`, of its bucket (not under the store's prefix) as
   each object's key, size and a name for its bytes, which `vestigo.torch` pins a
-  `Remote` input to.
+  `Remote` input to. Every store's `adopt_blob_file(artifact_id, version, path)`
+  publishes a complete local file and consumes it; the local store renames it into
+  place (0600, durable on return) and copies a symlink, a hard-linked file or one on
+  another filesystem, so the caller must hold the file alone.
+  `ArtifactStore.adopt_blob_file(..., attempt=None)` does it under a build attempt's key.
 - `vestigo.build_store`: `BuildStore(db_path, dialect=None, clock=time.time)`,
   whose `close()` closes the dialect it made when none was passed,
   the builds with their leases and attempts (`create_build`, `open_attempt` with
