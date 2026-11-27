@@ -272,7 +272,7 @@ start from.
 | --- | --- |
 | `AdvanceReference(name, release_id)` | points a head at an accepted release, which it then retains |
 | `AssertReferenceRevision(name, revision)` | fails unless the head is at that revision (0: absent), guarding an advance after it |
-| `AssignAuthority(target, release_id)` | makes the release the single winner of an output slot |
+| `AssignAuthority(target, release_id)` | makes an accepted release the single winner of an output slot |
 | `CheckBuildLease(build_id, attempt)` | fails unless that attempt holds that build |
 | `InsertAuditEvent(event)` | writes an audit row with the release |
 
