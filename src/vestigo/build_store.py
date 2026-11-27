@@ -3,8 +3,9 @@
 States: ``pending`` -> ``building`` (under a runner's lease) -> ``ready`` or ``failed``.
 
 Every writer of a build's state, owner or attempt runs under the build's write key
-(``begin_write``), so none lands between a release's fence check and its commit;
-``renew_lease``, which only moves the deadline, does not.
+(``begin_write``), so none lands between a release's fence check and its commit.
+``renew_lease``, which only moves the deadline, takes it too, and reads the clock under
+it, so a lease every fence check under the key would call lapsed is never renewed.
 """
 
 from __future__ import annotations
@@ -972,10 +973,18 @@ class BuildStore:
 
         Returns False unless ``lease_owner`` holds it, it has not lapsed and the build
         is building. A lapsed lease stays lapsed: its attempt is fenced for good, and
-        the build goes on only in a new attempt or a reclaim.
+        the build goes on only in a new attempt or a reclaim. It has lapsed by the clock
+        read once this holds the build's key, so time spent waiting for the key counts:
+        renew well before the deadline. Every process sharing the ledger must read the
+        same clock (synchronized hosts): one running behind could renew a lease another
+        has already called lapsed.
         """
         conn = self._get_connection()
         try:
+            # Read under the key, where every fence is decided. A reading taken before
+            # the wait could predate a lapse a fence check acted on meanwhile, and the
+            # renewal would revive the fenced attempt.
+            self._dialect.begin_write(conn, build_id)
             now = self._clock()
             lease_expires_at = now + lease_duration_seconds
             cursor = conn.execute(
@@ -997,11 +1006,11 @@ class BuildStore:
     def lapse_lease(self, build_id: str, lease_owner: str) -> bool:
         """End ``lease_owner``'s lease now, for good, from any thread or process.
 
-        Unlike a renewal to zero seconds, a renewal that read the clock first cannot
-        revive it: the lease has no owner left to renew. Under the build's key, so it
-        waits for an acceptance or an attempt opening that already holds the lease, and
-        either fences what follows. Returns False unless ``lease_owner`` holds it and
-        the build is building.
+        Unlike a renewal to zero seconds, which leaves the lease live through its
+        deadline, it clears the owner, so no later renewal can take it up again. Under
+        the build's key, so it waits for an acceptance or an attempt opening that already
+        holds the lease, and either fences what follows. Returns False unless
+        ``lease_owner`` holds it and the build is building.
         """
         conn = self._get_connection()
         try:

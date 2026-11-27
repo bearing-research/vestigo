@@ -11,6 +11,7 @@ SQLite and on Postgres. Nothing here imports Strata.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -680,6 +681,74 @@ class TestAttemptsAndFences:
         assert not ledger.builds.renew_lease(build_id, "runner-1", 60.0)
         with pytest.raises(ReleaseRejected):
             ledger.releases.prepare(build_id, "a2", "checkpoint")
+
+    def test_a_renewal_reads_the_clock_under_the_build_s_key(self, ledger: Ledger, monkeypatch):
+        """A reading taken before the key could predate a lapse an acceptance fenced on,
+        and the renewal would revive the lease of an attempt whose release was rejected."""
+        build_id = _build(ledger)
+        order: list[str] = []
+        begin_write = ledger.builds._dialect.begin_write
+        clock = ledger.builds._clock
+
+        def locking(conn, key):
+            begin_write(conn, key)
+            order.append(f"lock {key}")
+
+        def reading():
+            order.append("clock")
+            return clock()
+
+        monkeypatch.setattr(ledger.builds._dialect, "begin_write", locking)
+        monkeypatch.setattr(ledger.builds, "_clock", reading)
+
+        assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+        assert order == [f"lock {build_id}", "clock"]
+
+    def test_a_renewal_queued_for_the_key_past_the_deadline_is_refused(self, ledger: Ledger):
+        """Any fence check that held the key meanwhile saw the lease lapsed, so it stays so."""
+        build_id = _build(ledger)
+        ledger.clock.now += 59
+        clock = ledger.builds._clock
+        read = threading.Event()
+
+        def reading():
+            value = clock()
+            read.set()
+            return value
+
+        outcome: dict[str, object] = {}
+
+        def renew() -> None:
+            try:
+                outcome["renewed"] = ledger.builds.renew_lease(build_id, "runner-1", 600.0)
+            except Exception as exc:
+                outcome["raised"] = exc
+
+        with _another_process(ledger) as other:
+            holder = other.store.dialect.connect()
+            try:
+                other.store.dialect.begin_write(holder, build_id)
+                if other.store.dialect.name != "sqlite":
+                    # The row too: a renewal outside the key would queue on it instead.
+                    holder.execute(
+                        "SELECT 1 FROM artifact_builds WHERE build_id = ? FOR UPDATE", (build_id,)
+                    )
+                ledger.builds._clock = reading
+                renewer = threading.Thread(target=renew)
+                renewer.start()
+                # A renewal that reads the clock before queuing has read it by now.
+                read.wait(0.5)
+                ledger.clock.now += 2  # past the deadline while it waits
+            finally:
+                holder.commit()
+                holder.close()
+            renewer.join(10)
+            ledger.builds._clock = clock
+
+        assert not renewer.is_alive()
+        assert outcome == {"renewed": False}
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.prepare(build_id, "a1", "checkpoint")
 
     def test_only_its_own_attempt_abandons_attaches_or_marks_a_release(self, ledger: Ledger):
         build_id = _build(ledger)

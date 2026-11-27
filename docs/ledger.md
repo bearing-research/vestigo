@@ -207,8 +207,10 @@ dialect's integrity error; `builds.get_build(build_id)` says whether the first c
 committed.
 
 An attempt holds the build under a lease, which the worker renews with
-`builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
-lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
+`builds.renew_lease(build_id, lease_owner)` well inside its duration. A renewal takes
+the build's write lock and reads the clock once it holds it, as an acceptance does, so
+time spent waiting for the lock counts against the lease; every host must keep its clock
+synchronized. A lease that lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
 and its releases are rejected, so the build goes on only in a new attempt (a resume)
 or a reclaim. An attempt a resume or a reclaim took the build from cannot be opened
 again either, even once its successor's lease lapses. `builds.lapse_lease(build_id,
