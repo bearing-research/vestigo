@@ -165,7 +165,7 @@ builds.create_build(
 builds.open_attempt(
     build_id,
     "worker-1",
-    writable_until=time.time() + 3600,
+    writable_until=builds.now() + 3600,
     lease_owner="worker-1",
     lease_duration_seconds=60,
 )
@@ -188,7 +188,7 @@ build = builds.open_build(
     "worker-1",
     computation_key=key,
     executor_ref="train@v1",
-    writable_until=time.time() + 3600,
+    writable_until=builds.now() + 3600,
     lease_owner="worker-1",
 )
 if build.build_id != build_id:
@@ -211,8 +211,16 @@ An attempt holds the build under a lease, which the worker renews with
 optional `attempt=attempt` keeps a fenced attempt's heartbeat from renewing a successor
 that shares its owner. A renewal takes
 the build's write lock and reads the clock once it holds it, as an acceptance does, so
-time spent waiting for the lock counts against the lease; every host must keep its clock
-synchronized. A lease that lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
+time spent waiting for the lock counts against the lease. Every lease and write-window
+decision reads `builds.now()`: the database server's clock on Postgres, so hosts whose
+clocks disagree still agree on when a lease lapses (SQLite's is the one host's). Take
+`writable_until` from it too, as above: a deadline from a host's own clock is off by that
+host's skew. Housekeeping still reads each host's clock and is off by the same skew:
+`cleanup_failed(max_age_seconds=)` and `sweep_zombie_builds`'s age cutoff,
+`garbage_collect`'s idle floor (`min_idle_seconds`, against a last use an acceptance
+records by the database's clock and other writes by the host's), `settled_attempts`
+(a signed URL's expiry is the signing host's), and the day staged import bytes wait. Keep hosts within seconds of each other and those bounds are seconds off; a lease
+is never decided by them. A lease that lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
 and its releases are rejected, so the build goes on only in a new attempt (a resume)
 or a reclaim. An attempt a resume or a reclaim took the build from cannot be opened
 again either, even once its successor's lease lapses. `builds.lapse_lease(build_id,

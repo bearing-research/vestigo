@@ -90,7 +90,7 @@ def main() -> None:
             "first",
             computation_key=KEY,
             executor_ref="train@v1",
-            writable_until=time.time() + 3600,
+            writable_until=builds.now() + 3600,
             lease_owner="first",
             lease_duration_seconds=1.0,
         )
@@ -107,7 +107,7 @@ def main() -> None:
         releases.resume(
             build_id,
             "second",
-            writable_until=time.time() + 3600,
+            writable_until=builds.now() + 3600,
             lease_owner="second",
             from_release=latest.release_id,
         )

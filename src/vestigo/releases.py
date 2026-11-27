@@ -19,7 +19,6 @@ behind and the release where it was. A release belongs to its build's tenant.
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -174,13 +173,17 @@ class ReleaseStore:
         self,
         artifacts: ArtifactStore,
         builds: BuildStore,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._artifacts = artifacts
         self._builds = builds
         self._clock = clock
         self._connect = artifacts._get_connection
         self._dialect = artifacts.dialect
+
+    def _now(self, conn: StoreConnection) -> float:
+        """The injected clock, else the build store's (:meth:`BuildStore.now`)."""
+        return self._clock() if self._clock is not None else self._builds.now(conn)
 
     # --- Lifecycle ---
 
@@ -212,7 +215,7 @@ class ReleaseStore:
         conn = self._connect()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, build_id, attempt, now):
                 conn.rollback()
                 raise ReleaseRejected(f"attempt {attempt} does not hold build {build_id}")
@@ -362,7 +365,7 @@ class ReleaseStore:
             if release.state not in UNSETTLED:
                 conn.rollback()
                 raise ValueError(f"release {release_id} is {release.state}")
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, release.build_id, release.attempt, now):
                 conn.rollback()
                 self._settle(release_id, "rejected")
@@ -505,7 +508,7 @@ class ReleaseStore:
         conn = self._connect()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if from_release is not None:
                 source = self._get_on(conn, from_release)
                 if source is None or source.build_id != build_id or source.state != "accepted":
@@ -565,7 +568,7 @@ class ReleaseStore:
             # Its operations may write roots: no sweep batch then.
             self._artifacts._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, build_id, attempt, now):
                 conn.rollback()
                 raise ReleaseRejected(f"attempt {attempt} does not hold build {build_id}")
@@ -774,7 +777,7 @@ class ReleaseStore:
         cursor = conn.execute(
             "UPDATE build_releases SET state = ?, settled_at = ? "
             f"WHERE release_id = ? AND {_UNSETTLED_SQL}",
-            (state, self._clock(), release_id),
+            (state, self._now(conn), release_id),
         )
         return cursor.rowcount > 0
 
