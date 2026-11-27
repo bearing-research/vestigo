@@ -80,9 +80,9 @@ def main() -> None:
             target, run_output_key(KEY, build_id, "model"), SPEC, minted=True, computation_key=KEY
         )
         # The first worker: a short lease, which it stops renewing. A live worker calls
-        # builds.renew_lease(build_id, "first") well inside the lease. open_build creates
-        # the build and opens the attempt in one step, unless a build of KEY is open
-        # already, which it returns instead.
+        # builds.renew_lease(build_id, "first", attempt="first") well inside the lease.
+        # open_build creates the build and opens the attempt in one step, unless a build
+        # of KEY is open already, which it returns instead.
         opened = builds.open_build(
             build_id,
             target,

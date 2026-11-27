@@ -968,16 +968,21 @@ class BuildStore:
         build_id: str,
         lease_owner: str,
         lease_duration_seconds: float = 60.0,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Extend a live lease from now.
 
         Returns False unless ``lease_owner`` holds it, it has not lapsed and the build
-        is building. A lapsed lease stays lapsed: its attempt is fenced for good, and
-        the build goes on only in a new attempt or a reclaim. It has lapsed by the clock
-        read once this holds the build's key, so time spent waiting for the key counts:
-        renew well before the deadline. Every process sharing the ledger must read the
-        same clock (synchronized hosts): one running behind could renew a lease another
-        has already called lapsed.
+        is building, and with ``attempt`` unless that is still the build's attempt: a
+        runner that resumes a build under the same owner otherwise has the fenced
+        attempt's heartbeat renew its successor's lease. A claim's lease, before an
+        attempt opens, is renewed without it. A lapsed lease stays lapsed:
+        its attempt is fenced for good, and the build goes on only in a new attempt or a
+        reclaim. It has lapsed by the clock read once this holds the build's key, so time
+        spent waiting for the key counts: renew well before the deadline. Every process
+        sharing the ledger must read the same clock (synchronized hosts): one running
+        behind could renew a lease another has already called lapsed.
         """
         conn = self._get_connection()
         try:
@@ -987,17 +992,19 @@ class BuildStore:
             self._dialect.begin_write(conn, build_id)
             now = self._clock()
             lease_expires_at = now + lease_duration_seconds
-            cursor = conn.execute(
-                """
+            sql = """
                 UPDATE artifact_builds
                 SET lease_expires_at = ?
                 WHERE build_id = ?
                   AND state = 'building'
                   AND lease_owner = ?
                   AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
-                """,
-                (lease_expires_at, build_id, lease_owner, now),
-            )
+            """
+            params: list[SqlValue] = [lease_expires_at, build_id, lease_owner, now]
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
+            cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
         finally:
