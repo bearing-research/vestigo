@@ -2074,6 +2074,54 @@ class TestAuditedMovesFromWhatWasThere:
             (f"{kind}_{action}", before, after) for action, before, after in expected
         ]
 
+    def test_a_request_racing_a_move_is_audited_before_it(self, backend_store, monkeypatch):
+        store = backend_store
+        if store.dialect.name == "sqlite":
+            pytest.skip("a request locks its target, which on SQLite is the write lock")
+        for version in (1, 2):
+            store.create_artifact("x", f"prov-{version}")
+            store.write_blob("x", version, _ipc_bytes(version))
+            store.finalize_artifact("x", version, "{}", 1, 10)
+        store.set_alias("m", "prod", "x", 1)
+        read, other_done, moving = threading.Event(), threading.Event(), threading.Event()
+        connect = store._get_connection
+        requested = {}
+        requester = threading.Thread(
+            target=lambda: requested.update(
+                queued=store.request_alias_change("m", "prod", "set", "x", 2)
+            )
+        )
+        mover = threading.Thread(target=lambda: store.set_alias("m", "prod", "x", 2))
+
+        def connection():
+            if threading.current_thread() is requester:
+                return _PausedAfterRead(connect(), "artifact_aliases", read, other_done)
+            if threading.current_thread() is mover:
+                moving.set()
+            return connect()
+
+        monkeypatch.setattr(store, "_get_connection", connection)
+        requester.start()
+        try:
+            assert read.wait(10)
+            mover.start()
+            assert moving.wait(10)
+            # Time for a mover that does not wait for the request to commit.
+            mover.join(1)
+        finally:
+            other_done.set()
+            requester.join(10)
+            if mover.ident is not None:  # started
+                mover.join(10)
+        assert not requester.is_alive() and not mover.is_alive()
+
+        # Queued because the alias was on x@1, so its audit row comes before the move.
+        assert requested == {"queued": True}
+        assert [
+            (event["action"], event["to_version"])
+            for event in sorted(store.read_audit(name="m"), key=lambda event: event["seq"])
+        ] == [("alias_set", 1), ("alias_request_set", 2), ("alias_set", 2)]
+
     @pytest.mark.parametrize("alias", [None, "prod"])
     def test_a_deletion_is_audited_from_the_id_and_version_it_removed(self, store, alias):
         _make_ready_artifact(store, "y", "prov-y")
