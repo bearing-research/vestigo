@@ -257,6 +257,7 @@ class TestArtifactCRUD:
 
     def test_finalize_artifact(self, store):
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact(
             artifact_id="test-id",
             version=version,
@@ -279,6 +280,7 @@ class TestArtifactCRUD:
     def test_finalize_already_ready_is_idempotent(self, store):
         """Finalizing an already-ready artifact returns the existing one."""
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         first_result = store.finalize_artifact("test-id", version, "{}", 0, 0)
 
         # Finalize is idempotent.
@@ -302,9 +304,11 @@ class TestArtifactCRUD:
     def test_get_latest_version(self, store):
         """Returns the latest ready version."""
         v1 = store.create_artifact("test-id", "hash1")
+        store.write_blob("test-id", v1, b"bytes")
         store.finalize_artifact("test-id", v1, "{}", 100, 1000)
 
         v2 = store.create_artifact("test-id", "hash2")
+        store.write_blob("test-id", v2, b"bytes")
         store.finalize_artifact("test-id", v2, "{}", 200, 2000)
 
         # v3 is still building.
@@ -320,6 +324,7 @@ class TestArtifactCRUD:
 class TestProvenanceLookup:
     def test_find_by_provenance(self, store):
         version = store.create_artifact("test-id", "unique-hash")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
 
         found = store.find_by_provenance("unique-hash")
@@ -349,6 +354,7 @@ class TestProvenanceLookup:
         rather than waiting the busy timeout behind it. The lock is held throughout,
         so the lookup can only come back by giving the note up."""
         version = store.create_artifact("test-id", "unique-hash")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
         conn = store._get_connection()
         try:
@@ -451,8 +457,15 @@ class TestBlobIO:
         assert backend_store.content_digest("older", version) == expected
 
     def test_no_digest_without_an_artifact_or_its_bytes(self, backend_store):
-        version = backend_store.create_artifact("empty", "prov-empty")
-        backend_store.finalize_artifact("empty", version, "{}", 0, 0)
+        version = _finished(backend_store, "empty", "prov-empty")
+        # An older row, which recorded no digest, whose bytes are gone.
+        conn = backend_store._get_connection()
+        try:
+            conn.execute("UPDATE artifact_versions SET content_sha256 = NULL")
+            conn.commit()
+        finally:
+            conn.close()
+        backend_store.blob_store.delete_blob("empty", version)
 
         assert backend_store.content_digest("empty", version) is None
         assert backend_store.content_digest("missing", 1) is None
@@ -465,6 +478,7 @@ _LOSER = "b" * 32
 class TestNamePointers:
     def test_set_and_resolve_name(self, store):
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
 
         store.set_name("my-artifact", "test-id", version)
@@ -504,10 +518,12 @@ class TestNamePointers:
 
     def test_update_name(self, store):
         v1 = store.create_artifact("test-id", "hash1")
+        store.write_blob("test-id", v1, b"bytes")
         store.finalize_artifact("test-id", v1, "{}", 100, 1000)
         store.set_name("my-artifact", "test-id", v1)
 
         v2 = store.create_artifact("test-id", "hash2")
+        store.write_blob("test-id", v2, b"bytes")
         store.finalize_artifact("test-id", v2, "{}", 200, 2000)
         store.set_name("my-artifact", "test-id", v2)
 
@@ -516,6 +532,7 @@ class TestNamePointers:
 
     def test_get_name(self, store):
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
         store.set_name("my-artifact", "test-id", version)
 
@@ -528,6 +545,7 @@ class TestNamePointers:
 
     def test_delete_name(self, store):
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
         store.set_name("my-artifact", "test-id", version)
 
@@ -540,6 +558,7 @@ class TestNamePointers:
     def test_list_names(self, store):
         for i in range(3):
             v = store.create_artifact(f"id-{i}", f"hash-{i}")
+            store.write_blob(f"id-{i}", v, b"bytes")
             store.finalize_artifact(f"id-{i}", v, "{}", i * 100, i * 1000)
             store.set_name(f"name-{i}", f"id-{i}", v)
 
@@ -618,6 +637,7 @@ class TestCleanup:
     def test_cleanup_failed_leaves_the_top_version_while_a_lower_one_stays(self, store):
         """Otherwise the next create reuses the number, as the sweep's gap rule prevents."""
         store.create_artifact("model", "prov-1")
+        store.write_blob("model", 1, b"bytes")
         store.finalize_artifact("model", 1, "{}", 1, 10)
         failed = store.create_artifact("model", "prov-2")
         store.fail_artifact("model", failed)
@@ -634,6 +654,7 @@ class TestCleanup:
 
     def test_cleanup_preserves_ready(self, store):
         version = store.create_artifact("test-id", "hash123")
+        store.write_blob("test-id", version, b"bytes")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
 
         # Ready artifacts survive even with 0 age.
@@ -655,6 +676,7 @@ class TestStats:
 
     def test_stats_with_data(self, store):
         v1 = store.create_artifact("id-1", "hash1")
+        store.write_blob("id-1", v1, b"bytes")
         store.finalize_artifact("id-1", v1, "{}", 100, 1000)
 
         store.create_artifact("id-2", "hash2")
@@ -677,6 +699,7 @@ class TestStats:
         """An older version a refresh superseded keeps its bytes until a sweep takes them."""
         for size in (1000, 300):
             version = store.create_artifact("id-1", "hash1")
+            store.write_blob("id-1", version, b"bytes")
             store.finalize_artifact("id-1", version, "{}", 1, size)
         store.create_artifact("id-2", "hash1")
         store.finalize_artifact("id-2", 1, "{}", 1, 300)  # reads id-1@v=2's bytes
@@ -689,6 +712,7 @@ class TestStats:
         """A refresh and a dedup each leave a superseded version, which no other count holds."""
         for _ in range(2):
             version = store.create_artifact("id-1", "hash1")
+            store.write_blob("id-1", version, b"bytes")
             store.finalize_artifact("id-1", version, "{}", 1, 10)
         store.create_artifact("id-2", "hash1")
         store.finalize_artifact("id-2", 1, "{}", 1, 10)
@@ -704,6 +728,7 @@ class TestStats:
     def test_name_prefix_treats_an_underscore_literally(self, store):
         for name, artifact_id in (("taxi_model", "a"), ("taxi/model", "b")):
             version = store.create_artifact(artifact_id, f"hash-{artifact_id}")
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", 1, 1)
             store.set_name(name, artifact_id, version)
 
@@ -728,6 +753,7 @@ class TestExcludeIdPrefix:
     @staticmethod
     def _ready(store, artifact_id, rows=10, size=100):
         version = store.create_artifact(artifact_id, f"hash-{artifact_id}")
+        store.write_blob(artifact_id, version, b"bytes")
         store.finalize_artifact(artifact_id, version, "{}", rows, size)
         return version
 
@@ -794,6 +820,7 @@ class TestExcludeIdPrefix:
     def test_the_bytes_an_included_copy_reads_from_an_excluded_one_are_counted(self, store):
         for artifact_id in ("book_holder", "copy", "other_copy"):
             version = store.create_artifact(artifact_id, "same-hash")
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", 1, 100)
         assert store.get_artifact("copy", 1).state == "superseded"
 
@@ -836,6 +863,7 @@ class TestExcludeIdPrefix:
     def test_a_tenant_and_a_prefix_apply_together(self, store):
         for tenant, artifact_id in (("a", "result"), ("a", "book_1"), ("b", "other")):
             version = store.create_artifact(artifact_id, f"hash-{artifact_id}", tenant=tenant)
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", 1, 1)
 
         stats = store.stats(tenant="a", exclude_id_prefix="book_")
@@ -1139,10 +1167,12 @@ class TestRefreshSupersede:
     def test_finalize_supersedes_older_ready_version(self, store):
         """Finalizing v2 with v1's provenance demotes v1 to superseded."""
         store.create_artifact("art-1", "prov-x")
+        store.write_blob("art-1", 1, b"bytes")
         store.finalize_artifact("art-1", 1, "{}", 10, 100)
 
         version = store.create_artifact("art-1", "prov-x")
         assert version == 2
+        store.write_blob("art-1", 2, b"bytes")
         finalized = store.finalize_artifact("art-1", 2, "{}", 12, 120)
 
         assert finalized.version == 2
@@ -1152,8 +1182,10 @@ class TestRefreshSupersede:
     def test_provenance_lookup_returns_rebuild(self, store):
         """After supersede, dedup lookups resolve the new version."""
         store.create_artifact("art-1", "prov-x")
+        store.write_blob("art-1", 1, b"bytes")
         store.finalize_artifact("art-1", 1, "{}", 10, 100)
         store.create_artifact("art-1", "prov-x")
+        store.write_blob("art-1", 2, b"bytes")
         store.finalize_artifact("art-1", 2, "{}", 12, 120)
 
         found = store.find_by_provenance("prov-x")
@@ -1363,8 +1395,10 @@ class TestRefreshSupersede:
     def test_finalize_and_set_name_supersedes(self, store):
         """The atomic finalize+name path supersedes the same way."""
         store.create_artifact("art-1", "prov-x")
+        store.write_blob("art-1", 1, b"bytes")
         store.finalize_and_set_name("art-1", 1, "{}", 10, 100, name="model")
         store.create_artifact("art-1", "prov-x")
+        store.write_blob("art-1", 2, b"bytes")
         finalized = store.finalize_and_set_name("art-1", 2, "{}", 12, 120, name="model")
 
         assert finalized.version == 2
@@ -1390,6 +1424,7 @@ class TestZombieSweep:
 
     def test_ready_untouched(self, store):
         store.create_artifact("done", "prov-d")
+        store.write_blob("done", 1, b"bytes")
         store.finalize_artifact("done", 1, "{}", 1, 10)
         swept = store.sweep_zombie_builds(max_age_seconds=0)
         assert swept == 0
@@ -1455,7 +1490,9 @@ class TestVerifyArtifacts:
 
     def test_missing_blob_detected(self, store):
         store.create_artifact("ghost", "prov-gh")
-        store.finalize_artifact("ghost", 1, "{}", 1, 10)  # never wrote a blob
+        store.write_blob("ghost", 1, b"bytes")
+        store.finalize_artifact("ghost", 1, "{}", 1, 10)
+        store.blob_store.delete_blob("ghost", 1)  # lost since
 
         findings = store.verify_artifacts()
         assert len(findings) == 1
@@ -1467,6 +1504,7 @@ class TestLegacyDefaultTenantNames:
 
     def test_tenantless_request_can_name_default_artifact(self, store):
         store.create_artifact("legacy", "prov-l", tenant="_default")
+        store.write_blob("legacy", 1, b"bytes")
         store.finalize_artifact("legacy", 1, "{}", 1, 10)
 
         # Older PUT uploads stamped "_default" while the names routes resolve single-tenant
@@ -1477,6 +1515,7 @@ class TestLegacyDefaultTenantNames:
 
     def test_real_tenant_mismatch_still_rejected(self, store):
         store.create_artifact("owned", "prov-o", tenant="acme")
+        store.write_blob("owned", 1, b"bytes")
         store.finalize_artifact("owned", 1, "{}", 1, 10)
 
         # Answered as a missing artifact: the error must not confirm it exists, or name its tenant.
@@ -2068,6 +2107,7 @@ class TestTagAndNameLookups:
     def test_list_artifacts_by_tag(self, store):
         for aid, h in (("a1", "h1"), ("a2", "h2"), ("a3", "h3")):
             store.create_artifact(aid, h)
+            store.write_blob(aid, 1, b"bytes")
             store.finalize_artifact(aid, 1, "{}", 0, 0)
         store.set_tag("a1", 1, "nb_cell", "cellX")
         store.set_tag("a3", 1, "nb_cell", "cellX")
@@ -2084,6 +2124,7 @@ class TestListArtifactsSortAndSince:
     @staticmethod
     def _add(store, aid, byte_size):
         store.create_artifact(aid, f"{aid}-hash")
+        store.write_blob(aid, 1, b"bytes")
         store.finalize_artifact(aid, 1, "{}", 0, byte_size)
 
     def test_sort_by_byte_size(self, store):
@@ -2109,6 +2150,7 @@ class TestListArtifactsSortAndSince:
 
     def test_names_for_artifact(self, store):
         store.create_artifact("a1", "h1")
+        store.write_blob("a1", 1, b"bytes")
         store.finalize_artifact("a1", 1, "{}", 0, 0)
         store.set_name("team/model", "a1", 1)
 
@@ -2160,6 +2202,7 @@ class TestTenantNormalization:
         distinct.
         """
         store.create_artifact("art-1", "dup-prov")
+        store.write_blob("art-1", 1, b"bytes")
         store.finalize_artifact("art-1", 1, "{}", 1, 10)
         store.create_artifact("art-2", "dup-prov")
         result = store.finalize_artifact("art-2", 1, "{}", 1, 10)
@@ -2176,9 +2219,11 @@ class TestTenantNormalization:
     def test_tenantless_finalize_does_not_dedup_cross_tenant(self, store):
         """A tenantless finalize must not dedup against a tenant's artifact and name it."""
         store.create_artifact("team-art", "shared-prov", tenant="team-a")
+        store.write_blob("team-art", 1, b"bytes")
         store.finalize_artifact("team-art", 1, "{}", 1, 10)
 
         store.create_artifact("none-art", "shared-prov")  # tenantless
+        store.write_blob("none-art", 1, b"bytes")
         result = store.finalize_and_set_name(
             "none-art", 1, "{}", 1, 10, name="my-name", tenant=None
         )
@@ -2281,6 +2326,7 @@ class TestTenantNormalization:
     def test_set_tag_rejects_cross_tenant(self, store):
         """set_tag enforces ownership like set_alias."""
         store.create_artifact("owned", "p", tenant="acme")
+        store.write_blob("owned", 1, b"bytes")
         store.finalize_artifact("owned", 1, "{}", 1, 10)
         with pytest.raises(ArtifactNotFoundError, match="not found") as excinfo:
             store.set_tag("owned", 1, "k", "v", tenant="globex")
@@ -2290,6 +2336,7 @@ class TestTenantNormalization:
         """publish_artifact named the owner of a ready version, and the state of a building
         one, to a caller of another tenant."""
         store.create_artifact("owned", "p", tenant="acme")
+        store.write_blob("owned", 1, b"bytes")
         store.finalize_artifact("owned", 1, "{}", 1, 10)
         store.create_artifact("building", "q", tenant="acme")  # still 'building'
         for artifact_id in ("owned", "building", "nothing"):
@@ -2303,6 +2350,7 @@ class TestTenantNormalization:
         """A tenantless version is visible to every tenant, which may name it; a link is one
         tenant's, so it is refused, but not as missing."""
         store.create_artifact("shared", "p")
+        store.write_blob("shared", 1, b"bytes")
         store.finalize_artifact("shared", 1, "{}", 1, 10)
         assert store.set_tag("shared", 1, "k", "v", tenant="acme") is None
         with pytest.raises(ValueError, match="publish it from that tenant") as excinfo:
@@ -2324,6 +2372,7 @@ class TestTenantNormalization:
 
     def test_retain_answers_another_tenant_s_version_as_missing(self, store):
         store.create_artifact("owned", "p", tenant="acme")
+        store.write_blob("owned", 1, b"bytes")
         store.finalize_artifact("owned", 1, "{}", 1, 10)
         for artifact_id in ("owned", "nothing"):
             with pytest.raises(ArtifactNotFoundError, match="not found"):
@@ -2338,6 +2387,7 @@ class TestTenantNormalization:
     def test_delete_artifact_refuses_other_tenant(self, store):
         """delete_artifact refuses to delete another tenant's artifact."""
         store.create_artifact("owned", "p", tenant="acme")
+        store.write_blob("owned", 1, b"bytes")
         store.finalize_artifact("owned", 1, "{}", 1, 10)
         assert store.delete_artifact("owned", 1, tenant="globex") is False
         assert store.get_artifact("owned", 1) is not None  # not deleted
@@ -2349,6 +2399,7 @@ class TestTenantNormalization:
         """
         store = ArtifactStore(artifact_dir)
         store.create_artifact("a1", "h")
+        store.write_blob("a1", 1, b"bytes")
         store.finalize_artifact("a1", 1, "{}", 1, 10)
 
         # Rebuild artifact_versions as the legacy nullable-tenant table, then plant NULL
@@ -2384,6 +2435,7 @@ class TestTenantNormalization:
         store with no uniqueness index at all (and two upgrading processes could interleave)."""
         store = ArtifactStore(artifact_dir)
         store.create_artifact("a1", "h")
+        store.write_blob("a1", 1, b"bytes")
         store.finalize_artifact("a1", 1, "{}", 1, 10)
         conn = sqlite3.connect(str(store.db_path))
         _as_legacy_nullable_tenant_table(conn)
@@ -2736,6 +2788,64 @@ class TestFinalizeTogether:
         assert store.get_artifact(first.artifact_id, first.version).state == "building"
 
 
+class TestAReadyRowHasItsBytes:
+    """A row becomes ready only with bytes stored: a cache hit would serve nothing."""
+
+    @pytest.mark.parametrize("digest", [None, "d" * 64], ids=["hashed", "digest-given"])
+    def test_a_finalize_with_no_bytes_is_refused_and_stays_building(self, backend_store, digest):
+        store = backend_store
+        version = store.create_artifact("x", "prov-x")
+
+        with pytest.raises(ValueError, match="no bytes stored"):
+            store.finalize_and_set_name(
+                "x", version, "{}", 0, 10, name="latest", content_sha256=digest
+            )
+
+        assert store.get_artifact("x", version).state == "building"
+        assert store.find_by_provenance("prov-x") is None
+        assert store.get_name("latest") is None
+
+    def test_a_build_s_bytes_are_looked_for_under_its_attempt(self, backend_store):
+        store = backend_store
+        built = store.create_artifact("built", "prov-built")
+        store.write_blob("built", built, b"bytes", attempt=_WINNER)
+        lost = store.create_artifact("lost", "prov-lost")
+        store.write_blob("lost", lost, b"bytes")  # not under the attempt it names
+
+        store.finalize_artifact("built", built, "{}", 0, 5, "d" * 64, blob_attempt=_WINNER)
+        with pytest.raises(ValueError, match="no bytes stored"):
+            store.finalize_artifact("lost", lost, "{}", 0, 5, "d" * 64, blob_attempt=_WINNER)
+
+        assert store.get_artifact("built", built).state == "ready"
+        assert store.get_artifact("lost", lost).state == "building"
+
+    def test_a_duplicate_reads_its_canonical_s_bytes_and_needs_none(self, backend_store):
+        store = backend_store
+        canonical = _finished(store, "first", "prov-same")
+        duplicate = store.create_artifact("second", "prov-same")
+
+        assert store.finalize_artifact("second", duplicate, "{}", 0, 5).id == "first"
+
+        assert store.get_artifact("second", duplicate).state == "superseded"
+        assert store.read_blob("second", duplicate) == store.read_blob("first", canonical)
+
+    def test_outputs_finalized_together_are_refused_together_when_one_has_none(self, backend_store):
+        store = backend_store
+        written = store.create_artifact("written", "prov-w")
+        store.write_blob("written", written, b"x")
+        empty = store.create_artifact("empty", "prov-e")
+        staged = [
+            StagedVersion("written", written, "{}", 1, 1, "d" * 64),
+            StagedVersion("empty", empty, "{}", 1, 1, "d" * 64),
+        ]
+
+        with pytest.raises(ValueError, match="empty@v=1 has no bytes stored"):
+            store.finalize_canonical_together(staged)
+
+        assert store.get_artifact("written", written).state == "building"
+        assert store.get_artifact("empty", empty).state == "building"
+
+
 def _rebuild_after_first_lookup(store, monkeypatch, artifact_id: str, provenance: str) -> None:
     """Land a rebuild of ``artifact_id``, superseding what the first provenance lookup returns."""
     find = store.find_by_provenance
@@ -2746,6 +2856,7 @@ def _rebuild_after_first_lookup(store, monkeypatch, artifact_id: str, provenance
         if not landed:
             landed.append(True)
             version = store.create_artifact(artifact_id, provenance)
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", 1, 10, content_sha256="e" * 64)
         return found
 
@@ -2839,6 +2950,7 @@ class TestWholeStoreReads:
             version = backend_store.create_artifact(
                 artifact_id, f"prov-{artifact_id}", input_versions={f"in-{read}": read}
             )
+            backend_store.write_blob(artifact_id, version, b"bytes")
             backend_store.finalize_artifact(artifact_id, version, "{}", 1, 10)
 
         for upstream in ("up", "UP"):
@@ -2858,6 +2970,7 @@ class TestWholeStoreReads:
                 "vestigo://artifact/base-1@v=1": "base-1@v=1",
             },
         )
+        backend_store.write_blob("reader", version, b"bytes")
         backend_store.finalize_artifact("reader", version, "{}", 1, 10)
 
         dependents = backend_store.find_dependents("base-1", 1)
@@ -2869,6 +2982,7 @@ class TestWholeStoreReads:
         version = backend_store.create_artifact(
             "reader", "prov-reader", input_versions={"vestigo://artifact/nbXa@v=1": "nbXa@v=1"}
         )
+        backend_store.write_blob("reader", version, b"bytes")
         backend_store.finalize_artifact("reader", version, "{}", 1, 10)
 
         assert backend_store.find_dependents("nb_a", 1) == []
@@ -2966,9 +3080,11 @@ class TestUriScheme:
         uris.set_uri_scheme("strata")
         spec = TransformSpec(executor="cell@v1", params={}, inputs=[])
         store.create_artifact("scan", "p-scan", spec)
+        store.write_blob("scan", 1, b"bytes")
         store.finalize_artifact("scan", 1, "{}", row_count=0, byte_size=0)
         edges = {"strata://artifact/scan@v=1": "scan@v=1", "strata://name/taxi/model": "m@v=1"}
         store.create_artifact("top", "p-top", spec, input_versions=edges)
+        store.write_blob("top", 1, b"bytes")
         store.finalize_artifact("top", 1, "{}", row_count=0, byte_size=0)
 
         assert store.list_name_reads() == [(None, "top", "taxi/model")]
@@ -3725,7 +3841,9 @@ class TestImportWithoutBytes:
     def test_a_row_here_without_bytes_is_refused_too(self, backend_store):
         store = backend_store
         version = store.create_artifact("hollow", "prov-x", _OCTETS)
+        store.write_blob("hollow", version, b"bytes")
         store.finalize_artifact("hollow", version, "{}", None, 0)
+        store.blob_store.delete_blob("hollow", version)  # lost since
 
         with pytest.raises(ValueError, match="has none either"):
             store.import_artifact(_record("hollow", version, "prov-x"), None)
@@ -3999,7 +4117,9 @@ class TestVerifyStreams:
         odd = replace(_record("odd", 1, "prov-odd"), transform_spec=nan_spec)
         store.import_artifact(odd, _ipc_bytes(2))
         store.create_artifact("ghost", "prov-ghost")
+        store.write_blob("ghost", 1, b"bytes")
         store.finalize_artifact("ghost", 1, "{}", None, 10)
+        store.blob_store.delete_blob("ghost", 1)  # lost since
 
         findings = store.verify_artifacts()
 

@@ -86,6 +86,9 @@ if hit is None:
   give different keys, which is what `cache.py`'s third command shows.
 - **An id holds versions.** Each `create_artifact` adds the next version (1, 2, ...).
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
+- **A finalize with no bytes stored** raises `ValueError` and leaves the row
+  `building`, so a lost upload is never served as a hit. With `content_sha256` given it
+  costs one existence check on the blob store; without it, the bytes are hashed anyway.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
   stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
   `sweep_zombie_builds` fails every `building` row older than its cutoff, except the

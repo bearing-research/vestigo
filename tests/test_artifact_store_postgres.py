@@ -78,6 +78,7 @@ class TestSchemaInitialization:
         # Re-running the CREATE TABLE IF NOT EXISTS script against a populated
         # database must not disturb it.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
 
         reopened = ArtifactStore(tmp_path / "artifacts", dialect=PostgresDialect(postgres_dsn))
@@ -144,6 +145,7 @@ class TestRoundTrip:
 
     def test_name_pointer_resolves(self, store):
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("daily_revenue", "a1", version)
 
@@ -170,6 +172,7 @@ class TestRoundTrip:
             version = store.create_artifact(
                 artifact_id, f"p-{artifact_id}", _spec(), input_versions=edges, tenant=tenant
             )
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=0)
 
         assert store.list_name_reads(tenant="team-a") == [("team-a", "ours", "taxi/model@champion")]
@@ -182,6 +185,7 @@ class TestRoundTrip:
         # Exercises _REGISTRY_SCHEMA_SQL, which carries the one AUTOINCREMENT
         # column in the schema (registry_audit.seq).
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("model", "a1", version)
         store.set_alias("model", "champion", "a1", version)
@@ -195,6 +199,7 @@ class TestRoundTrip:
         # read_audit does `dict(row)`, which needs the row factory to behave
         # like a Mapping rather than a tuple.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("model", "a1", version)
 
@@ -226,6 +231,7 @@ class TestColumnWidths:
         # blob is written and the row is stranded in 'building' forever.
         version = store.create_artifact("big", "prov-big", _spec())
         three_gib = 3 * 1024**3
+        store.write_blob("big", version, b"bytes")
         store.finalize_artifact("big", version, "{}", row_count=1, byte_size=three_gib)
 
         artifact = store.get_artifact("big", version)
@@ -236,6 +242,7 @@ class TestColumnWidths:
     def test_row_count_holds_more_than_two_billion_rows(self, store):
         version = store.create_artifact("wide", "prov-wide", _spec())
         rows = 5_000_000_000
+        store.write_blob("wide", version, b"bytes")
         store.finalize_artifact("wide", version, "{}", row_count=rows, byte_size=1)
         assert store.get_artifact("wide", version).row_count == rows
 
@@ -287,6 +294,7 @@ class TestAggregateReturnTypes:
         # Decimal, so an in-process caller doing total_bytes / 1024**3 gets
         # TypeError where the SQLite backend gave a float.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=7, byte_size=11)
 
         stats = store.stats()
@@ -296,6 +304,7 @@ class TestAggregateReturnTypes:
 
     def test_usage_totals_are_ints_not_decimals(self, store):
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=7, byte_size=11)
 
         usage = store.get_usage()
@@ -338,12 +347,15 @@ class TestConnectionLimits:
 class TestCanonicalPromotion:
     def test_a_runs_outputs_finalize_together_or_not_at_all(self, store):
         first = store.create_artifact("a1", "shared-prov", _spec())
+        store.write_blob("a1", first, b"bytes")
         store.finalize_artifact("a1", first, "{}", row_count=0, byte_size=0)
         x = StagedVersion(
             "a2", store.create_artifact("a2", "shared-prov", _spec()), "{}", 0, 0, "d"
         )
         y = StagedVersion("a3", store.create_artifact("a3", "prov-y", _spec()), "{}", 0, 0, "d")
         z = StagedVersion("a4", store.create_artifact("a4", "prov-z", _spec()), "{}", 0, 0, "d")
+        for staged in (x, y, z):
+            store.write_blob(staged.artifact_id, staged.version, b"")
         store.fail_artifact("a4", z.version)
 
         with pytest.raises(ValueError, match="building"):
@@ -375,6 +387,7 @@ class TestFinalizeAndName:
 
         monkeypatch.setattr(store, "_set_name_in_connection", read_elsewhere_then_name)
 
+        store.write_blob("a1", version, b"bytes")
         artifact = store.finalize_and_set_name(
             "a1", version, "{}", 0, 0, name="the-name", content_sha256="d" * 64
         )
@@ -392,6 +405,7 @@ class TestFinalizeAndName:
 
         monkeypatch.setattr(store, "_set_name_in_connection", name_write_fails)
 
+        store.write_blob("a1", version, b"bytes")
         with pytest.raises(psycopg.OperationalError):
             store.finalize_and_set_name(
                 "a1", version, "{}", 0, 0, name="the-name", content_sha256="d" * 64
@@ -404,6 +418,7 @@ class TestFinalizeAndName:
 class TestFindReadyAndSetName:
     def _ready(self, store) -> int:
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", 0, 0, content_sha256="d" * 64)
         return version
 
@@ -425,6 +440,7 @@ class TestFindReadyAndSetName:
             found = find(*args, **kwargs)
             if not rebuilt:
                 rebuilt.append(store.create_artifact("a1", "prov-1", _spec()))
+                store.write_blob("a1", rebuilt[0], b"bytes")
                 store.finalize_artifact("a1", rebuilt[0], "{}", 0, 0, content_sha256="e" * 64)
             return found
 
@@ -784,6 +800,7 @@ class TestGarbageCollection:
         # The spare-the-current-value clause is a correlated NOT EXISTS; run
         # it on the dialect that has never seen it in a unit test.
         first = store.create_artifact("nb_x_cell_c1_var_df", "prov-v1", _spec())
+        store.write_blob("nb_x_cell_c1_var_df", first, b"bytes")
         store.finalize_artifact("nb_x_cell_c1_var_df", first, "{}", row_count=0, byte_size=0)
         store.create_artifact("nb_x_cell_c1_var_df", "prov-v2", _spec())
 
@@ -793,6 +810,7 @@ class TestGarbageCollection:
     @staticmethod
     def _ready(store, artifact_id: str, provenance: str, *, minted: bool = False) -> int:
         version = store.create_artifact(artifact_id, provenance, _spec(), minted=minted)
+        store.write_blob(artifact_id, version, b"bytes")
         store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=100)
         return version
 
@@ -850,6 +868,7 @@ class TestGarbageCollection:
             version = store.create_artifact(
                 artifact_id, f"p-{owner}", _spec(), tenant=tenant, minted=True
             )
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=100)
             self._last_used(store, artifact_id, 7200)
 
@@ -1070,6 +1089,7 @@ class TestConnectionPool:
                     for round_ in range(3):
                         aid = f"a{i}-{round_}"
                         version = store.create_artifact(aid, f"prov-{i}-{round_}", _spec())
+                        store.write_blob(aid, version, b"b")
                         # finalize_artifact evaluates `return self.get_artifact(...)`
                         # inside its try, so the outer connection is still held.
                         store.finalize_artifact(aid, version, "{}", row_count=1, byte_size=1)
@@ -1667,6 +1687,7 @@ class TestWriterSerialization:
         and never got the earlier event once it committed.
         """
         version = store.create_artifact("m1", "prov-m1", _spec())
+        store.write_blob("m1", version, b"bytes")
         store.finalize_artifact("m1", version, "{}", row_count=0, byte_size=0)
 
         inserted, release = threading.Event(), threading.Event()
@@ -1716,6 +1737,7 @@ class TestWriterSerialization:
         Each then waited on the lock the other held, and Postgres aborted one of them.
         """
         version = store.create_artifact("d1", "prov-d1", _spec())
+        store.write_blob("d1", version, b"bytes")
         store.finalize_artifact("d1", version, "{}", row_count=0, byte_size=0)
         store.set_name("current", "d1", version)
         store.set_alias("current", "prod", "d1", version)
@@ -1773,6 +1795,7 @@ class TestWriterSerialization:
         """A hit holds the version's row and then takes the audit lock to name it; delete took
         the audit lock and then the row. Each waited on the other and Postgres aborted one."""
         version = store.create_artifact("h1", "prov-h1", _spec())
+        store.write_blob("h1", version, b"bytes")
         store.finalize_artifact("h1", version, "{}", row_count=0, byte_size=0)
 
         holding_row, release = threading.Event(), threading.Event()
@@ -1830,6 +1853,7 @@ class TestWriterSerialization:
         acceptance took the audit lock and then superseded the holder. Each waited on the
         other and Postgres aborted one."""
         held = store.create_artifact("held", "prov-out", _spec())
+        store.write_blob("held", held, b"bytes")
         store.finalize_artifact("held", held, "{}", row_count=0, byte_size=0)
         builds = BuildStore(store.db_path, dialect=store.dialect)
         releases = ReleaseStore(store, builds)
@@ -1943,6 +1967,7 @@ class TestWriterSerialization:
         # The second finalize finds the first by provenance before it writes and
         # returns it; the index's rejection is TestProvenanceRaces' case.
         first = store.create_artifact("a1", "same-prov", _spec())
+        store.write_blob("a1", first, b"bytes")
         store.finalize_artifact("a1", first, "{}", row_count=0, byte_size=0)
 
         second = store.create_artifact("a2", "same-prov", _spec())
@@ -2026,6 +2051,7 @@ class TestSchemaMigrations:
     def test_an_existing_database_is_carried_forward(self, postgres_dsn, tmp_path, store):
         """A new column reaches a store that already has rows."""
         version = store.create_artifact("keeper", "prov-keep", _spec())
+        store.write_blob("keeper", version, b"bytes")
         store.finalize_artifact("keeper", version, schema_json="", row_count=1, byte_size=1)
 
         # Rewind to a pre-migration database that still holds its rows.
@@ -2256,6 +2282,7 @@ class TestGraph:
         node = store.definition_of("a1", version)
         assert node is not None
         assert store.graph.get(node) is not None
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         assert store.versions_lacking_definition() == []
 
