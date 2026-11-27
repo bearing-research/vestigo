@@ -457,7 +457,8 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 class TestASweepBatchHoldsOffHoldWriters:
     """A sweep batch takes the sweep's key exclusively and every writer that can create a
     hold takes it shared, first, so no hold lands while a batch claims; so does a delete,
-    which locks the rows a claim locks, in an order of its own."""
+    which locks the rows a claim locks, in an order of its own. A cleanup_failed batch
+    takes it exclusively, as a sweep batch does, so it too waits for a batch."""
 
     WRITERS = (
         "create_artifact",
@@ -477,6 +478,7 @@ class TestASweepBatchHoldsOffHoldWriters:
         "accept",
         "apply",
         "delete_artifact",
+        "cleanup_failed",
     )
 
     @pytest.mark.parametrize("writer", WRITERS)
@@ -499,6 +501,8 @@ class TestASweepBatchHoldsOffHoldWriters:
         release = releases.prepare("b1", "a1", "final")
         if writer == "approve_alias_change":
             store.request_alias_change("m", "prod", "set", "v", version)
+        if writer == "cleanup_failed":
+            store.fail_artifact("failed", store.create_artifact("failed", "prov-f", _spec()))
         cached = replace(record, id="cached", provenance_hash="p3")
         if writer == "import_artifact_lineage":
             store.import_artifact(cached, b"bytes")  # as the team cache writes it, no inputs
@@ -528,6 +532,7 @@ class TestASweepBatchHoldsOffHoldWriters:
             "accept": lambda: releases.accept(release.release_id, [], [event]),
             "apply": lambda: releases.apply("b1", "a1", [event]),
             "delete_artifact": lambda: store.delete_artifact("v", version),
+            "cleanup_failed": lambda: store.cleanup_failed(max_age_seconds=-10),
         }
         errors: list[BaseException] = []
 
@@ -1007,6 +1012,46 @@ class TestGarbageCollection:
         assert store.get_artifact("built", version) is None
         assert builds.get_build("build-1") is None
 
+    def test_cleanup_failed_waits_for_a_requirement_being_written(self, store):
+        """An edge's writer locks no row of its target, only the sweep's key shared: the
+        batch takes that key exclusively, so it waits for the edge and then spares x."""
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", _spec()))
+        store.create_artifact("y", "prov-y", _spec())
+        written, commit = threading.Event(), threading.Event()
+
+        def require() -> None:
+            # As require_many writes it, held uncommitted until the batch has started.
+            conn = store._get_connection()
+            try:
+                store._hold_off_sweeps(conn)
+                store._write_requirements(conn, "y", 1, None, [("x", 1)])
+                written.set()
+                commit.wait(30)
+                conn.commit()
+            finally:
+                conn.close()
+
+        removed = {}
+        requirer = threading.Thread(target=require)
+        cleaner = threading.Thread(
+            target=lambda: removed.update(n=store.cleanup_failed(max_age_seconds=-10))
+        )
+        requirer.start()
+        try:
+            assert written.wait(10)
+            cleaner.start()
+            _until_it_waits(store, cleaner)
+            assert cleaner.is_alive(), "the batch went ahead of the edge being written"
+        finally:
+            commit.set()
+            requirer.join(10)
+            if cleaner.ident is not None:  # started
+                cleaner.join(10)
+        assert not requirer.is_alive() and not cleaner.is_alive()
+
+        assert removed == {"n": 0}
+        assert store.get_artifact("x", 1).state == "failed"
+
 
 class TestConnectionPool:
     """A bounded pool is only safe here because acquisition is re-entrant."""
@@ -1391,10 +1436,10 @@ class TestBuildStoreSharesTheBackend:
             conn.close()
             reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
 
-            before = time.time()
+            before = reopened.now()  # the database's clock, which writes opened_at
             assert reopened.open_attempt("b", "a1", writable_until=1e12)
             # To the second: a single-precision column would round it by a minute.
-            assert before <= reopened.get_attempt("b", "a1").opened_at <= time.time()
+            assert before <= reopened.get_attempt("b", "a1").opened_at <= reopened.now()
             conn = dialect.connect()
             [column] = conn.execute(
                 "SELECT data_type FROM information_schema.columns "
@@ -1495,7 +1540,7 @@ class TestBuildStoreSharesTheBackend:
             version = artifacts.create_artifact("big", "prov-big", _spec())
 
             store = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
-            before = time.time()
+            before = store.now()  # the database's clock, which writes created_at
             build_id = "build-widths"
             store.create_build(
                 build_id=build_id,
@@ -1505,7 +1550,7 @@ class TestBuildStoreSharesTheBackend:
             )
             store.start_build(build_id)
             store.complete_build(build_id, output_byte_count=3 * 1024**3)
-            after = time.time()
+            after = store.now()
 
             build = store.get_build(build_id)
             assert build.output_byte_count == 3 * 1024**3
@@ -2631,3 +2676,45 @@ class TestTheOpenBuildIndex:
             assert self._present(reopened) == {"idx_build_open"}
         finally:
             reopened.close()
+
+
+class TestOneClockForEveryHost:
+    """Lease decisions read the database's clock, so a host whose own clock runs two
+    minutes ahead, past a one-minute lease, still finds the lease live."""
+
+    @staticmethod
+    def _live_build(store: ArtifactStore, tmp_path) -> BuildStore:
+        builds = BuildStore(tmp_path / "x.sqlite", dialect=store.dialect)
+        version = store.create_artifact("art", "prov-art", _spec())
+        builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+        assert builds.open_attempt(
+            "b",
+            "a1",
+            writable_until=builds.now() + 3600,
+            lease_owner="runner-1",
+            lease_duration_seconds=60.0,
+        )
+        return builds
+
+    @staticmethod
+    def _run_ahead(monkeypatch: pytest.MonkeyPatch) -> None:
+        real = time.time
+        monkeypatch.setattr(time, "time", lambda: real() + 120)
+
+    def test_a_host_running_ahead_finds_a_live_lease_live(self, store, tmp_path, monkeypatch):
+        builds = self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert builds.list_expired_leases(dispatch=None) == []
+        assert not builds.reclaim_expired_build("b", "runner-2", dispatch=None)
+        assert builds.renew_lease("b", "runner-1", 60.0, attempt="a1")
+        assert ReleaseStore(store, builds).prepare("b", "a1", "checkpoint").state == "preparing"
+
+    def test_a_zombie_sweep_on_a_host_running_ahead_spares_a_live_build(
+        self, store, tmp_path, monkeypatch
+    ):
+        self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert store.sweep_zombie_builds(max_age_seconds=60) == 0
+        assert store.get_artifact("art", 1).state == "building"
