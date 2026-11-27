@@ -102,7 +102,8 @@ entry point, and the README's overview when a capability is added.
    and required edges are one closure. On Postgres a batch holds the sweep's
    key exclusively, and a writer that can create a hold (or lock rows a claim
    locks, as a delete does) calls `_hold_off_sweeps` before any other lock and
-   opens no nested connection while it holds it;
+   opens no nested connection while it holds it; a `cleanup_failed` batch takes
+   the key exclusively, as a sweep batch does;
    `TestASweepBatchHoldsOffHoldWriters` lists the writers.
 3. **A release is accepted only once every output's bytes are stored**, and
    only by the attempt whose lease is live; a lapsed lease fences its attempt.
