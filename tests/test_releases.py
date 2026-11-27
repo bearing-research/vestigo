@@ -730,6 +730,33 @@ class TestAttemptsAndFences:
         assert not ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a1")
         assert ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a2")
 
+    def test_a_fenced_attempt_does_not_lapse_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.lapse_lease(build_id, "runner-1", attempt="a1")
+        assert ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a2")
+        assert ledger.builds.lapse_lease(build_id, "runner-1", attempt="a2")
+
+    def test_a_fenced_attempt_does_not_complete_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "building"
+        assert ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a2")
+
+    def test_an_attempt_whose_lease_lapsed_does_not_complete_its_build(self, ledger: Ledger):
+        build_id = _build(ledger)
+        ledger.clock.now += 120  # a1's lease lapses; nobody has resumed the build yet
+
+        assert not ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "building"
+
     def test_a_renewal_queued_for_the_key_past_the_deadline_is_refused(self, ledger: Ledger):
         """Any fence check that held the key meanwhile saw the lease lapsed, so it stays so."""
         build_id = _build(ledger)

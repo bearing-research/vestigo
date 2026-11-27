@@ -1010,14 +1010,16 @@ class BuildStore:
         finally:
             conn.close()
 
-    def lapse_lease(self, build_id: str, lease_owner: str) -> bool:
+    def lapse_lease(self, build_id: str, lease_owner: str, *, attempt: str | None = None) -> bool:
         """End ``lease_owner``'s lease now, for good, from any thread or process.
 
         Unlike a renewal to zero seconds, which leaves the lease live through its
         deadline, it clears the owner, so no later renewal can take it up again. Under
         the build's key, so it waits for an acceptance or an attempt opening that already
         holds the lease, and either fences what follows. Returns False unless
-        ``lease_owner`` holds it and the build is building.
+        ``lease_owner`` holds it and the build is building, and with ``attempt`` unless
+        that is still the build's attempt, as for :meth:`renew_lease`: otherwise a
+        fenced attempt lapses the successor that shares its owner.
         """
         conn = self._get_connection()
         try:
@@ -1025,14 +1027,16 @@ class BuildStore:
             # Strictly past: a lease is live through its deadline, so one ending at now
             # would still let the attempt through within the same clock reading.
             lapsed_at = math.nextafter(self._clock(), -math.inf)
-            cursor = conn.execute(
-                """
+            sql = """
                 UPDATE artifact_builds
                 SET lease_owner = NULL, lease_expires_at = ?
                 WHERE build_id = ? AND state = 'building' AND lease_owner = ?
-                """,
-                (lapsed_at, build_id, lease_owner),
-            )
+            """
+            params: list[SqlValue] = [lapsed_at, build_id, lease_owner]
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
+            cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
         finally:
@@ -1125,15 +1129,21 @@ class BuildStore:
         output_byte_count: int | None = None,
         logs: str | None = None,
         lease_owner: str | None = None,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Mark a build ready (building -> ready).
 
         Args:
             lease_owner: When given, apply only if this owner still holds the lease,
                 so a runner whose lease was taken over cannot publish over the new owner.
+            attempt: When given, apply only if this is still the build's attempt and
+                its lease has not lapsed, so a fenced attempt cannot complete its build,
+                nor a successor that shares its owner.
 
         Returns:
-            False if not found, not building, or the lease is held by someone else.
+            False if not found, not building, or the lease or the attempt is someone
+            else's.
         """
         conn = self._get_connection()
         try:
@@ -1143,10 +1153,14 @@ class BuildStore:
                 SET state = 'ready', completed_at = ?, output_byte_count = ?, logs = ?
                 WHERE build_id = ? AND state = 'building'
             """
-            params: list[SqlValue] = [self._clock(), output_byte_count, logs, build_id]
+            now = self._clock()
+            params: list[SqlValue] = [now, output_byte_count, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
+            if attempt is not None:
+                sql += " AND attempt = ? AND (lease_expires_at IS NULL OR lease_expires_at >= ?)"
+                params += [attempt, now]
             cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0

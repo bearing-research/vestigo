@@ -221,7 +221,10 @@ or a reclaim. An attempt a resume or a reclaim took the build from cannot be ope
 again either, even once its successor's lease lapses. `builds.lapse_lease(build_id,
 lease_owner)` ends a lease at once, under the build's write lock, so an acceptance
 already under way commits before it and nothing of the attempt after it; it clears the
-owner, so a renewal racing it from another thread cannot revive it. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
+owner, so a renewal racing it from another thread cannot revive it; `attempt=`, as for a
+renewal, and on `builds.complete_build`, keeps a fenced attempt from ending its
+successor's lease or completing its build, and `complete_build` with it refuses an
+attempt whose lease has lapsed. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
 build again after a crash.
 
 ## Releases
