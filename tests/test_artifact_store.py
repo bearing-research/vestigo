@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
+import vestigo.store as store_module
 from vestigo import uris
 from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES, S3BlobStore
 from vestigo.build_store import BuildStore
@@ -713,6 +714,54 @@ class TestCleanup:
         assert store.cleanup_failed(max_age_seconds=-10) == 0
         assert store.get_artifact("x", 1).state == "failed"
         assert store.retention_roots("x", 1)
+
+    def test_cleanup_failed_spares_a_version_a_requirer_needs(self, backend_store):
+        """Taken, the requirer would point at a hole the next version of x could fill."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "y", "prov-y")
+        store.require("y", 1, [("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_a_failed_requirer_requires(self, backend_store):
+        """The gap rule keeps z@2, and an import may yet fill it, edges and all."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "z", "prov-z1")
+        store.fail_artifact("z", store.create_artifact("z", "prov-z2", requires=[("x", 1)]))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_another_tenant_requires(self, backend_store):
+        """Taken, x's last row goes, and the requirer's own tenant may make x@1 anew."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", tenant="acme"), tenant="acme")
+        store.create_artifact("y", "prov-y", tenant="other", requires=[("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_ends_a_batch_when_its_time_is_up(self, backend_store, monkeypatch):
+        """A batch holds hold writers off, so it stops at the sweep's cap and the next one
+        goes on from there, at least one row each."""
+        store = backend_store
+        for artifact_id in ("a", "b", "c"):
+            store.fail_artifact(artifact_id, store.create_artifact(artifact_id, "prov"))
+        monkeypatch.setattr(store_module, "_GC_BATCH_SECONDS", 0.0)
+        batches = []
+        batch = ArtifactStore._cleanup_failed_batch
+
+        def counted(self, keys, cutoff):
+            batches.append(keys)
+            return batch(self, keys, cutoff)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", counted)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 3
+        assert [keys[0] for keys in batches] == [("a", 1), ("b", 1), ("c", 1)]
 
     def test_cleanup_preserves_ready(self, store):
         version = store.create_artifact("test-id", "hash123")
