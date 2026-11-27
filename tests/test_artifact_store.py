@@ -1677,6 +1677,58 @@ class TestPendingAliasChanges:
         )
         assert approved["actor"] == "approver"
 
+    @pytest.mark.parametrize(
+        ("replacement", "message"),
+        [
+            (("set", "m2", 1, "alice"), "alice now asks for m2@v=1"),
+            (("set", "m1", 1, "carol"), "carol now asks for m1@v=1"),
+            (("delete", None, None, "alice"), "alice now asks for a delete"),
+            (("set", "m1", 1, None), "a request now asks for m1@v=1"),
+            (("set", "m1", 1, "alice"), "alice now asks for m1@v=1"),  # asked again
+        ],
+    )
+    def test_an_approval_applies_only_the_change_its_approver_reviewed(
+        self, store, monkeypatch, replacement, message
+    ):
+        for artifact_id in ("m1", "m2", "m3"):
+            _make_ready_artifact(store, artifact_id, f"prov-{artifact_id}")
+        store.set_alias("demo/model", "champion", "m3", 1)
+        # A clock that always moves on, so a request asked again is stamped anew.
+        ticks = [1000.0]
+        monkeypatch.setattr(time, "time", lambda: ticks.append(ticks[-1] + 1) or ticks[-1])
+        store.request_alias_change("demo/model", "champion", "set", "m1", 1, actor="alice")
+        (seen,) = store.list_pending_changes()
+        # Replaced after the approver read it and before they approve.
+        action, artifact_id, version, actor = replacement
+        store.request_alias_change(
+            "demo/model", "champion", action, artifact_id, version, actor=actor
+        )
+        monkeypatch.undo()
+
+        with pytest.raises(ValueError, match=f"no longer the one reviewed: {message}"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.reject_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+
+        assert store.resolve_alias("demo/model", "champion").id == "m3"
+        (pending,) = store.list_pending_changes()
+        assert (
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=pending)[
+                "requested_by"
+            ]
+            == actor
+        )
+
+    def test_a_review_of_one_alias_approves_no_other(self, store):
+        _make_ready_artifact(store, "m1", "prov-1")
+        for alias in ("staging", "champion"):
+            store.request_alias_change("demo/model", alias, "set", "m1", 1, actor="alice")
+        staging = next(c for c in store.list_pending_changes() if c["alias"] == "staging")
+
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=staging)
+        assert store.approve_alias_change("demo/model", "staging", actor="bob", reviewed=staging)
+
     def test_reject_discards(self, store):
         _make_ready_artifact(store, "m1", "prov-1")
         store.request_alias_change("demo/model", "champion", "set", artifact_id="m1", version=1)
