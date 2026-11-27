@@ -12,7 +12,6 @@ release is rejected and neither id reverts.
 from __future__ import annotations
 
 import argparse
-import time
 import uuid
 from pathlib import Path
 
@@ -49,7 +48,9 @@ def revert_build(store: ArtifactStore, builds: BuildStore) -> str:
         computation_key=KEY,
         dispatch="external",
     )
-    builds.open_attempt(build_id, "worker", writable_until=time.time() + 3600, lease_owner="worker")
+    builds.open_attempt(
+        build_id, "worker", writable_until=builds.now() + 3600, lease_owner="worker"
+    )
     return build_id
 
 
