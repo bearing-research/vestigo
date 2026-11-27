@@ -1123,6 +1123,25 @@ class TestReferencesAndAuthorities:
         assert ledger.releases.get(release.release_id).state == "preparing"
         assert ledger.builds.get_build(build_id).state == "building"
 
+    def test_a_slot_goes_only_to_an_accepted_release_or_the_one_being_accepted(
+        self, ledger: Ledger
+    ):
+        """A slot is held for good: a release later abandoned would keep it from the winner."""
+        build_id = _build(ledger)
+        abandoned = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        assert ledger.releases.abandon(abandoned.release_id, "a1")
+        foreign = _checkpoint(ledger, _build(ledger, tenant="acme")).release.release_id
+        pending = ledger.releases.prepare(build_id, "a1", "final")
+        for release_id in (pending.release_id, abandoned.release_id, foreign, "no-such-release"):
+            with pytest.raises(OperationFailed, match="not an accepted release"):
+                ledger.releases.apply(build_id, "a1", [AssignAuthority("slot:x", release_id)])
+        assert ledger.releases.authority("slot:x") is None
+
+        ledger.releases.accept(pending.release_id, [_stage(ledger, pending, "model", b"w")])
+        later = _build(ledger)
+        ledger.releases.apply(later, "a1", [AssignAuthority("slot:x", pending.release_id)])
+        assert ledger.releases.authority("slot:x") == pending.release_id
+
     def test_two_attempts_racing_for_a_slot_have_one_winner(self, ledger: Ledger):
         """Two processes accept finals claiming one slot at once; the slot has one winner."""
         releases, staged = [], []
