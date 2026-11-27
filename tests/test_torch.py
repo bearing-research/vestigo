@@ -857,6 +857,74 @@ def test_collect_fails_the_placeholder_a_close_never_retried_left_building(
     assert (build.state, placeholder.state) == ("failed", "failed")
 
 
+def test_a_derivation_whose_open_reply_was_lost_is_reaped_after_its_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    with Ledger(tmp_path / "ledger") as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 1)
+            source = run.release_of(1).release_id
+            run.finish()
+        lost = ledger.store.dialect.operational_error
+        open_build = BuildStore.open_build
+
+        def committed_then_dropped(self: BuildStore, *args, **kwargs) -> BuildState:
+            open_build(self, *args, **kwargs)
+            raise lost("the reply was lost")
+
+        with Ledger(tmp_path / "ledger", writable_seconds=0.5) as job:
+            with monkeypatch.context() as patch:
+                patch.setattr(BuildStore, "open_build", committed_then_dropped)
+                with pytest.raises(lost):
+                    job.derive(source, "eval", {"metrics": b"1"})
+        # The retry derives it, in a full write window.
+        assert ledger.derive(source, "eval", {"metrics": b"1"}).release.state == "accepted"
+        time.sleep(0.6)
+        ledger.collect(keep=1)
+        states = sorted(
+            (b.state, ledger.store.get_artifact(b.artifact_id, b.version).state)
+            for b in ledger.builds.builds_of(DERIVE_EXECUTOR)
+        )
+        assert states == [("failed", "failed"), ("ready", "ready")]
+
+
+def test_a_derivation_whose_cleanup_failed_is_reaped_after_its_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    with Ledger(tmp_path / "ledger") as ledger:
+        trainer = Trainer(ledger)
+        with ledger.start(trainer.program) as run:
+            trainer.train(run, 2)
+            earlier, source = run.release_of(1).release_id, run.release_of(2).release_id
+            run.set_head("tiny/best", earlier)  # keeps it through the collection
+            run.finish()
+        lost = ledger.store.dialect.operational_error
+
+        def unreachable(*args, **kwargs):
+            raise lost("the database is down")
+
+        def disk_full(*args, **kwargs):
+            raise OSError("disk full")
+
+        with Ledger(tmp_path / "ledger", writable_seconds=0.5) as job:
+            with monkeypatch.context() as patch:
+                patch.setattr(Ledger, "_write_small", disk_full)
+                patch.setattr(ArtifactStore, "fail_artifact", unreachable)
+                with pytest.raises(OSError, match="disk full"):
+                    job.derive(source, "eval", {"metrics": b"1"})
+        time.sleep(0.6)
+        ledger.collect(keep=1)
+        try:
+            ledger.derive(earlier, "eval", {"metrics": b"0"})
+            blocked = None
+        except ValueError as exc:
+            blocked = str(exc)
+        [build, *_] = ledger.builds.builds_of(DERIVE_EXECUTOR)
+        placeholder = ledger.store.get_artifact(build.artifact_id, build.version)
+        assert (build.state, placeholder.state, blocked) == ("failed", "failed", None)
+
+
 def test_a_failed_close_does_not_hide_why_the_block_was_left(
     ledger: Ledger, monkeypatch: pytest.MonkeyPatch
 ):
