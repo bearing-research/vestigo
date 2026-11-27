@@ -2740,7 +2740,9 @@ class ArtifactStore:
         writing nothing, when the source version or its blob is gone or the source is not
         a result. A copy whose bytes fail to write raises and leaves its row ``building``
         under the release, which then cannot be accepted: a partial revert is abandoned,
-        never made current.
+        never made current. A sweep spares the source until its bytes are copied; an
+        explicit :meth:`delete_artifact` does not wait, as it does not ask what requires a
+        version, and on a backend reading in ranges the copy then fails.
 
         Raises:
             ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
@@ -2792,8 +2794,7 @@ class ArtifactStore:
                     self._stage_under(conn, release_id, final=True)
                 # The source again, locked as a pointer's target is: a sweep or a delete
                 # that took it since the look above leaves no row, and one that comes
-                # after waits for the copy's row and the edges it takes over (not for its
-                # bytes, streamed from the reader once this commits).
+                # after waits for the copy's row and the edges below.
                 lock = "" if self._dialect.name == "sqlite" else " FOR SHARE"
                 held = conn.execute(
                     f"SELECT state FROM artifact_versions WHERE id = ? AND version = ?{lock}",
@@ -2840,6 +2841,25 @@ class ArtifactStore:
                     "FROM retention_edges WHERE from_artifact_id = ? AND from_version = ?",
                     (new_version, artifact_id, version),
                 )
+                # And the source itself, until its bytes are copied: they stream after this
+                # commits, and a sweep would otherwise take the source mid-copy, where an
+                # object store reading in ranges (GCS, Azure) fails the rest of the copy.
+                # The building copy is a root, so the edge holds the source. Dropped after
+                # only if inserted here: the source's own edges, copied above, stay.
+                holds_source = conn.execute(
+                    "INSERT INTO retention_edges "
+                    "(tenant, from_artifact_id, from_version, to_artifact_id, to_version) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (from_artifact_id, from_version, to_artifact_id, to_version) "
+                    "DO NOTHING",
+                    (
+                        source.tenant if source.tenant is not None else "",
+                        artifact_id,
+                        new_version,
+                        artifact_id,
+                        version,
+                    ),
+                ).rowcount
                 conn.commit()
             finally:
                 conn.close()
@@ -2850,14 +2870,31 @@ class ArtifactStore:
             from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES
 
             copied = 0
-            with self.blob_store.open_blob_writer(artifact_id, new_version) as writer:
-                # Hashed in passing: the bytes go by anyway, and reading them again for the
-                # digest would be wasteful.
-                hasher = hashlib.sha256()
-                while chunk := reader.read(BLOB_STREAM_CHUNK_BYTES):
-                    writer.write(chunk)
-                    hasher.update(chunk)
-                    copied += len(chunk)
+            try:
+                with self.blob_store.open_blob_writer(artifact_id, new_version) as writer:
+                    # Hashed in passing: the bytes go by anyway, and reading them again for
+                    # the digest would be wasteful.
+                    hasher = hashlib.sha256()
+                    while chunk := reader.read(BLOB_STREAM_CHUNK_BYTES):
+                        writer.write(chunk)
+                        hasher.update(chunk)
+                        copied += len(chunk)
+            except BaseException:
+                # Copied or not, the copy needs its source no longer; the copy's own
+                # error is the one to raise. A crash before this leaves the edge on a
+                # building row, which goes with that row.
+                if holds_source:
+                    try:
+                        self._release_copy_source(artifact_id, new_version, version)
+                    except self._dialect.operational_error:
+                        logger.exception(
+                            "stage_promotion: %s@v=%d still holds its source",
+                            artifact_id,
+                            new_version,
+                        )
+                raise
+            if holds_source:
+                self._release_copy_source(artifact_id, new_version, version)
 
         return StagedVersion(
             artifact_id=artifact_id,
@@ -2867,6 +2904,22 @@ class ArtifactStore:
             byte_size=copied,
             content_sha256=hasher.hexdigest(),
         )
+
+    def _release_copy_source(self, artifact_id: str, copy_version: int, version: int) -> None:
+        """Drop the edge :meth:`stage_promotion` holds its source by during the copy."""
+        conn = self._get_connection()
+        try:
+            # The edge is a row a sweep's claim may delete with a demoted copy.
+            self._hold_off_sweeps(conn)
+            conn.execute(
+                "DELETE FROM retention_edges "
+                "WHERE from_artifact_id = ? AND from_version = ? "
+                "AND to_artifact_id = ? AND to_version = ?",
+                (artifact_id, copy_version, artifact_id, version),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _reclaim_blob(
         self, canonical_blob: tuple[str, int], ref: str, artifact_id: str, version: int
