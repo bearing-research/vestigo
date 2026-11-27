@@ -720,6 +720,16 @@ class TestAttemptsAndFences:
         assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
         assert order == [f"lock {build_id}", "clock"]
 
+    def test_a_fenced_attempt_does_not_renew_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)  # a1, under runner-1
+        # a1 stalls past its lease; the same runner resumes the build in a2.
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a1")
+        assert ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a2")
+
     def test_a_renewal_queued_for_the_key_past_the_deadline_is_refused(self, ledger: Ledger):
         """Any fence check that held the key meanwhile saw the lease lapsed, so it stays so."""
         build_id = _build(ledger)
