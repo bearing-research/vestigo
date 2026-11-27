@@ -2065,11 +2065,13 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
-            for (artifact_id, version), requires in requirements.items():
-                row = conn.execute(
-                    "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
-                    (artifact_id, version),
-                ).fetchone()
+            # Each requirer locked, in key order: a delete or a sweep that went first left
+            # no row, and one that comes after sees the edges. Unlocked, an edge from a
+            # requirer deleted meanwhile held its target for good.
+            for index, ((artifact_id, version), requires) in enumerate(
+                sorted(requirements.items())
+            ):
+                row = self._lock_target(conn, artifact_id, version, "tenant", locked=index > 0)
                 if row is None:
                     raise ValueError(f"Artifact {artifact_id}@v={version} not found")
                 self._write_requirements(conn, artifact_id, version, row["tenant"], requires)
@@ -3729,17 +3731,25 @@ class ArtifactStore:
             )
 
     def _lock_target(
-        self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
+        self,
+        conn: StoreConnection,
+        artifact_id: str,
+        version: int,
+        columns: str = "state, tenant",
+        *,
+        locked: bool = False,
     ):
         """The version row a pointer or a hold is about to name, kept until commit.
 
         A delete or a sweep's claim then waits for the caller, or went first and the
         row reads as missing. Postgres takes the row ``FOR SHARE``, which conflicts
-        with both; SQLite takes the write lock before the read. The lock comes before
-        the audit lock, as the delete takes them.
+        with both; SQLite takes the write lock before the read, unless *locked* says an
+        earlier call on this transaction took it. The lock comes before the audit lock,
+        as the delete takes them.
         """
         if self._dialect.name == "sqlite":
-            self._dialect.begin_write(conn, artifact_id)
+            if not locked:
+                self._dialect.begin_write(conn, artifact_id)
             suffix = ""
         else:
             suffix = " FOR SHARE"
