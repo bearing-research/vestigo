@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
+import vestigo.store as store_module
 from vestigo import uris
 from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES, S3BlobStore
 from vestigo.build_store import BuildStore
@@ -632,6 +633,136 @@ class TestCleanup:
         assert store.get_artifact("model", 2) is None
         assert store.get_artifact("model", 3).state == "failed"
 
+    @staticmethod
+    def _before_the_lock(monkeypatch, write) -> None:
+        """Run *write* between cleanup's read of the failed rows and its batch's locks."""
+        lock = ArtifactStore._cleanup_failed_batch
+
+        def write_then_lock(self, *args):
+            write()
+            return lock(self, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", write_then_lock)
+
+    @staticmethod
+    def _filled(store, version: int):
+        """An import of a ready result into the failed row ``x@v=version``."""
+        data = _ipc_bytes(2)
+        record = replace(
+            store.get_artifact("x", version),
+            state="ready",
+            byte_size=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+            schema_json="{}",
+            row_count=2,
+        )
+        return lambda: store.import_artifact(record, data), data
+
+    def test_cleanup_failed_spares_a_row_an_import_filled_after_its_read(
+        self, backend_store, monkeypatch
+    ):
+        """Filled in, the row is a ready version whose bytes are under the import's key."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        fill, data = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "ready"
+        assert store.read_blob("x", 1) == data
+
+    def test_cleanup_failed_keeps_the_top_failed_version_over_one_an_import_filled(
+        self, backend_store, monkeypatch
+    ):
+        """The gap rule runs on the rows still failed once locked, or v2 is handed out twice."""
+        store = backend_store
+        for provenance in ("prov-1", "prov-2"):
+            store.fail_artifact("x", store.create_artifact("x", provenance))
+        fill, _ = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 2).state == "failed"
+        assert store.create_artifact("x", "prov-3") == 3
+
+    def test_cleanup_failed_spares_a_younger_row_put_at_a_key_it_read(
+        self, backend_store, monkeypatch
+    ):
+        """Deleted and failed again since the read, the key holds a row too young to go."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-1"))
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET created_at = created_at - 7200")
+        conn.commit()
+        conn.close()
+
+        def fail_anew():
+            assert store.delete_artifact("x", 1)
+            assert store.create_artifact("x", "prov-2") == 1
+            store.fail_artifact("x", 1)
+
+        self._before_the_lock(monkeypatch, fail_anew)
+
+        assert store.cleanup_failed(max_age_seconds=3600) == 0
+        assert store.get_artifact("x", 1).provenance_hash == "prov-2"
+
+    def test_cleanup_failed_keeps_a_root_retained_after_its_read(self, backend_store, monkeypatch):
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        self._before_the_lock(monkeypatch, lambda: store.retain("x", 1, kind="pin", holder="h"))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+        assert store.retention_roots("x", 1)
+
+    def test_cleanup_failed_spares_a_version_a_requirer_needs(self, backend_store):
+        """Taken, the requirer would point at a hole the next version of x could fill."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "y", "prov-y")
+        store.require("y", 1, [("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_a_failed_requirer_requires(self, backend_store):
+        """The gap rule keeps z@2, and an import may yet fill it, edges and all."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "z", "prov-z1")
+        store.fail_artifact("z", store.create_artifact("z", "prov-z2", requires=[("x", 1)]))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_another_tenant_requires(self, backend_store):
+        """Taken, x's last row goes, and the requirer's own tenant may make x@1 anew."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", tenant="acme"), tenant="acme")
+        store.create_artifact("y", "prov-y", tenant="other", requires=[("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_ends_a_batch_when_its_time_is_up(self, backend_store, monkeypatch):
+        """A batch holds hold writers off, so it stops at the sweep's cap and the next one
+        goes on from there, at least one row each."""
+        store = backend_store
+        for artifact_id in ("a", "b", "c"):
+            store.fail_artifact(artifact_id, store.create_artifact(artifact_id, "prov"))
+        monkeypatch.setattr(store_module, "_GC_BATCH_SECONDS", 0.0)
+        batches = []
+        batch = ArtifactStore._cleanup_failed_batch
+
+        def counted(self, keys, cutoff):
+            batches.append(keys)
+            return batch(self, keys, cutoff)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", counted)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 3
+        assert [keys[0] for keys in batches] == [("a", 1), ("b", 1), ("c", 1)]
+
     def test_cleanup_preserves_ready(self, store):
         version = store.create_artifact("test-id", "hash123")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)
@@ -1028,12 +1159,12 @@ class TestVersionPromotion:
         store.blob_store.write_blob("file-1", 1, b"file")
         store.finalize_artifact("file-1", 1, "{}", 1, 4)
         manifest = store.create_artifact(
-            "manifest",
-            "prov-m",
-            requires=[("file-1", 1)],
-            release_id="rel-1",
-            computation_key="comp-1",
+            "manifest", "prov-m", requires=[("file-1", 1)], computation_key="comp-1"
         )
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET release_id = 'rel-1' WHERE id = 'manifest'")
+        conn.commit()
+        conn.close()
         store.blob_store.write_blob("manifest", manifest, b"m")
         store.finalize_artifact("manifest", manifest, "{}", 1, 1)
         self._ready(store, "manifest", "prov-m2", b"m2")
@@ -1676,6 +1807,58 @@ class TestPendingAliasChanges:
             e for e in store.read_audit(name="demo/model") if e["action"] == "alias_approved"
         )
         assert approved["actor"] == "approver"
+
+    @pytest.mark.parametrize(
+        ("replacement", "message"),
+        [
+            (("set", "m2", 1, "alice"), "alice now asks for m2@v=1"),
+            (("set", "m1", 1, "carol"), "carol now asks for m1@v=1"),
+            (("delete", None, None, "alice"), "alice now asks for a delete"),
+            (("set", "m1", 1, None), "a request now asks for m1@v=1"),
+            (("set", "m1", 1, "alice"), "alice now asks for m1@v=1"),  # asked again
+        ],
+    )
+    def test_an_approval_applies_only_the_change_its_approver_reviewed(
+        self, store, monkeypatch, replacement, message
+    ):
+        for artifact_id in ("m1", "m2", "m3"):
+            _make_ready_artifact(store, artifact_id, f"prov-{artifact_id}")
+        store.set_alias("demo/model", "champion", "m3", 1)
+        # A clock that always moves on, so a request asked again is stamped anew.
+        ticks = [1000.0]
+        monkeypatch.setattr(time, "time", lambda: ticks.append(ticks[-1] + 1) or ticks[-1])
+        store.request_alias_change("demo/model", "champion", "set", "m1", 1, actor="alice")
+        (seen,) = store.list_pending_changes()
+        # Replaced after the approver read it and before they approve.
+        action, artifact_id, version, actor = replacement
+        store.request_alias_change(
+            "demo/model", "champion", action, artifact_id, version, actor=actor
+        )
+        monkeypatch.undo()
+
+        with pytest.raises(ValueError, match=f"no longer the one reviewed: {message}"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.reject_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+
+        assert store.resolve_alias("demo/model", "champion").id == "m3"
+        (pending,) = store.list_pending_changes()
+        assert (
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=pending)[
+                "requested_by"
+            ]
+            == actor
+        )
+
+    def test_a_review_of_one_alias_approves_no_other(self, store):
+        _make_ready_artifact(store, "m1", "prov-1")
+        for alias in ("staging", "champion"):
+            store.request_alias_change("demo/model", alias, "set", "m1", 1, actor="alice")
+        staging = next(c for c in store.list_pending_changes() if c["alias"] == "staging")
+
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=staging)
+        assert store.approve_alias_change("demo/model", "staging", actor="bob", reviewed=staging)
 
     def test_reject_discards(self, store):
         _make_ready_artifact(store, "m1", "prov-1")
@@ -3957,6 +4140,63 @@ class TestPromotionIsNotARelease:
         first = bundles[0].release.release_id
         assert [(o.id, o.version) for o in releases.bundle(first).outputs] == [("model-1", 1)]
         assert ("model-1", 2) not in releases.collectable_checkpoints(keep=1)
+
+
+class TestASourceIsHeldWhileItsCopyStreams:
+    """A promotion's bytes stream after its row commits: a sweep then must spare the source."""
+
+    @staticmethod
+    def _during_copy(store, monkeypatch, step):
+        """Run *step* once the copy's row has committed, before its bytes are written."""
+        open_writer = store.blob_store.open_blob_writer
+
+        def opened(blob_id, version):
+            step()
+            return open_writer(blob_id, version)
+
+        monkeypatch.setattr(store.blob_store, "open_blob_writer", opened)
+
+    def test_a_sweep_mid_copy_spares_the_source(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        swept = []
+        self._during_copy(
+            store, monkeypatch, lambda: swept.append(store.garbage_collect(max_idle_days=0))
+        )
+
+        promoted = store.promote_version("art", old)
+
+        assert swept and store.get_artifact("art", old) is not None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_the_copy_holds_its_source_no_longer_once_it_lands(self, backend_store):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        promoted = store.promote_version("art", old)
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_a_failed_copy_holds_its_source_no_longer(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+
+        def broken():
+            raise OSError("the disk filled up")
+
+        self._during_copy(store, monkeypatch, broken)
+        with pytest.raises(OSError, match="disk filled"):
+            store.promote_version("art", old)
+        monkeypatch.undo()
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
 
 
 class TestAReadThroughAPointer:
