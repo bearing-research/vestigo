@@ -11,6 +11,7 @@ SQLite and on Postgres. Nothing here imports Strata.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -868,14 +869,14 @@ class TestAttemptsAndFences:
         real_settle = ReleaseStore._settle
         retried: list[ReleaseBundle] = []
 
-        def settle_after_a_retry(self, release_id: str, state: str) -> None:
+        def settle_after_a_retry(self, build_id: str, release_id: str, state: str) -> None:
             # Between the fence's rollback and the rejection, a caller whose clock lags
             # sees the lease live and its retry is accepted.
             if not retried:
                 ledger.clock.now -= 120
                 retried.append(ledger.releases.accept(release_id, staged))
                 ledger.clock.now += 120
-            real_settle(self, release_id, state)
+            real_settle(self, build_id, release_id, state)
 
         monkeypatch.setattr(ReleaseStore, "_settle", settle_after_a_retry)
         with pytest.raises(ReleaseRejected):
@@ -1340,6 +1341,125 @@ class TestPromotionsInARelease:
         assert ledger.store.get_artifact("x", building + 1) is None
         assert ledger.store.get_artifact("z", 2) is None
         assert ledger.releases.bundle(release.release_id).outputs == []
+
+    def test_a_row_staged_while_its_release_is_accepted_is_refused_or_counted(self, ledger: Ledger):
+        """An acceptance holds the build's key from its read of the release's rows to its
+        commit, so a row staged meanwhile never sits building in an accepted release."""
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        staged = [_stage(ledger, release, "model", b"w")]
+        late_id = f"{build_id}-late"
+
+        def stage_late(other: Ledger) -> object:
+            try:
+                return other.store.create_artifact(
+                    late_id,
+                    checkpoint_output_key(PARENT, build_id, release.sequence, "late"),
+                    SPEC,
+                    computation_key=PARENT,
+                    minted=True,
+                    release_id=release.release_id,
+                )
+            except ValueError as exc:
+                return exc
+
+        accepted, late, _ = _interleave(
+            ledger,
+            lambda ledger_: ledger_.releases.accept(release.release_id, staged),
+            stage_late,
+            after="WHERE release_id = ? AND state = 'building'",
+        )
+
+        assert isinstance(accepted, ReleaseBundle) and accepted.release.state == "accepted"
+        assert isinstance(late, ValueError) and "accepted" in str(late)
+        assert ledger.store.get_artifact(late_id, 1) is None
+        assert [o.state for o in ledger.releases.bundle(release.release_id).outputs] == ["ready"]
+
+    def test_a_row_staged_while_its_release_is_rejected_is_refused(
+        self, ledger: Ledger, monkeypatch
+    ):
+        """A rejection settles under the build's key too, after the acceptance that found
+        the lease lapsed has let it go."""
+        build_id = _build(ledger)
+        release = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        ledger.clock.now += 120
+        settle_on = ReleaseStore._settle_on
+        outcome: dict[str, object] = {}
+
+        def stage_late() -> None:
+            try:
+                outcome["staged"] = ledger.store.create_artifact(
+                    f"{build_id}-late",
+                    checkpoint_output_key(PARENT, build_id, release.sequence, "late"),
+                    SPEC,
+                    computation_key=PARENT,
+                    minted=True,
+                    release_id=release.release_id,
+                )
+            except ValueError as exc:
+                outcome["refused"] = exc
+
+        stager = threading.Thread(target=stage_late)
+
+        def staged_meanwhile(self, conn, release_id, state):
+            if not stager.is_alive() and not outcome:
+                stager.start()
+                stager.join(1)  # one not held off commits in this time
+            return settle_on(self, conn, release_id, state)
+
+        monkeypatch.setattr(ReleaseStore, "_settle_on", staged_meanwhile)
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.accept(release.release_id, [])
+        stager.join(10)
+
+        assert not stager.is_alive()
+        assert list(outcome) == ["refused"] and "rejected" in str(outcome["refused"])
+        assert ledger.store.get_artifact(f"{build_id}-late", 1) is None
+
+    def test_a_copy_whose_release_is_accepted_meanwhile_is_refused(
+        self, ledger: Ledger, monkeypatch
+    ):
+        """The release is looked at again under the locks the copy's row is written in."""
+        _value(ledger, "x", "x-k1", b"x1")
+        release = ledger.releases.prepare(_build(ledger), "a1", "final")
+        open_reader = ledger.store.open_blob_reader
+
+        def accept_meanwhile(artifact_id, version):
+            ledger.releases.accept(release.release_id, [])
+            return open_reader(artifact_id, version)
+
+        monkeypatch.setattr(ledger.store, "open_blob_reader", accept_meanwhile)
+        with pytest.raises(ValueError, match="unsettled final"):
+            ledger.store.stage_promotion("x", 1, release_id=release.release_id)
+
+        assert ledger.store.get_artifact("x", 2) is None
+        assert ledger.releases.bundle(release.release_id).outputs == []
+
+    def test_nothing_is_copied_from_a_source_a_sweep_took_meanwhile(
+        self, ledger: Ledger, monkeypatch
+    ):
+        """Else the copy is current with no edges, its source's files gone."""
+        for provenance in ("f-k1", "f-k2"):
+            _value(ledger, "f", provenance, b"f")
+        for file_version, provenance in ((1, "m-k1"), (2, "m-k2")):
+            version = ledger.store.create_artifact(
+                "m", provenance, SPEC, requires=[("f", file_version)]
+            )
+            ledger.store.write_blob("m", version, b"m")
+            ledger.store.finalize_artifact("m", version, "{}", None, 1)
+        open_reader = ledger.store.open_blob_reader
+
+        def sweep_meanwhile(artifact_id, version):
+            reader = open_reader(artifact_id, version)
+            ledger.store.garbage_collect(keep_superseded=0)
+            return reader
+
+        monkeypatch.setattr(ledger.store, "open_blob_reader", sweep_meanwhile)
+        assert ledger.store.get_artifact("m", 1) is not None
+
+        assert ledger.store.promote_version("m", 1) is None
+        assert ledger.store.get_artifact("m", 1) is None
+        assert ledger.store.get_latest_version("m").version == 2
 
 
 class TestCheckpointRetention:

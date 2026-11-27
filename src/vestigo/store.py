@@ -1834,13 +1834,16 @@ class ArtifactStore:
         Raises:
             ArtifactIdTaken: If a version of ``artifact_id`` belongs to another tenant.
             ValueError: If ``artifact_id`` is empty, holds ``@v=``, ``/`` or ``\\``, is
-                ``..``, or ends as an attempt's blob id does (:func:`reject_unsafe_artifact_id`).
+                ``..``, or ends as an attempt's blob id does (:func:`reject_unsafe_artifact_id`);
+                or ``release_id`` names no release, or one already settled.
         """
         reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
             version, was_minted = self._next_version(conn, artifact_id, tenant)
+            if release_id is not None:
+                self._stage_under(conn, release_id, final=False)
 
             input_versions_json = json.dumps(input_versions) if input_versions else None
             definition_id = (
@@ -1877,6 +1880,42 @@ class ArtifactStore:
             return version
         finally:
             conn.close()
+
+    def _stage_under(self, conn: StoreConnection, release_id: str, *, final: bool) -> None:
+        """Hold *release_id*'s build key shared and refuse a settled release, on the
+        transaction that writes a row staged under it.
+
+        An acceptance holds the key exclusively from its read of the release's rows to
+        its commit, so the row lands before that read, where it counts, or after the
+        commit, where the release reads as settled here. Stagers do not queue on each
+        other. Taken after the id's key: a build id that is also an artifact id is then
+        held already, and the shared lock is no upgrade to wait for. On SQLite the write
+        lock already serializes them all.
+
+        Raises:
+            ValueError: *release_id* names no release, one accepted, rejected or
+                abandoned, or with *final* one that is not a ``final``.
+        """
+        row = conn.execute(
+            "SELECT build_id FROM build_releases WHERE release_id = ?", (release_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            if final:
+                raise ValueError(f"release {release_id} is not an unsettled final release")
+            raise ValueError(f"release {release_id} does not exist")
+        self._dialect.share_write(conn, row["build_id"])
+        row = one(
+            conn.execute(
+                "SELECT kind, state FROM build_releases WHERE release_id = ?", (release_id,)
+            )
+        )
+        if row["state"] in ("preparing", "prepared") and (not final or row["kind"] == "final"):
+            return
+        conn.rollback()
+        if final:
+            raise ValueError(f"release {release_id} is not an unsettled final release")
+        raise ValueError(f"release {release_id} is {row['state']}")
 
     def _next_version(
         self, conn: StoreConnection, artifact_id: str, tenant: str | None
@@ -2749,6 +2788,20 @@ class ArtifactStore:
             try:
                 self._hold_off_sweeps(conn)
                 new_version, was_minted = self._next_version(conn, artifact_id, tenant)
+                if release_id is not None:
+                    self._stage_under(conn, release_id, final=True)
+                # The source again, locked as a pointer's target is: a sweep or a delete
+                # that took it since the look above leaves no row, and one that comes
+                # after waits for the copy's row and the edges it takes over (not for its
+                # bytes, streamed from the reader once this commits).
+                lock = "" if self._dialect.name == "sqlite" else " FOR SHARE"
+                held = conn.execute(
+                    f"SELECT state FROM artifact_versions WHERE id = ? AND version = ?{lock}",
+                    (artifact_id, version),
+                ).fetchone()
+                if held is None or held["state"] not in _RESULT_STATES:
+                    conn.rollback()
+                    return None
                 conn.execute(
                     """
                     INSERT INTO artifact_versions
