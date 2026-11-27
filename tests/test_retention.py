@@ -7,6 +7,7 @@ the row; a holder retains a version under a kind and a holder of its own.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -241,6 +242,35 @@ class TestRequirements:
 
         assert whole == ("whole", 1)
         assert _edges(store) == {(*whole, *part) for part in parts}
+
+    def test_a_delete_of_the_requirer_mid_require_waits_and_takes_the_edges(
+        self, backend_store, monkeypatch
+    ):
+        """Unlocked, a requirer deleted between its read and the edges' insert left an edge
+        from no version, which held its target for good."""
+        store = backend_store
+        target = _ready(store, "t")
+        requirer = _ready(store, "r")
+        write = ArtifactStore._write_requirements
+        deletes: list[threading.Thread] = []
+        deleted: list[bool] = []
+
+        def delete_meanwhile(conn, *args):
+            worker = threading.Thread(
+                target=lambda: deleted.append(store.delete_artifact(*requirer))
+            )
+            worker.start()
+            worker.join(1)
+            deletes.append(worker)
+            return write(conn, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_write_requirements", staticmethod(delete_meanwhile))
+        store.require(*requirer, [target])
+        deletes[0].join(30)
+
+        assert deleted == [True]
+        assert _edges(store) == set()
+        assert _sweep(store) == 1
 
     def test_a_held_version_keeps_what_it_requires(self, store):
         parts = [_ready(store) for _ in range(2)]

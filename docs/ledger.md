@@ -87,7 +87,7 @@ if hit is None:
 - **An id holds versions.** Each `create_artifact` adds the next version (1, 2, ...).
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
-  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
+  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows, in batches that each commit on their own.
   `sweep_zombie_builds` fails every `building` row older than its cutoff, except the
   rows of a build whose lease is live (its target, its releases' outputs, its
   computation's rows), so run it only where no writer without a lease can hold a row
@@ -118,7 +118,10 @@ store.set_tag("train", 7, "dataset", "2026-10")
 
 A protected alias changes only by approval: `request_alias_change`, then
 `approve_alias_change` or `reject_alias_change`. With
-`require_distinct_approver=True`, the requester cannot approve their own change. Every change goes to the audit log (`read_audit`).
+`require_distinct_approver=True`, the requester cannot approve their own change. Pass
+the change you reviewed, as `list_pending_changes` listed it, as `reviewed=`: a request
+that replaced it since is refused rather than applied or discarded unseen. Every change
+goes to the audit log (`read_audit`).
 
 ## Lineage
 
@@ -274,7 +277,7 @@ start from.
 | --- | --- |
 | `AdvanceReference(name, release_id)` | points a head at an accepted release, which it then retains |
 | `AssertReferenceRevision(name, revision)` | fails unless the head is at that revision (0: absent), guarding an advance after it |
-| `AssignAuthority(target, release_id)` | makes the release the single winner of an output slot |
+| `AssignAuthority(target, release_id)` | makes an accepted release the single winner of an output slot |
 | `CheckBuildLease(build_id, attempt)` | fails unless that attempt holds that build |
 | `InsertAuditEvent(event)` | writes an audit row with the release |
 
