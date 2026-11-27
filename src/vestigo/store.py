@@ -3009,6 +3009,10 @@ class ArtifactStore:
                     if not self._can_assign_name_for_tenant(artifact_tenant, tenant):
                         raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
                     self._hold_off_sweeps(conn)
+                    # As every other name write locks its target: a delete waits, and on
+                    # SQLite the name's previous target is read under the write lock.
+                    if self._lock_target(conn, *canonical) is None:
+                        raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
                     self._set_name_in_connection(conn, name, *canonical, tenant)
                 _commit_through_fence(conn, *canonical)
                 return self.get_artifact(*canonical)
@@ -3213,7 +3217,9 @@ class ArtifactStore:
         # '' not NULL for personal mode: SQLite NULL != NULL in unique constraints.
         effective_tenant = tenant if tenant is not None else ""
 
-        # Audit: record what the name pointed at before this move.
+        # Audit: record what the name pointed at before this move, read under the audit
+        # lock so no other move commits in between.
+        self._serialize_audit(conn)
         cursor = conn.execute(
             "SELECT artifact_id, version FROM artifact_names WHERE name = ? AND tenant = ?",
             (name, effective_tenant),
@@ -3882,12 +3888,14 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             effective_tenant = tenant if tenant is not None else ""
+            # The audit's key (SQLite's write lock) before the read, so the deletion is
+            # audited from what it deleted.
+            self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT version FROM artifact_names WHERE name = ? AND tenant = ?",
+                "SELECT artifact_id, version FROM artifact_names WHERE name = ? AND tenant = ?",
                 (name, effective_tenant),
             )
             previous = cursor.fetchone()
-            self._serialize_audit(conn)
             cursor = conn.execute(
                 "DELETE FROM artifact_names WHERE name = ? AND tenant = ?",
                 (name, effective_tenant),
@@ -3897,6 +3905,7 @@ class ArtifactStore:
                     conn,
                     action="name_delete",
                     name=name,
+                    from_artifact_id=previous["artifact_id"] if previous else None,
                     from_version=previous["version"] if previous else None,
                     tenant=tenant,
                 )
@@ -4291,6 +4300,9 @@ class ArtifactStore:
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
             self._lock_readable_target(conn, artifact_id, version, tenant)
+            # Before the read: a move committed after it would be audited from the wrong
+            # target.
+            self._serialize_audit(conn)
 
             effective_tenant = tenant if tenant is not None else ""
             cursor = conn.execute(
@@ -4429,12 +4441,14 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             effective_tenant = tenant if tenant is not None else ""
+            # As in delete_name.
+            self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT version FROM artifact_aliases WHERE name = ? AND alias = ? AND tenant = ?",
+                "SELECT artifact_id, version FROM artifact_aliases "
+                "WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             previous = cursor.fetchone()
-            self._serialize_audit(conn)
             cursor = conn.execute(
                 "DELETE FROM artifact_aliases WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
@@ -4445,6 +4459,7 @@ class ArtifactStore:
                     action="alias_delete",
                     name=name,
                     alias=alias,
+                    from_artifact_id=previous["artifact_id"] if previous else None,
                     from_version=previous["version"] if previous else None,
                     actor=actor,
                     tenant=tenant,
