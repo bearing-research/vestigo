@@ -1371,6 +1371,8 @@ class BuildStore:
         logs: str | None = None,
         lease_owner: str | None = None,
         lease_expires_at: float | None = None,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Mark a build failed (pending or building -> failed).
 
@@ -1379,9 +1381,13 @@ class BuildStore:
                 as in ``complete_build``.
             lease_expires_at: With ``lease_owner``, also pin the exact claim, as in
                 ``complete_within``.
+            attempt: When given, apply only if this is still the build's attempt, its
+                lease live or not: an attempt that lapsed its own lease has no owner
+                left to match, and nothing has taken the build from it.
 
         Returns:
-            False if not found, not pending or building, or the lease is someone else's.
+            False if not found, not pending or building, the lease is someone else's,
+            or with ``attempt`` the build is another attempt's.
         """
         conn = self._get_connection()
         try:
@@ -1398,6 +1404,9 @@ class BuildStore:
                 if lease_expires_at is not None:
                     sql += " AND lease_expires_at = ?"
                     params.append(lease_expires_at)
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
             cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0

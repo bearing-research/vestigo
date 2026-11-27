@@ -2042,11 +2042,13 @@ class Ledger:
         execution, those under an abandoned release and those of a step at or before
         the newest it accepted; an observation a fenced or ended attempt never
         finished storing; and the outputs of a derivation still building past its
-        lease (its write window), whose process died: its release is abandoned and
-        its build and placeholder fail. Failed rows go too, but for the placeholder a build still
-        names (a finished execution's record). Observations stay. ``deleted_count``
-        and ``deleted_bytes`` count the staged rows too, by their blobs' sizes, and a
-        dry run lists them under ``collected``.
+        lease (its write window), whose process died: its release, if unsettled, is
+        abandoned, and its build and placeholder fail even when it has no release (an
+        open whose reply was lost) or its release is settled (a cleanup that failed).
+        Failed rows go too, but for the placeholder a build still names (a finished
+        execution's record), which fails if its build failed and left it building.
+        Observations stay. ``deleted_count`` and ``deleted_bytes`` count the staged rows
+        too, by their blobs' sizes, and a dry run lists them under ``collected``.
 
         A branch opened while this runs may lose the release it starts from; run it
         with *min_idle_seconds* or while none opens.
@@ -2073,16 +2075,23 @@ class Ledger:
         # A derivation leases its whole write window, so one still building past its
         # lease died: nothing it releases would be accepted now.
         now = self.builds.now()
-        dead = {
-            release.release_id: (build, release)
+        # By the build, not its release: one whose open reply was lost has none, and one
+        # whose cleanup failed may have settled it already.
+        dead_builds = [
+            build
             for build in builds.values()
             if build is not None
             and build.executor_ref == DERIVE_EXECUTOR
             and build.state == "building"
             and build.lease_expires_at is not None
             and build.lease_expires_at <= now
+        ]
+        dead = {
+            release.release_id: release
+            for build in dead_builds
             for release in self.releases.releases_of(build.build_id, "final")
-            if release.state in UNSETTLED
+            # Read after the build: one accepted since holds the id's current value.
+            if release.state != "accepted"
         }
         settled: dict[str, bool] = {}
 
@@ -2097,6 +2106,7 @@ class Ledger:
 
         orphans: list[ArtifactVersion] = []
         failed = []
+        unsettled_placeholders = []
         for v in versions:
             if v.state == "failed":
                 # A placeholder its build still names is that build's record.
@@ -2109,6 +2119,14 @@ class Ledger:
                 continue
             if v.release_id in dead:
                 orphans.append(v)
+                continue
+            placeholder = _PLACEHOLDER.fullmatch(v.id)
+            if placeholder is not None:
+                # A close whose fail reply was lost, never retried: the build failed and
+                # nothing else settles its record.
+                build = builds.get(placeholder.group(1))
+                if build is not None and build.state == "failed":
+                    unsettled_placeholders.append((v.id, v.version))
                 continue
             observed = _OBSERVED.match(v.id)
             if observed is not None:
@@ -2145,8 +2163,12 @@ class Ledger:
         if not dry_run:
             for v in orphans:
                 self.store.fail_artifact(v.id, v.version)
-            for build, release in dead.values():
-                self.releases.abandon(release.release_id, release.attempt)
+            for artifact_id, version in unsettled_placeholders:
+                self.store.fail_artifact(artifact_id, version)
+            for release in dead.values():
+                if release.state in UNSETTLED:
+                    self.releases.abandon(release.release_id, release.attempt)
+            for build in dead_builds:
                 self.store.fail_artifact(build.artifact_id, build.version)
                 self.builds.fail_build(build.build_id, "derivation died", lease_owner=build.attempt)
         result = self.store.garbage_collect(
@@ -3161,13 +3183,15 @@ class Run:
         if self.ledger.releases.latest_accepted(self.execution_id) is not None:
             # Not a renewal to zero seconds, which is live through this clock reading.
             builds.lapse_lease(self.execution_id, self.attempt)
-        elif builds.fail_build(
-            self.execution_id, "ended before a checkpoint", lease_owner=self.attempt
-        ):
-            # Its placeholder too, once the build is this attempt's to fail: nothing
-            # would ever settle it.
-            build = builds.get_build(self.execution_id)
-            assert build is not None
+            return
+        # By attempt, not owner: a run that lapsed its own lease (a changed input, a
+        # closed write window) has none, yet the build is still its to fail.
+        builds.fail_build(self.execution_id, "ended before a checkpoint", attempt=self.attempt)
+        # Its placeholder too, once the build failed under this attempt, whichever call
+        # failed it: a close retried after a lost reply finds the build failed already,
+        # and nothing else would ever settle the placeholder.
+        build = builds.get_build(self.execution_id)
+        if build is not None and build.state == "failed" and build.attempt == self.attempt:
             self.ledger.store.fail_artifact(build.artifact_id, build.version)
 
 
