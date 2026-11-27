@@ -457,7 +457,8 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 class TestASweepBatchHoldsOffHoldWriters:
     """A sweep batch takes the sweep's key exclusively and every writer that can create a
     hold takes it shared, first, so no hold lands while a batch claims; so does a delete,
-    which locks the rows a claim locks, in an order of its own."""
+    which locks the rows a claim locks, in an order of its own. A cleanup_failed batch
+    takes it exclusively, as a sweep batch does, so it too waits for a batch."""
 
     WRITERS = (
         "create_artifact",
@@ -1010,6 +1011,46 @@ class TestGarbageCollection:
         assert store.cleanup_failed(max_age_seconds=-10) == 1
         assert store.get_artifact("built", version) is None
         assert builds.get_build("build-1") is None
+
+    def test_cleanup_failed_waits_for_a_requirement_being_written(self, store):
+        """An edge's writer locks no row of its target, only the sweep's key shared: the
+        batch takes that key exclusively, so it waits for the edge and then spares x."""
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", _spec()))
+        store.create_artifact("y", "prov-y", _spec())
+        written, commit = threading.Event(), threading.Event()
+
+        def require() -> None:
+            # As require_many writes it, held uncommitted until the batch has started.
+            conn = store._get_connection()
+            try:
+                store._hold_off_sweeps(conn)
+                store._write_requirements(conn, "y", 1, None, [("x", 1)])
+                written.set()
+                commit.wait(30)
+                conn.commit()
+            finally:
+                conn.close()
+
+        removed = {}
+        requirer = threading.Thread(target=require)
+        cleaner = threading.Thread(
+            target=lambda: removed.update(n=store.cleanup_failed(max_age_seconds=-10))
+        )
+        requirer.start()
+        try:
+            assert written.wait(10)
+            cleaner.start()
+            _until_it_waits(store, cleaner)
+            assert cleaner.is_alive(), "the batch went ahead of the edge being written"
+        finally:
+            commit.set()
+            requirer.join(10)
+            if cleaner.ident is not None:  # started
+                cleaner.join(10)
+        assert not requirer.is_alive() and not cleaner.is_alive()
+
+        assert removed == {"n": 0}
+        assert store.get_artifact("x", 1).state == "failed"
 
 
 class TestConnectionPool:

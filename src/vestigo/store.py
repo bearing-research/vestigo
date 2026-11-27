@@ -959,6 +959,12 @@ _GC_DELETE_BATCH = 1000
 _GC_BATCH_SECONDS = 0.25
 _GC_BATCH_PAUSE_SECONDS = 0.1
 
+# A required edge that holds the version ``av`` against cleanup_failed. Any edge, as the
+# sweep's holds over-protect: a failed requirer may yet be filled by an import, and one
+# of another tenant would point at a number the id's tenant may hand out again.
+_REQUIREMENT_SQL = """SELECT 1 FROM retention_edges e
+    WHERE e.to_artifact_id = av.id AND e.to_version = av.version"""
+
 # How long a temp file goes untouched before a sweep takes it for a dead write's.
 _ABANDONED_WRITE_SECONDS = 3600.0
 
@@ -6092,8 +6098,9 @@ class ArtifactStore:
 
         A batch takes the sweep's key exclusively and reads the holds again under it, so
         no hold lands while it claims, which on Postgres a claim could otherwise act on
-        unseen (SQLite's write lock already serializes them). Before any other lock, or a
-        writer holding a row waits on a batch that waits on the row.
+        unseen (SQLite's write lock already serializes them). A cleanup_failed batch
+        takes it exclusively too. Before any other lock, or a writer holding a row waits
+        on a batch that waits on the row.
         """
         self._dialect.share_write(conn, _SWEEP_KEY)
 
@@ -6550,22 +6557,24 @@ class ArtifactStore:
         """Delete failed artifacts older than ``max_age_seconds``; return the count.
 
         As the sweep, it leaves an id's highest version while a lower one stays, so a
-        version number is never reused, and it spares a version a retention root holds
-        or a publication names: either is a promise someone else was given. Each batch
-        commits on its own, so one that raises leaves the earlier batches' deletes done.
+        version number is never reused, and it spares a version a retention root holds,
+        a publication names or a required edge points at: each is a promise someone else
+        was given. Each batch commits on its own, so one that raises leaves the earlier
+        batches' deletes done.
         """
         cutoff = time.time() - max_age_seconds
         conn = self._get_connection()
         try:
             # The holds here only spare locking a row that stays; the batch looks again.
             cursor = conn.execute(
-                """
+                f"""
                 SELECT id, version FROM artifact_versions av
                 WHERE state = 'failed' AND created_at < ?
                   AND NOT EXISTS (SELECT 1 FROM retention_roots r
                                   WHERE r.artifact_id = av.id AND r.version = av.version)
                   AND NOT EXISTS (SELECT 1 FROM artifact_publications p
                                   WHERE p.artifact_id = av.id AND p.version = av.version)
+                  AND NOT EXISTS ({_REQUIREMENT_SQL})
                 """,
                 (cutoff,),
             )
@@ -6574,28 +6583,41 @@ class ArtifactStore:
             candidates = sorted((row["id"], row["version"]) for row in cursor.fetchall())
         finally:
             conn.close()
-        removed = 0
-        # In batches, as the sweep's: each holds sweeps off, so a sweep waiting on one,
-        # and every hold writer queued behind that sweep, waits for a batch, not for all.
-        for start in range(0, len(candidates), _GC_DELETE_BATCH):
+        removed = start = 0
+        # In batches, as the sweep's, capped in rows and in time: each holds the sweep's
+        # key exclusively, so every hold writer waits for a batch, not for all.
+        while start < len(candidates):
+            if start and self._dialect.name == "sqlite":
+                # As the sweep pauses: a waiting writer polls the lock rather than queueing.
+                time.sleep(_GC_BATCH_PAUSE_SECONDS)
             batch = candidates[start : start + _GC_DELETE_BATCH]
-            removed += self._cleanup_failed_batch(batch, cutoff)
+            went, looked_at = self._cleanup_failed_batch(batch, cutoff)
+            removed += went
+            start += looked_at
         return removed
 
-    def _cleanup_failed_batch(self, batch: list[tuple[str, int]], cutoff: float) -> int:
-        """Delete the failed versions of *batch* that may still go; return how many went.
+    def _cleanup_failed_batch(self, batch: list[tuple[str, int]], cutoff: float) -> tuple[int, int]:
+        """Delete the failed versions of *batch* that may still go; return how many went
+        and how many of *batch* it looked at, at least one, before its time ran out.
 
         Each row is locked, in key order, and looked at again: since the read an import
         may have filled it, making it a ready version with bytes under another key, a
-        root or a publication may hold it, or a delete and a new failure may have put a
-        younger row at its key. The gap rule then runs on what is left.
+        root, a publication or a requirement may hold it, or a delete and a new failure
+        may have put a younger row at its key. The gap rule then runs on what is left.
         """
         conn = self._get_connection()
+        looked_at = 0
         try:
-            # Its deletes lock rows a sweep's claim locks.
-            self._hold_off_sweeps(conn)
+            # The sweep's key exclusively, as a sweep batch takes it: a required edge's
+            # writer locks no row of its target, only this key shared, so its edge is
+            # committed before the look below or waits for the batch.
+            self._dialect.begin_write(conn, _SWEEP_KEY)
+            began = time.monotonic()
             locked: dict[tuple[str, int], StoreRow] = {}
             for key in batch:
+                if looked_at and time.monotonic() - began >= _GC_BATCH_SECONDS:
+                    break
+                looked_at += 1
                 if not conn.execute(
                     "UPDATE artifact_versions SET last_used_at = last_used_at "
                     "WHERE id = ? AND version = ? AND state = 'failed' AND created_at < ?",
@@ -6604,13 +6626,14 @@ class ArtifactStore:
                     continue
                 # Under the row lock, which a retain or a publish takes before writing.
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT id, version, blob_attempt FROM artifact_versions av
                     WHERE id = ? AND version = ?
                       AND NOT EXISTS (SELECT 1 FROM retention_roots r
                                       WHERE r.artifact_id = av.id AND r.version = av.version)
                       AND NOT EXISTS (SELECT 1 FROM artifact_publications p
                                       WHERE p.artifact_id = av.id AND p.version = av.version)
+                      AND NOT EXISTS ({_REQUIREMENT_SQL})
                     """,
                     key,
                 ).fetchone()
@@ -6645,7 +6668,7 @@ class ArtifactStore:
                     row["id"],
                     row["version"],
                 )
-        return len(rows)
+        return len(rows), looked_at
 
     def stats(
         self,
