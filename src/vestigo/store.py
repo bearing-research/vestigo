@@ -2327,7 +2327,8 @@ class ArtifactStore:
         """Hold bytes, already checked against ``content_sha256``, for an import.
 
         Restaging the same digest refreshes the hold. Each call also drops this
-        tenant's stagings older than ``IMPORT_STAGING_TTL_SECONDS``.
+        tenant's stagings older than ``IMPORT_STAGING_TTL_SECONDS``, each only while it
+        is still that old, so a restage since keeps its row and bytes.
         """
         now = time.time() if now is None else now
         blob_id, version = staged_import_key(tenant, content_sha256)
@@ -2345,15 +2346,60 @@ class ArtifactStore:
                 """,
                 (effective_tenant, content_sha256, byte_size, now),
             )
+            cutoff = now - IMPORT_STAGING_TTL_SECONDS
             stale = conn.execute(
                 "SELECT content_sha256 FROM import_staging WHERE tenant = ? AND staged_at < ?",
-                (effective_tenant, now - IMPORT_STAGING_TTL_SECONDS),
+                (effective_tenant, cutoff),
             ).fetchall()
             conn.commit()
         finally:
             conn.close()
+        # A drop or a release of this digest between the publish and the row took the
+        # bytes with the row it found: one HEAD per staging sees whether to put them back.
+        if not self.blob_store.blob_exists(blob_id, version):
+            self._restore_staged_bytes(tenant, content_sha256, source_path)
         for row in stale:
-            self.release_staged_import(tenant, row["content_sha256"])
+            self._drop_stale_staging(tenant, row["content_sha256"], cutoff)
+
+    def _restore_staged_bytes(
+        self, tenant: str | None, content_sha256: str, source_path: Path
+    ) -> None:
+        """Publish a staging's bytes again, and take them back if a release has taken its
+        row meanwhile: bytes no row names would never be dropped."""
+        blob_id, version = staged_import_key(tenant, content_sha256)
+        self.blob_store.publish_blob_from_path(blob_id, version, source_path)
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM import_staging WHERE tenant = ? AND content_sha256 = ?",
+                (tenant or "", content_sha256),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            self.blob_store.delete_blob(blob_id, version)
+
+    def _drop_stale_staging(self, tenant: str | None, content_sha256: str, cutoff: float) -> None:
+        """Drop a staging still older than *cutoff*, its bytes only with its row.
+
+        The bytes go before the row's deletion commits, so a restage's row waits for both
+        (and its HEAD finds the bytes gone), or came first and the row is no longer
+        stale. On SQLite that holds the write lock across one delete, rare: a stale
+        staging is an upload no import followed.
+        """
+        blob_id, version = staged_import_key(tenant, content_sha256)
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM import_staging "
+                "WHERE tenant = ? AND content_sha256 = ? AND staged_at < ?",
+                (tenant or "", content_sha256, cutoff),
+            )
+            if cursor.rowcount:
+                self.blob_store.delete_blob(blob_id, version)
+            conn.commit()
+        finally:
+            conn.close()
 
     def open_staged_import(self, tenant: str | None, content_sha256: str):
         """A reader for bytes *tenant* staged under *content_sha256*, or ``None``.

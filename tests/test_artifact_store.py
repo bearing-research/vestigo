@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
+from vestigo import store as store_module
 from vestigo import uris
 from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES, S3BlobStore
 from vestigo.build_store import BuildStore
@@ -4072,6 +4073,119 @@ class TestADeletedBuildsChildren:
         assert [a[:4] for a in builds.settled_attempts()] == [
             ("build-1", "built", version, "att-1")
         ]
+
+
+class TestARestageRacingTheDropOfItsStaleStaging:
+    """A staging's sweep drops what was stale when it looked, never a restage's bytes."""
+
+    T0 = 1_000_000.0
+    LATER = T0 + IMPORT_STAGING_TTL_SECONDS + 1
+
+    @staticmethod
+    def _source(tmp_path, data: bytes):
+        source = tmp_path / hashlib.sha256(data).hexdigest()
+        source.write_bytes(data)
+        return source, hashlib.sha256(data).hexdigest()
+
+    def _sweep(self, store, tmp_path) -> None:
+        """Another upload, whose staging drops the tenant's stale ones."""
+        source, digest = self._source(tmp_path, b"other")
+        store.stage_import_blob("acme", digest, source, 5, now=self.LATER)
+
+    def test_a_restage_after_the_sweep_looked_keeps_its_bytes(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        key = store_module.staged_import_key
+        restaged = []
+
+        def restaged_first(tenant, content_sha256):
+            # The drop of the stale staging names its key first, here and before the fix
+            # alike, so the restage lands between the sweep's look and its drop.
+            if content_sha256 == digest and not restaged:
+                restaged.append(True)
+                store.stage_import_blob("acme", digest, source, 7, now=self.LATER)
+            return key(tenant, content_sha256)
+
+        monkeypatch.setattr(store_module, "staged_import_key", restaged_first)
+        self._sweep(store, tmp_path)
+
+        assert restaged
+        with store.open_staged_import("acme", digest) as reader:
+            assert reader.read() == b"payload"
+
+    def test_a_restage_whose_bytes_the_sweep_took_puts_them_back(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        blob_id, _ = store_module.staged_import_key("acme", digest)
+        publish = store.blob_store.publish_blob_from_path
+        swept = []
+
+        def sweep_after_publishing(artifact_id, version, path):
+            publish(artifact_id, version, path)
+            if artifact_id == blob_id and not swept:
+                swept.append(True)
+                self._sweep(store, tmp_path)  # drops the row the restage has not refreshed
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", sweep_after_publishing)
+        store.stage_import_blob("acme", digest, source, 7, now=self.LATER)
+
+        assert swept
+        with store.open_staged_import("acme", digest) as reader:
+            assert reader.read() == b"payload"
+
+    def test_a_restage_whose_bytes_a_release_took_puts_them_back(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """An import's release of the old staging comes between the restage's publish and
+        its row: the new row keeps its bytes."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        blob_id, _ = store_module.staged_import_key("acme", digest)
+        publish = store.blob_store.publish_blob_from_path
+        released = []
+
+        def release_after_publishing(artifact_id, version, path):
+            publish(artifact_id, version, path)
+            if artifact_id == blob_id and not released:
+                released.append(True)
+                store.release_staged_import("acme", digest)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", release_after_publishing)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1)
+
+        assert released
+        with store.open_staged_import("acme", digest) as reader:
+            assert reader.read() == b"payload"
+
+    def test_bytes_a_release_took_after_the_restage_s_row_are_not_put_back(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """Else they outlive the row, and nothing names them again."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        blob_id, version = store_module.staged_import_key("acme", digest)
+        exists = store.blob_store.blob_exists
+        released = []
+
+        def release_before_looking(artifact_id, version):
+            if artifact_id == blob_id and not released:
+                released.append(True)
+                store.release_staged_import("acme", digest)
+            return exists(artifact_id, version)
+
+        monkeypatch.setattr(store.blob_store, "blob_exists", release_before_looking)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+
+        assert released
+        assert store.open_staged_import("acme", digest) is None
+        assert not exists(blob_id, version)
 
 
 class TestPublicCallablesTheSuiteMissed:
