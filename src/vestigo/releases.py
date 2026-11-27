@@ -19,7 +19,6 @@ behind and the release where it was. A release belongs to its build's tenant.
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -174,13 +173,17 @@ class ReleaseStore:
         self,
         artifacts: ArtifactStore,
         builds: BuildStore,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._artifacts = artifacts
         self._builds = builds
         self._clock = clock
         self._connect = artifacts._get_connection
         self._dialect = artifacts.dialect
+
+    def _now(self, conn: StoreConnection) -> float:
+        """The injected clock, else the build store's (:meth:`BuildStore.now`)."""
+        return self._clock() if self._clock is not None else self._builds.now(conn)
 
     # --- Lifecycle ---
 
@@ -212,7 +215,7 @@ class ReleaseStore:
         conn = self._connect()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, build_id, attempt, now):
                 conn.rollback()
                 raise ReleaseRejected(f"attempt {attempt} does not hold build {build_id}")
@@ -362,7 +365,7 @@ class ReleaseStore:
             if release.state not in UNSETTLED:
                 conn.rollback()
                 raise ValueError(f"release {release_id} is {release.state}")
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, release.build_id, release.attempt, now):
                 conn.rollback()
                 self._settle(release.build_id, release_id, "rejected")
@@ -505,7 +508,7 @@ class ReleaseStore:
         conn = self._connect()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if from_release is not None:
                 source = self._get_on(conn, from_release)
                 if source is None or source.build_id != build_id or source.state != "accepted":
@@ -565,7 +568,7 @@ class ReleaseStore:
             # Its operations may write roots: no sweep batch then.
             self._artifacts._hold_off_sweeps(conn)
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self._now(conn)
             if not lease_held(conn, build_id, attempt, now):
                 conn.rollback()
                 raise ReleaseRejected(f"attempt {attempt} does not hold build {build_id}")
@@ -779,7 +782,7 @@ class ReleaseStore:
         cursor = conn.execute(
             "UPDATE build_releases SET state = ?, settled_at = ? "
             f"WHERE release_id = ? AND {_UNSETTLED_SQL}",
-            (state, self._clock(), release_id),
+            (state, self._now(conn), release_id),
         )
         return cursor.rowcount > 0
 
@@ -864,8 +867,8 @@ class ReleaseStore:
     ) -> None:
         """The operations in order on the caller's transaction; *subject* names an audit row.
 
-        *accepting* is the release this transaction accepts, which a reference may
-        name before it is accepted.
+        *accepting* is the release this transaction accepts, which a reference or a slot
+        may name before it is accepted.
         """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
             # Before the operations' own writes; after any version rows, as the store
@@ -901,6 +904,8 @@ class ReleaseStore:
                 )
             asserted[op.name] = revision
         elif isinstance(op, AssignAuthority):
+            # A slot is held for good, so never by a release that may yet be abandoned.
+            self._check_release_named(conn, tenant, op.release_id, accepting, f"slot {op.target}")
             conn.execute(
                 "INSERT INTO release_authorities (tenant, target, release_id, created_at) "
                 "VALUES (?, ?, ?, ?) ON CONFLICT (tenant, target) DO NOTHING",
@@ -915,16 +920,9 @@ class ReleaseStore:
             if row["release_id"] != op.release_id:
                 raise OperationFailed(f"slot {op.target} already belongs to {row['release_id']}")
         elif isinstance(op, AdvanceReference):
-            if op.release_id != accepting:
-                target = conn.execute(
-                    "SELECT tenant, state FROM build_releases WHERE release_id = ?",
-                    (op.release_id,),
-                ).fetchone()
-                if target is None or target["tenant"] != tenant or target["state"] != "accepted":
-                    raise OperationFailed(
-                        f"reference {op.name}: {op.release_id} is not an accepted release "
-                        f"of tenant {tenant!r}"
-                    )
+            self._check_release_named(
+                conn, tenant, op.release_id, accepting, f"reference {op.name}"
+            )
             self._advance(conn, tenant, op.name, op.release_id, now, asserted.get(op.name))
             if op.name in asserted:
                 asserted[op.name] += 1
@@ -945,6 +943,21 @@ class ReleaseStore:
             )
         else:
             raise OperationFailed(f"{type(op).__name__} is not an operation")
+
+    @staticmethod
+    def _check_release_named(
+        conn: StoreConnection, tenant: str, release_id: str, accepting: str | None, what: str
+    ) -> None:
+        """Fail unless *release_id* is the release being accepted or an accepted one of *tenant*."""
+        if release_id == accepting:
+            return
+        target = conn.execute(
+            "SELECT tenant, state FROM build_releases WHERE release_id = ?", (release_id,)
+        ).fetchone()
+        if target is None or target["tenant"] != tenant or target["state"] != "accepted":
+            raise OperationFailed(
+                f"{what}: {release_id} is not an accepted release of tenant {tenant!r}"
+            )
 
     @staticmethod
     def _advance(

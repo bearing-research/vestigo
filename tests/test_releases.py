@@ -682,6 +682,127 @@ class TestAttemptsAndFences:
         with pytest.raises(ReleaseRejected):
             ledger.releases.prepare(build_id, "a2", "checkpoint")
 
+    def test_a_build_fails_by_attempt_after_its_own_lapse_and_not_after_a_takeover(
+        self, ledger: Ledger
+    ):
+        """A lapse clears the owner, so only the attempt still names whose build it is."""
+        build_id = _build(ledger)
+        assert ledger.builds.lapse_lease(build_id, "runner-1")
+        assert not ledger.builds.fail_build(build_id, "ended", lease_owner="runner-1")
+        assert ledger.builds.fail_build(build_id, "ended", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "failed"
+
+        taken = _build(ledger)
+        ledger.clock.now += 120
+        _resume(ledger, taken, "a2")
+        assert not ledger.builds.fail_build(taken, "ended", attempt="a1")
+        assert ledger.builds.get_build(taken).state == "building"
+
+    def test_a_renewal_reads_the_clock_under_the_build_s_key(self, ledger: Ledger, monkeypatch):
+        """A reading taken before the key could predate a lapse an acceptance fenced on,
+        and the renewal would revive the lease of an attempt whose release was rejected."""
+        build_id = _build(ledger)
+        order: list[str] = []
+        begin_write = ledger.builds._dialect.begin_write
+        clock = ledger.builds._clock
+
+        def locking(conn, key):
+            begin_write(conn, key)
+            order.append(f"lock {key}")
+
+        def reading():
+            order.append("clock")
+            return clock()
+
+        monkeypatch.setattr(ledger.builds._dialect, "begin_write", locking)
+        monkeypatch.setattr(ledger.builds, "_clock", reading)
+
+        assert ledger.builds.renew_lease(build_id, "runner-1", 60.0)
+        assert order == [f"lock {build_id}", "clock"]
+
+    def test_a_fenced_attempt_does_not_renew_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)  # a1, under runner-1
+        # a1 stalls past its lease; the same runner resumes the build in a2.
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a1")
+        assert ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a2")
+
+    def test_a_fenced_attempt_does_not_lapse_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.lapse_lease(build_id, "runner-1", attempt="a1")
+        assert ledger.builds.renew_lease(build_id, "runner-1", 600.0, attempt="a2")
+        assert ledger.builds.lapse_lease(build_id, "runner-1", attempt="a2")
+
+    def test_a_fenced_attempt_does_not_complete_a_successor_that_shares_its_owner(
+        self, ledger: Ledger
+    ):
+        build_id = _build(ledger)
+        _resume(ledger, build_id, "a2", lease_owner="runner-1")
+
+        assert not ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "building"
+        assert ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a2")
+
+    def test_an_attempt_whose_lease_lapsed_does_not_complete_its_build(self, ledger: Ledger):
+        build_id = _build(ledger)
+        ledger.clock.now += 120  # a1's lease lapses; nobody has resumed the build yet
+
+        assert not ledger.builds.complete_build(build_id, lease_owner="runner-1", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "building"
+
+    def test_a_renewal_queued_for_the_key_past_the_deadline_is_refused(self, ledger: Ledger):
+        """Any fence check that held the key meanwhile saw the lease lapsed, so it stays so."""
+        build_id = _build(ledger)
+        ledger.clock.now += 59
+        clock = ledger.builds._clock
+        read = threading.Event()
+
+        def reading():
+            value = clock()
+            read.set()
+            return value
+
+        outcome: dict[str, object] = {}
+
+        def renew() -> None:
+            try:
+                outcome["renewed"] = ledger.builds.renew_lease(build_id, "runner-1", 600.0)
+            except Exception as exc:
+                outcome["raised"] = exc
+
+        with _another_process(ledger) as other:
+            holder = other.store.dialect.connect()
+            try:
+                other.store.dialect.begin_write(holder, build_id)
+                if other.store.dialect.name != "sqlite":
+                    # The row too: a renewal outside the key would queue on it instead.
+                    holder.execute(
+                        "SELECT 1 FROM artifact_builds WHERE build_id = ? FOR UPDATE", (build_id,)
+                    )
+                ledger.builds._clock = reading
+                renewer = threading.Thread(target=renew)
+                renewer.start()
+                # A renewal that reads the clock before queuing has read it by now.
+                read.wait(0.5)
+                ledger.clock.now += 2  # past the deadline while it waits
+            finally:
+                holder.commit()
+                holder.close()
+            renewer.join(10)
+            ledger.builds._clock = clock
+
+        assert not renewer.is_alive()
+        assert outcome == {"renewed": False}
+        with pytest.raises(ReleaseRejected):
+            ledger.releases.prepare(build_id, "a1", "checkpoint")
+
     def test_only_its_own_attempt_abandons_attaches_or_marks_a_release(self, ledger: Ledger):
         build_id = _build(ledger)
         _resume(ledger, build_id, "a2")
@@ -1123,6 +1244,25 @@ class TestReferencesAndAuthorities:
         assert ledger.releases.authority("slot:b") == winner.release_id
         assert ledger.releases.get(release.release_id).state == "preparing"
         assert ledger.builds.get_build(build_id).state == "building"
+
+    def test_a_slot_goes_only_to_an_accepted_release_or_the_one_being_accepted(
+        self, ledger: Ledger
+    ):
+        """A slot is held for good: a release later abandoned would keep it from the winner."""
+        build_id = _build(ledger)
+        abandoned = ledger.releases.prepare(build_id, "a1", "checkpoint")
+        assert ledger.releases.abandon(abandoned.release_id, "a1")
+        foreign = _checkpoint(ledger, _build(ledger, tenant="acme")).release.release_id
+        pending = ledger.releases.prepare(build_id, "a1", "final")
+        for release_id in (pending.release_id, abandoned.release_id, foreign, "no-such-release"):
+            with pytest.raises(OperationFailed, match="not an accepted release"):
+                ledger.releases.apply(build_id, "a1", [AssignAuthority("slot:x", release_id)])
+        assert ledger.releases.authority("slot:x") is None
+
+        ledger.releases.accept(pending.release_id, [_stage(ledger, pending, "model", b"w")])
+        later = _build(ledger)
+        ledger.releases.apply(later, "a1", [AssignAuthority("slot:x", pending.release_id)])
+        assert ledger.releases.authority("slot:x") == pending.release_id
 
     def test_two_attempts_racing_for_a_slot_have_one_winner(self, ledger: Ledger):
         """Two processes accept finals claiming one slot at once; the slot has one winner."""

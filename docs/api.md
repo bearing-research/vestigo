@@ -31,7 +31,8 @@ The package exports nothing at its top level; a consumer imports each module.
   returns without fail. Among the protocol's methods, `begin_write(conn, key)`
   serializes writers on a key and `share_write(conn, key)` holds it shared, which
   every writer that can create a hold takes before any other lock and a sweep batch
-  takes exclusively; `create_tables(dialect, table, ddl)`, a consumer's own tables
+  takes exclusively, and `server_time(conn)` is the database's clock, which lease
+  decisions read; `create_tables(dialect, table, ddl)`, a consumer's own tables
   beside the ledger's, created once per database under a lock keyed on `table`.
 - `vestigo.blob_store`: `BlobSettings`, `LocalBlobStore`, `S3BlobStore`,
   `GCSBlobStore`, `AzureBlobStore`; each object store's `objects(path)` lists a
@@ -42,8 +43,9 @@ The package exports nothing at its top level; a consumer imports each module.
   place (0600, durable on return) and copies a symlink, a hard-linked file or one on
   another filesystem, so the caller must hold the file alone.
   `ArtifactStore.adopt_blob_file(..., attempt=None)` does it under a build attempt's key.
-- `vestigo.build_store`: `BuildStore(db_path, dialect=None, clock=time.time)`,
-  whose `close()` closes the dialect it made when none was passed,
+- `vestigo.build_store`: `BuildStore(db_path, dialect=None, clock=None)`,
+  whose `close()` closes the dialect it made when none was passed and whose `now()` is
+  the time every lease decision reads (the injected clock, else the database's),
   the builds with their leases and attempts (`create_build`, `open_attempt` with
   the attempt's `principal`, `open_attempt_within`, `renew_lease`, `lapse_lease`,
   `find_open_build`, `open_build` (an external build with its first attempt open, unless
@@ -59,8 +61,8 @@ The package exports nothing at its top level; a consumer imports each module.
   `list_builds_by_tenant`, `cleanup_old_builds` and `get_stats`; `BuildState`
   (`to_dict()` a `BuildRecord`), `AttemptState`, `BuildStats`, `DISPATCHES`;
   `get_build_store` and `reset_build_store` for the process-wide instance.
-- `vestigo.releases`: `ReleaseStore(artifacts, builds, clock=time.time)`, a
-  build's checkpoint and final releases (`prepare`, `attach`, `mark_prepared`,
+- `vestigo.releases`: `ReleaseStore(artifacts, builds, clock=None)` (by default the
+  build store's `now()`), a build's checkpoint and final releases (`prepare`, `attach`, `mark_prepared`,
   `accept`, `abandon`, `resume`, `apply` for operations between releases, fenced
   as an acceptance is; `get`, `bundle`, `releases_of`, `latest_accepted`,
   `bundles_of`, `collectable_checkpoints` with its `keep` bound, `reference`,
