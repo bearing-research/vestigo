@@ -118,7 +118,10 @@ store.set_tag("train", 7, "dataset", "2026-10")
 
 A protected alias changes only by approval: `request_alias_change`, then
 `approve_alias_change` or `reject_alias_change`. With
-`require_distinct_approver=True`, the requester cannot approve their own change. Every change goes to the audit log (`read_audit`).
+`require_distinct_approver=True`, the requester cannot approve their own change. Pass
+the change you reviewed, as `list_pending_changes` listed it, as `reviewed=`: a request
+that replaced it since is refused rather than applied or discarded unseen. Every change
+goes to the audit log (`read_audit`).
 
 ## Lineage
 
