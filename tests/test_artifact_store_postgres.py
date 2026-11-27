@@ -2626,6 +2626,40 @@ class TestStagingsKeyedByTokenMigration:
             reopened.close()
 
 
+class TestHighWaterMigration:
+    def test_the_migration_makes_a_bigint_high_water_and_fills_it(
+        self, store, postgres_dsn, tmp_path
+    ):
+        """The SQLite half is in ``test_artifact_store.py`` and the migration-shape test."""
+        store.create_artifact("x", "prov-1")
+        top = store.create_artifact("x", "prov-2")
+        store.create_artifact("y", "prov-y", requires=[("x", top)])
+        assert store.delete_artifact("x", top)
+        conn = store._get_connection()
+        try:
+            conn.execute("DROP TABLE artifact_high_water")
+            conn.execute("DELETE FROM schema_version")
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (21, 0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "again", dialect=PostgresDialect(postgres_dsn))
+        try:
+            conn = reopened._get_connection()
+            try:
+                version_type = conn.execute(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_name = 'artifact_high_water' AND column_name = 'version'"
+                ).fetchone()["data_type"]
+            finally:
+                conn.close()
+            assert version_type == "bigint"
+            assert reopened.create_artifact("x", "prov-3") == top + 1
+        finally:
+            reopened.close()
+
+
 class TestTheHoldTablesIndexes:
     """Names, aliases and pending changes indexed by the version they hold, which every
     chunk of a sweep's claim asks, on a new ledger and an old one."""

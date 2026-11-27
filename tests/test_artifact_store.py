@@ -4046,6 +4046,100 @@ class TestSetDefinitionsCount:
         assert store.set_definitions({("out", 1): node}) == 0
 
 
+class TestAVersionNumberIsNeverHandedOutTwice:
+    """A requirer's edge, a review and a blob key name id@v=N: a rebuild after a delete
+    gets a number of its own."""
+
+    @staticmethod
+    def _ready(store, artifact_id, provenance, data=b"bytes") -> int:
+        version = store.create_artifact(artifact_id, provenance)
+        store.write_blob(artifact_id, version, data)
+        store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=len(data))
+        return version
+
+    def test_a_rebuild_after_the_top_version_is_deleted_is_numbered_past_it(self, backend_store):
+        store = backend_store
+        self._ready(store, "x", "prov-1")
+        top = self._ready(store, "x", "prov-2")
+        requirer = store.create_artifact("y", "prov-y", requires=[("x", top)])
+        assert store.delete_artifact("x", top)
+
+        rebuilt = self._ready(store, "x", "prov-3", b"other bytes")
+
+        assert rebuilt == top + 1
+        assert store.get_artifact("x", top) is None
+        assert not store.requirements_met(store.get_artifact("y", requirer))
+
+    def test_a_rebuild_after_an_id_s_only_version_is_deleted_is_not_v1(self, backend_store):
+        store = backend_store
+        only = self._ready(store, "x", "prov-1")
+        assert store.delete_artifact("x", only)
+
+        assert store.create_artifact("x", "prov-2") == only + 1
+
+    def test_a_rebuild_after_cleanup_takes_every_failed_version_is_not_v1(self, backend_store):
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-1"))
+        store.fail_artifact("x", store.create_artifact("x", "prov-2"))
+        assert store.cleanup_failed(max_age_seconds=-1) == 2
+
+        assert store.create_artifact("x", "prov-3") == 3
+
+    def test_a_rebuild_after_a_sweep_takes_the_whole_id_is_not_v1(self, backend_store):
+        store = backend_store
+        self._ready(store, "loose", "prov-1")
+        assert store.garbage_collect(max_idle_days=0, collect_latest=True)["deleted_count"] == 1
+        assert store.get_artifact("loose", 1) is None
+
+        assert store.create_artifact("loose", "prov-2") == 2
+
+    def test_a_delete_below_the_top_leaves_the_numbering_alone(self, backend_store):
+        """Against numbering from the high water alone, which hands out the top again."""
+        store = backend_store
+        low = self._ready(store, "x", "prov-1")
+        self._ready(store, "x", "prov-2")
+        assert store.delete_artifact("x", low)
+
+        assert store.create_artifact("x", "prov-3") == 3
+
+    @pytest.mark.parametrize("namer", ["name", "requirer"])
+    def test_an_upgraded_store_numbers_past_the_versions_it_still_names(self, tmp_path, namer):
+        """A delete from before the high water: an audit row or an edge names it."""
+        store = ArtifactStore(tmp_path / "s")
+        self._ready(store, "x", "prov-1")
+        named = self._ready(store, "x", "prov-2")
+        if namer == "name":
+            store.set_name("m", "x", named)
+        else:
+            store.create_artifact("y", "prov-y", requires=[("x", named)])
+        assert store.delete_artifact("x", named)
+        conn = sqlite3.connect(store.db_path)
+        conn.execute("DROP TABLE artifact_high_water")
+        conn.execute("DELETE FROM schema_version WHERE version = 22")
+        conn.commit()
+        conn.close()
+        store.close()
+
+        reopened = ArtifactStore(tmp_path / "s")
+        try:
+            assert reopened.create_artifact("x", "prov-3") == named + 1
+        finally:
+            reopened.close()
+
+    def test_an_import_keeps_its_version_below_the_high_water(self, backend_store):
+        store = backend_store
+        first = self._ready(store, "x", "prov-1")
+        record = store.get_artifact("x", first)
+        self._ready(store, "x", "prov-2")
+        assert store.delete_artifact("x", 2)
+        assert store.delete_artifact("x", first)
+
+        landed = store.import_artifact(record, b"bytes")
+
+        assert (landed.id, landed.version) == ("x", first)
+        assert store.create_artifact("x", "prov-3") == 3
+
+
 class TestADeletedBuildsChildren:
     def test_its_console_goes_and_its_attempts_stay_for_the_attempt_sweep(
         self, backend_store, tmp_path

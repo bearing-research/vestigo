@@ -968,6 +968,50 @@ def _add_staging_tokens(conn: StoreConnection, dialect: SqlDialect) -> None:
     conn.execute("ALTER TABLE import_staging_keyed RENAME TO import_staging")
 
 
+_HIGH_WATER_DDL = """
+CREATE TABLE IF NOT EXISTS artifact_high_water (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL
+)"""
+
+
+# Where a version once named outlives its delete: a set, move or delete of a reference
+# or a tag (its audit rows, a pending change), a publication, and a requirer's edge.
+_NAMED_VERSIONS = (
+    "SELECT artifact_id AS id, to_version AS version FROM registry_audit "
+    "WHERE artifact_id IS NOT NULL AND to_version IS NOT NULL",
+    "SELECT from_artifact_id AS id, from_version AS version FROM registry_audit "
+    "WHERE from_artifact_id IS NOT NULL AND from_version IS NOT NULL",
+    "SELECT artifact_id AS id, from_version AS version FROM registry_audit "
+    "WHERE from_artifact_id IS NULL AND artifact_id IS NOT NULL AND from_version IS NOT NULL",
+    "SELECT artifact_id AS id, version FROM registry_pending "
+    "WHERE artifact_id IS NOT NULL AND version IS NOT NULL",
+    "SELECT artifact_id AS id, version FROM artifact_publications",
+    # An edge may name a version never made, so only one of the tenant still holding the
+    # id counts, and only a number a store could reach.
+    "SELECT e.to_artifact_id AS id, e.to_version AS version FROM retention_edges e "
+    "WHERE e.to_version < 2147483647 AND EXISTS (SELECT 1 FROM artifact_versions v "
+    "WHERE v.id = e.to_artifact_id AND v.tenant = e.tenant)",
+)
+_NAMED_VERSION_TABLES = ("registry_audit", "registry_pending", "artifact_publications")
+
+
+def _add_high_water(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Each id's highest deleted version, below which no new version is numbered; for a
+    delete from before it, the highest version the store still names above the id's
+    rows."""
+    conn.execute(dialect.adapt_ddl(_HIGH_WATER_DDL))
+    # Tables made by the constants on SQLite, which a store this old may lack.
+    if not all(dialect.schema_exists(conn, table) for table in _NAMED_VERSION_TABLES):
+        return
+    conn.execute(
+        "INSERT INTO artifact_high_water (id, version) "
+        f"SELECT n.id, MAX(n.version) FROM ({' UNION ALL '.join(_NAMED_VERSIONS)}) n "
+        "GROUP BY n.id HAVING MAX(n.version) > COALESCE("
+        "(SELECT MAX(v.version) FROM artifact_versions v WHERE v.id = n.id), 0)"
+    )
+
+
 # How stale ``last_used_at`` may get before a use writes it again: recording
 # every read would turn reads into writes, and a hot artifact costs one UPDATE
 # per interval this way. A sweep adds it to its recent-use floor, because the
@@ -1288,6 +1332,7 @@ _MIGRATIONS: list[_Migration] = [
     _Migration(19, "idx_names_version, idx_aliases_version, idx_pending_version", _index_holds),
     _Migration(20, "idx_build_open replaces idx_build_computation", _index_open_builds),
     _Migration(21, "import_staging keyed by blob_token; state", _add_staging_tokens),
+    _Migration(22, "artifact_high_water", _add_high_water),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1390,6 +1435,9 @@ _SCHEMA_SQL += "\n" + ";\n".join(GRAPH_DDL) + ";\n"
 # Releases (ADR 002 §7.2): a build's publication events, the references that follow
 # them and the slots they win.
 _SCHEMA_SQL += "\n" + ";\n".join(RELEASE_DDL) + ";\n"
+# The highest version each id ever had deleted, so a number is never handed out twice:
+# a requirer's edge, a descendant's lineage, a review and a blob key all name id@v=N.
+_SCHEMA_SQL += _HIGH_WATER_DDL + ";\n"
 
 # Registry tables (aliases / tags / audit). Run unconditionally at init; CREATE IF NOT EXISTS makes
 # it idempotent for fresh and existing databases.
@@ -1863,7 +1911,8 @@ class ArtifactStore:
     ) -> int:
         """Create a new artifact version in "building" state and return its number.
 
-        Versions are numbered ``MAX(version) + 1`` per id. ``input_versions`` maps input
+        Versions are numbered per id past every version it has had, deleted ones too,
+        so a number is never handed out twice. ``input_versions`` maps input
         URI to version for staleness checks. ``minted`` means the caller made the id up
         (``uuid4``) for this computation, so retention may collect its latest version;
         later versions of a minted id stay minted. ``requires`` names the versions this
@@ -1946,8 +1995,14 @@ class ArtifactStore:
                 (artifact_id,),
             )
         )
+        # A delete writes the high water with the row it takes, so this read and the one
+        # above see one or the other.
+        deleted = conn.execute(
+            "SELECT version FROM artifact_high_water WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        floor = int(deleted["version"]) + 1 if deleted is not None else 1
         # By name: a Postgres row unpacks to its column names, not values.
-        return int(row["next_version"]), row["was_minted"]
+        return max(int(row["next_version"]), floor), row["was_minted"]
 
     @staticmethod
     def _write_requirements(
@@ -5443,10 +5498,8 @@ class ArtifactStore:
             if not locked:
                 conn.rollback()
                 return False
-            # A published version is cited by a link somebody else holds, and
-            # version numbers are reused (``MAX(version) + 1``), so deleting
-            # one and rebuilding the cell would leave that link serving
-            # different bytes under the same title and authors. Withdraw the
+            # A published version is cited by a link somebody else holds, and the
+            # link would answer for nothing once the version goes. Withdraw the
             # publication first, deliberately, and then it can go.
             published = conn.execute(
                 "SELECT token FROM artifact_publications "
@@ -5534,6 +5587,7 @@ class ArtifactStore:
                 "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                 (artifact_id, version),
             )
+            self._raise_high_water(conn, [(artifact_id, version)])
             conn.commit()
         finally:
             conn.close()
@@ -5543,6 +5597,22 @@ class ArtifactStore:
         # Holding a pooled one across it parks a slot for the round trip.
         self.blob_store.delete_blob(blob_id, version)
         return True
+
+    @staticmethod
+    def _raise_high_water(conn: StoreConnection, keys: Collection[tuple[str, int]]) -> None:
+        """Record *keys*' versions as deleted, on the transaction that deletes them, so
+        ``_next_version`` never hands their numbers out again."""
+        tops: dict[str, int] = {}
+        for artifact_id, version in keys:
+            tops[artifact_id] = max(version, tops.get(artifact_id, version))
+        for artifact_id, version in sorted(tops.items()):
+            conn.execute(
+                "INSERT INTO artifact_high_water (id, version) VALUES (?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET version = CASE "
+                "WHEN excluded.version > artifact_high_water.version THEN excluded.version "
+                "ELSE artifact_high_water.version END",
+                (artifact_id, version),
+            )
 
     def _delete_versions_children(
         self, conn: StoreConnection, keys: Collection[tuple[str, int]]
@@ -5866,8 +5936,8 @@ class ArtifactStore:
         together or not at all. With none of the four set nothing is collected. A version of an
         id ``exempt`` accepts goes only as ``collectable``, and a version in ``spare``
         never goes (nor its inputs, if it is a current value). An id never loses its
-        highest version while keeping a lower one, so a version number is never
-        reused. A folder file goes only with every manifest of its tenant naming it,
+        highest version while keeping a lower one, and a number it frees is never
+        handed out again. A folder file goes only with every manifest of its tenant naming it,
         and the cap evicts a folder whole, at its newest member's use.
 
         ``tenant`` limits the sweep, and the ``max_bytes`` measure, to that tenant;
@@ -6092,6 +6162,10 @@ class ArtifactStore:
             # losing a blob whose row is gone only wastes bytes.
             collected: list[tuple[str, int]] = []
             pending: list[tuple[str, int]] = []
+            # The batch's deleted versions, whose high water it writes last, just before
+            # its commit: a group's claim then never waits for a row lock while the batch
+            # holds an id's high water, which a delete writes after its rows.
+            taken: list[tuple[str, int]] = []
             # Pointers before their canonicals, so a canonical goes only once nothing reads it;
             # folder files after their manifests, so a file goes only once its folders did;
             # an id's lower versions before its top, which goes only once they did. A failed
@@ -6135,6 +6209,8 @@ class ArtifactStore:
                     or time.monotonic() - batch_began >= _GC_BATCH_SECONDS
                 ):
                     if in_batch:
+                        self._raise_high_water(conn, taken)
+                        taken.clear()
                         conn.commit()
                         collected.extend(pending)
                         pending.clear()
@@ -6162,9 +6238,11 @@ class ArtifactStore:
                     attempt = row["blob_attempt"]
                     blob_id = attempt_blob_id(row["id"], attempt) if attempt else row["id"]
                     pending.append((blob_id, row["version"]))
+                    taken.append((row["id"], row["version"]))
                     deleted_count += 1
                     deleted_bytes += row["byte_size"] or 0
 
+            self._raise_high_water(conn, taken)
             conn.commit()
             # Only rows whose delete committed lose their bytes.
             collected.extend(pending)
@@ -6444,7 +6522,8 @@ class ArtifactStore:
     ) -> dict[tuple[str, int], StoreRow]:
         """``chosen``, less any id's highest version whose lower versions stay.
 
-        Otherwise the next ``create_artifact`` for that id would reuse the number.
+        No longer what keeps a number from being handed out again (``artifact_high_water``
+        does, for every delete); a sweep still takes an id from the top down.
         """
         by_id: dict[str, int] = {}
         for artifact_id, _ in chosen:
@@ -6662,9 +6741,9 @@ class ArtifactStore:
     def cleanup_failed(self, max_age_seconds: float = 3600) -> int:
         """Delete failed artifacts older than ``max_age_seconds``; return the count.
 
-        As the sweep, it leaves an id's highest version while a lower one stays, so a
-        version number is never reused, and it spares a version a retention root holds
-        or a publication names: either is a promise someone else was given.
+        As the sweep, it leaves an id's highest version while a lower one stays, and it
+        spares a version a retention root holds or a publication names: either is a
+        promise someone else was given. A number it frees is never handed out again.
         """
         conn = self._get_connection()
         try:
@@ -6695,6 +6774,7 @@ class ArtifactStore:
                     "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                     (row["id"], row["version"]),
                 )
+            self._raise_high_water(conn, [(row["id"], row["version"]) for row in rows])
             conn.commit()
         finally:
             conn.close()

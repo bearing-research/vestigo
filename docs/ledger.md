@@ -85,6 +85,9 @@ if hit is None:
   no part in it. Two inputs that hold the same bytes but came from different places
   give different keys, which is what `cache.py`'s third command shows.
 - **An id holds versions.** Each `create_artifact` adds the next version (1, 2, ...).
+  A number is never handed out twice: a rebuild after a delete is numbered past the
+  deleted version, so an edge, a review or a link naming `id@v=N` never comes to mean
+  other bytes here. An import keeps the number its source store gave it.
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
   stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
