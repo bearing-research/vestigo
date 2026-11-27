@@ -78,6 +78,7 @@ class TestSchemaInitialization:
         # Re-running the CREATE TABLE IF NOT EXISTS script against a populated
         # database must not disturb it.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
 
         reopened = ArtifactStore(tmp_path / "artifacts", dialect=PostgresDialect(postgres_dsn))
@@ -144,6 +145,7 @@ class TestRoundTrip:
 
     def test_name_pointer_resolves(self, store):
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("daily_revenue", "a1", version)
 
@@ -170,6 +172,7 @@ class TestRoundTrip:
             version = store.create_artifact(
                 artifact_id, f"p-{artifact_id}", _spec(), input_versions=edges, tenant=tenant
             )
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=0)
 
         assert store.list_name_reads(tenant="team-a") == [("team-a", "ours", "taxi/model@champion")]
@@ -182,6 +185,7 @@ class TestRoundTrip:
         # Exercises _REGISTRY_SCHEMA_SQL, which carries the one AUTOINCREMENT
         # column in the schema (registry_audit.seq).
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("model", "a1", version)
         store.set_alias("model", "champion", "a1", version)
@@ -195,6 +199,7 @@ class TestRoundTrip:
         # read_audit does `dict(row)`, which needs the row factory to behave
         # like a Mapping rather than a tuple.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         store.set_name("model", "a1", version)
 
@@ -226,6 +231,7 @@ class TestColumnWidths:
         # blob is written and the row is stranded in 'building' forever.
         version = store.create_artifact("big", "prov-big", _spec())
         three_gib = 3 * 1024**3
+        store.write_blob("big", version, b"bytes")
         store.finalize_artifact("big", version, "{}", row_count=1, byte_size=three_gib)
 
         artifact = store.get_artifact("big", version)
@@ -236,6 +242,7 @@ class TestColumnWidths:
     def test_row_count_holds_more_than_two_billion_rows(self, store):
         version = store.create_artifact("wide", "prov-wide", _spec())
         rows = 5_000_000_000
+        store.write_blob("wide", version, b"bytes")
         store.finalize_artifact("wide", version, "{}", row_count=rows, byte_size=1)
         assert store.get_artifact("wide", version).row_count == rows
 
@@ -287,6 +294,7 @@ class TestAggregateReturnTypes:
         # Decimal, so an in-process caller doing total_bytes / 1024**3 gets
         # TypeError where the SQLite backend gave a float.
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=7, byte_size=11)
 
         stats = store.stats()
@@ -296,6 +304,7 @@ class TestAggregateReturnTypes:
 
     def test_usage_totals_are_ints_not_decimals(self, store):
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=7, byte_size=11)
 
         usage = store.get_usage()
@@ -338,12 +347,15 @@ class TestConnectionLimits:
 class TestCanonicalPromotion:
     def test_a_runs_outputs_finalize_together_or_not_at_all(self, store):
         first = store.create_artifact("a1", "shared-prov", _spec())
+        store.write_blob("a1", first, b"bytes")
         store.finalize_artifact("a1", first, "{}", row_count=0, byte_size=0)
         x = StagedVersion(
             "a2", store.create_artifact("a2", "shared-prov", _spec()), "{}", 0, 0, "d"
         )
         y = StagedVersion("a3", store.create_artifact("a3", "prov-y", _spec()), "{}", 0, 0, "d")
         z = StagedVersion("a4", store.create_artifact("a4", "prov-z", _spec()), "{}", 0, 0, "d")
+        for staged in (x, y, z):
+            store.write_blob(staged.artifact_id, staged.version, b"")
         store.fail_artifact("a4", z.version)
 
         with pytest.raises(ValueError, match="building"):
@@ -375,6 +387,7 @@ class TestFinalizeAndName:
 
         monkeypatch.setattr(store, "_set_name_in_connection", read_elsewhere_then_name)
 
+        store.write_blob("a1", version, b"bytes")
         artifact = store.finalize_and_set_name(
             "a1", version, "{}", 0, 0, name="the-name", content_sha256="d" * 64
         )
@@ -392,6 +405,7 @@ class TestFinalizeAndName:
 
         monkeypatch.setattr(store, "_set_name_in_connection", name_write_fails)
 
+        store.write_blob("a1", version, b"bytes")
         with pytest.raises(psycopg.OperationalError):
             store.finalize_and_set_name(
                 "a1", version, "{}", 0, 0, name="the-name", content_sha256="d" * 64
@@ -404,6 +418,7 @@ class TestFinalizeAndName:
 class TestFindReadyAndSetName:
     def _ready(self, store) -> int:
         version = store.create_artifact("a1", "prov-1", _spec())
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", 0, 0, content_sha256="d" * 64)
         return version
 
@@ -425,6 +440,7 @@ class TestFindReadyAndSetName:
             found = find(*args, **kwargs)
             if not rebuilt:
                 rebuilt.append(store.create_artifact("a1", "prov-1", _spec()))
+                store.write_blob("a1", rebuilt[0], b"bytes")
                 store.finalize_artifact("a1", rebuilt[0], "{}", 0, 0, content_sha256="e" * 64)
             return found
 
@@ -457,7 +473,8 @@ def _until_it_waits(store, thread: threading.Thread) -> None:
 class TestASweepBatchHoldsOffHoldWriters:
     """A sweep batch takes the sweep's key exclusively and every writer that can create a
     hold takes it shared, first, so no hold lands while a batch claims; so does a delete,
-    which locks the rows a claim locks, in an order of its own."""
+    which locks the rows a claim locks, in an order of its own. A cleanup_failed batch
+    takes it exclusively, as a sweep batch does, so it too waits for a batch."""
 
     WRITERS = (
         "create_artifact",
@@ -477,6 +494,7 @@ class TestASweepBatchHoldsOffHoldWriters:
         "accept",
         "apply",
         "delete_artifact",
+        "cleanup_failed",
     )
 
     @pytest.mark.parametrize("writer", WRITERS)
@@ -499,6 +517,8 @@ class TestASweepBatchHoldsOffHoldWriters:
         release = releases.prepare("b1", "a1", "final")
         if writer == "approve_alias_change":
             store.request_alias_change("m", "prod", "set", "v", version)
+        if writer == "cleanup_failed":
+            store.fail_artifact("failed", store.create_artifact("failed", "prov-f", _spec()))
         cached = replace(record, id="cached", provenance_hash="p3")
         if writer == "import_artifact_lineage":
             store.import_artifact(cached, b"bytes")  # as the team cache writes it, no inputs
@@ -528,6 +548,7 @@ class TestASweepBatchHoldsOffHoldWriters:
             "accept": lambda: releases.accept(release.release_id, [], [event]),
             "apply": lambda: releases.apply("b1", "a1", [event]),
             "delete_artifact": lambda: store.delete_artifact("v", version),
+            "cleanup_failed": lambda: store.cleanup_failed(max_age_seconds=-10),
         }
         errors: list[BaseException] = []
 
@@ -784,6 +805,7 @@ class TestGarbageCollection:
         # The spare-the-current-value clause is a correlated NOT EXISTS; run
         # it on the dialect that has never seen it in a unit test.
         first = store.create_artifact("nb_x_cell_c1_var_df", "prov-v1", _spec())
+        store.write_blob("nb_x_cell_c1_var_df", first, b"bytes")
         store.finalize_artifact("nb_x_cell_c1_var_df", first, "{}", row_count=0, byte_size=0)
         store.create_artifact("nb_x_cell_c1_var_df", "prov-v2", _spec())
 
@@ -793,6 +815,7 @@ class TestGarbageCollection:
     @staticmethod
     def _ready(store, artifact_id: str, provenance: str, *, minted: bool = False) -> int:
         version = store.create_artifact(artifact_id, provenance, _spec(), minted=minted)
+        store.write_blob(artifact_id, version, b"bytes")
         store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=100)
         return version
 
@@ -850,6 +873,7 @@ class TestGarbageCollection:
             version = store.create_artifact(
                 artifact_id, f"p-{owner}", _spec(), tenant=tenant, minted=True
             )
+            store.write_blob(artifact_id, version, b"bytes")
             store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=100)
             self._last_used(store, artifact_id, 7200)
 
@@ -1007,6 +1031,46 @@ class TestGarbageCollection:
         assert store.get_artifact("built", version) is None
         assert builds.get_build("build-1") is None
 
+    def test_cleanup_failed_waits_for_a_requirement_being_written(self, store):
+        """An edge's writer locks no row of its target, only the sweep's key shared: the
+        batch takes that key exclusively, so it waits for the edge and then spares x."""
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", _spec()))
+        store.create_artifact("y", "prov-y", _spec())
+        written, commit = threading.Event(), threading.Event()
+
+        def require() -> None:
+            # As require_many writes it, held uncommitted until the batch has started.
+            conn = store._get_connection()
+            try:
+                store._hold_off_sweeps(conn)
+                store._write_requirements(conn, "y", 1, None, [("x", 1)])
+                written.set()
+                commit.wait(30)
+                conn.commit()
+            finally:
+                conn.close()
+
+        removed = {}
+        requirer = threading.Thread(target=require)
+        cleaner = threading.Thread(
+            target=lambda: removed.update(n=store.cleanup_failed(max_age_seconds=-10))
+        )
+        requirer.start()
+        try:
+            assert written.wait(10)
+            cleaner.start()
+            _until_it_waits(store, cleaner)
+            assert cleaner.is_alive(), "the batch went ahead of the edge being written"
+        finally:
+            commit.set()
+            requirer.join(10)
+            if cleaner.ident is not None:  # started
+                cleaner.join(10)
+        assert not requirer.is_alive() and not cleaner.is_alive()
+
+        assert removed == {"n": 0}
+        assert store.get_artifact("x", 1).state == "failed"
+
 
 class TestConnectionPool:
     """A bounded pool is only safe here because acquisition is re-entrant."""
@@ -1070,6 +1134,7 @@ class TestConnectionPool:
                     for round_ in range(3):
                         aid = f"a{i}-{round_}"
                         version = store.create_artifact(aid, f"prov-{i}-{round_}", _spec())
+                        store.write_blob(aid, version, b"b")
                         # finalize_artifact evaluates `return self.get_artifact(...)`
                         # inside its try, so the outer connection is still held.
                         store.finalize_artifact(aid, version, "{}", row_count=1, byte_size=1)
@@ -1391,10 +1456,10 @@ class TestBuildStoreSharesTheBackend:
             conn.close()
             reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
 
-            before = time.time()
+            before = reopened.now()  # the database's clock, which writes opened_at
             assert reopened.open_attempt("b", "a1", writable_until=1e12)
             # To the second: a single-precision column would round it by a minute.
-            assert before <= reopened.get_attempt("b", "a1").opened_at <= time.time()
+            assert before <= reopened.get_attempt("b", "a1").opened_at <= reopened.now()
             conn = dialect.connect()
             [column] = conn.execute(
                 "SELECT data_type FROM information_schema.columns "
@@ -1495,7 +1560,7 @@ class TestBuildStoreSharesTheBackend:
             version = artifacts.create_artifact("big", "prov-big", _spec())
 
             store = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
-            before = time.time()
+            before = store.now()  # the database's clock, which writes created_at
             build_id = "build-widths"
             store.create_build(
                 build_id=build_id,
@@ -1505,7 +1570,7 @@ class TestBuildStoreSharesTheBackend:
             )
             store.start_build(build_id)
             store.complete_build(build_id, output_byte_count=3 * 1024**3)
-            after = time.time()
+            after = store.now()
 
             build = store.get_build(build_id)
             assert build.output_byte_count == 3 * 1024**3
@@ -1667,6 +1732,7 @@ class TestWriterSerialization:
         and never got the earlier event once it committed.
         """
         version = store.create_artifact("m1", "prov-m1", _spec())
+        store.write_blob("m1", version, b"bytes")
         store.finalize_artifact("m1", version, "{}", row_count=0, byte_size=0)
 
         inserted, release = threading.Event(), threading.Event()
@@ -1716,6 +1782,7 @@ class TestWriterSerialization:
         Each then waited on the lock the other held, and Postgres aborted one of them.
         """
         version = store.create_artifact("d1", "prov-d1", _spec())
+        store.write_blob("d1", version, b"bytes")
         store.finalize_artifact("d1", version, "{}", row_count=0, byte_size=0)
         store.set_name("current", "d1", version)
         store.set_alias("current", "prod", "d1", version)
@@ -1773,6 +1840,7 @@ class TestWriterSerialization:
         """A hit holds the version's row and then takes the audit lock to name it; delete took
         the audit lock and then the row. Each waited on the other and Postgres aborted one."""
         version = store.create_artifact("h1", "prov-h1", _spec())
+        store.write_blob("h1", version, b"bytes")
         store.finalize_artifact("h1", version, "{}", row_count=0, byte_size=0)
 
         holding_row, release = threading.Event(), threading.Event()
@@ -1830,6 +1898,7 @@ class TestWriterSerialization:
         acceptance took the audit lock and then superseded the holder. Each waited on the
         other and Postgres aborted one."""
         held = store.create_artifact("held", "prov-out", _spec())
+        store.write_blob("held", held, b"bytes")
         store.finalize_artifact("held", held, "{}", row_count=0, byte_size=0)
         builds = BuildStore(store.db_path, dialect=store.dialect)
         releases = ReleaseStore(store, builds)
@@ -1943,6 +2012,7 @@ class TestWriterSerialization:
         # The second finalize finds the first by provenance before it writes and
         # returns it; the index's rejection is TestProvenanceRaces' case.
         first = store.create_artifact("a1", "same-prov", _spec())
+        store.write_blob("a1", first, b"bytes")
         store.finalize_artifact("a1", first, "{}", row_count=0, byte_size=0)
 
         second = store.create_artifact("a2", "same-prov", _spec())
@@ -2026,6 +2096,7 @@ class TestSchemaMigrations:
     def test_an_existing_database_is_carried_forward(self, postgres_dsn, tmp_path, store):
         """A new column reaches a store that already has rows."""
         version = store.create_artifact("keeper", "prov-keep", _spec())
+        store.write_blob("keeper", version, b"bytes")
         store.finalize_artifact("keeper", version, schema_json="", row_count=1, byte_size=1)
 
         # Rewind to a pre-migration database that still holds its rows.
@@ -2256,6 +2327,7 @@ class TestGraph:
         node = store.definition_of("a1", version)
         assert node is not None
         assert store.graph.get(node) is not None
+        store.write_blob("a1", version, b"bytes")
         store.finalize_artifact("a1", version, "{}", row_count=0, byte_size=0)
         assert store.versions_lacking_definition() == []
 
@@ -2568,6 +2640,98 @@ class TestRootsKeyedByTenantMigration:
             reopened.close()
 
 
+class TestStagingsKeyedByTokenMigration:
+    def test_the_migration_rekeys_the_table_and_keeps_its_stagings(
+        self, store, postgres_dsn, tmp_path
+    ):
+        """The SQLite half is the migration-shape test in ``test_schema_migrations.py``."""
+        source = tmp_path / "payload"
+        source.write_bytes(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
+        tenant_key = hashlib.sha256(b"acme").hexdigest()[:16]
+        conn = store._get_connection()
+        try:
+            conn.execute("DROP TABLE import_staging")
+            conn.execute(
+                "CREATE TABLE import_staging (tenant TEXT NOT NULL DEFAULT '', "
+                "content_sha256 TEXT NOT NULL, byte_size BIGINT NOT NULL, "
+                "staged_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (tenant, content_sha256))"
+            )
+            conn.execute(
+                "INSERT INTO import_staging VALUES ('acme', ?, 7, ?)", (digest, time.time())
+            )
+            conn.execute("DELETE FROM schema_version")
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (20, 0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "again", dialect=PostgresDialect(postgres_dsn))
+        try:
+            conn = reopened._get_connection()
+            try:
+                key = [
+                    row["attname"]
+                    for row in conn.execute(
+                        "SELECT a.attname FROM pg_index i "
+                        "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true "
+                        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                        "WHERE i.indrelid = 'import_staging'::regclass AND i.indisprimary "
+                        "ORDER BY k.n"
+                    ).fetchall()
+                ]
+                states = conn.execute("SELECT state FROM import_staging").fetchall()
+            finally:
+                conn.close()
+            assert key == ["tenant", "content_sha256", "blob_token"]
+            assert [row["state"] for row in states] == ["ready"]
+            # The key every staging of the digest had then, in this store's blobs.
+            shared = (f"import-staging-{tenant_key}-{digest}", 0)
+            reopened.blob_store.publish_blob_from_path(*shared, source)
+            with reopened.open_staged_import("acme", digest) as reader:
+                assert reader.read() == b"payload"
+            reopened.stage_import_blob("acme", digest, source, 7)  # joins it
+            reopened.release_staged_import("acme", digest)
+            assert reopened.open_staged_import("acme", digest) is None
+            assert not reopened.blob_store.blob_exists(*shared)
+        finally:
+            reopened.close()
+
+
+class TestHighWaterMigration:
+    def test_the_migration_makes_a_bigint_high_water_and_fills_it(
+        self, store, postgres_dsn, tmp_path
+    ):
+        """The SQLite half is in ``test_artifact_store.py`` and the migration-shape test."""
+        store.create_artifact("x", "prov-1")
+        top = store.create_artifact("x", "prov-2")
+        store.create_artifact("y", "prov-y", requires=[("x", top)])
+        assert store.delete_artifact("x", top)
+        conn = store._get_connection()
+        try:
+            conn.execute("DROP TABLE artifact_high_water")
+            conn.execute("DELETE FROM schema_version")
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (21, 0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "again", dialect=PostgresDialect(postgres_dsn))
+        try:
+            conn = reopened._get_connection()
+            try:
+                version_type = conn.execute(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_name = 'artifact_high_water' AND column_name = 'version'"
+                ).fetchone()["data_type"]
+            finally:
+                conn.close()
+            assert version_type == "bigint"
+            assert reopened.create_artifact("x", "prov-3") == top + 1
+        finally:
+            reopened.close()
+
+
 class TestTheHoldTablesIndexes:
     """Names, aliases and pending changes indexed by the version they hold, which every
     chunk of a sweep's claim asks, on a new ledger and an old one."""
@@ -2631,3 +2795,45 @@ class TestTheOpenBuildIndex:
             assert self._present(reopened) == {"idx_build_open"}
         finally:
             reopened.close()
+
+
+class TestOneClockForEveryHost:
+    """Lease decisions read the database's clock, so a host whose own clock runs two
+    minutes ahead, past a one-minute lease, still finds the lease live."""
+
+    @staticmethod
+    def _live_build(store: ArtifactStore, tmp_path) -> BuildStore:
+        builds = BuildStore(tmp_path / "x.sqlite", dialect=store.dialect)
+        version = store.create_artifact("art", "prov-art", _spec())
+        builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+        assert builds.open_attempt(
+            "b",
+            "a1",
+            writable_until=builds.now() + 3600,
+            lease_owner="runner-1",
+            lease_duration_seconds=60.0,
+        )
+        return builds
+
+    @staticmethod
+    def _run_ahead(monkeypatch: pytest.MonkeyPatch) -> None:
+        real = time.time
+        monkeypatch.setattr(time, "time", lambda: real() + 120)
+
+    def test_a_host_running_ahead_finds_a_live_lease_live(self, store, tmp_path, monkeypatch):
+        builds = self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert builds.list_expired_leases(dispatch=None) == []
+        assert not builds.reclaim_expired_build("b", "runner-2", dispatch=None)
+        assert builds.renew_lease("b", "runner-1", 60.0, attempt="a1")
+        assert ReleaseStore(store, builds).prepare("b", "a1", "checkpoint").state == "preparing"
+
+    def test_a_zombie_sweep_on_a_host_running_ahead_spares_a_live_build(
+        self, store, tmp_path, monkeypatch
+    ):
+        self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert store.sweep_zombie_builds(max_age_seconds=60) == 0
+        assert store.get_artifact("art", 1).state == "building"

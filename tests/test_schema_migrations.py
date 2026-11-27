@@ -311,6 +311,7 @@ _MIGRATED_TABLES = [
     "build_releases",
     "release_references",
     "release_authorities",
+    "artifact_high_water",
 ]
 
 

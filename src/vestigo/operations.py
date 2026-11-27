@@ -37,7 +37,11 @@ class AssertReferenceRevision:
 
 @dataclass(frozen=True)
 class AssignAuthority:
-    """Make the release the single winner of an output slot; fail if the slot has one."""
+    """Make the release the single winner of an output slot; fail if another holds it.
+
+    *release_id* is an accepted release of the tenant, or the release being accepted;
+    any other fails the operation.
+    """
 
     target: str
     release_id: str
