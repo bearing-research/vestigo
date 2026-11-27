@@ -2044,7 +2044,8 @@ class Ledger:
         finished storing; and the outputs of a derivation still building past its
         lease (its write window), whose process died: its release is abandoned and
         its build and placeholder fail. Failed rows go too, but for the placeholder a build still
-        names (a finished execution's record). Observations stay. ``deleted_count``
+        names (a finished execution's record), which fails if its build failed and left it
+        building. Observations stay. ``deleted_count``
         and ``deleted_bytes`` count the staged rows too, by their blobs' sizes, and a
         dry run lists them under ``collected``.
 
@@ -2097,6 +2098,7 @@ class Ledger:
 
         orphans: list[ArtifactVersion] = []
         failed = []
+        unsettled_placeholders = []
         for v in versions:
             if v.state == "failed":
                 # A placeholder its build still names is that build's record.
@@ -2109,6 +2111,14 @@ class Ledger:
                 continue
             if v.release_id in dead:
                 orphans.append(v)
+                continue
+            placeholder = _PLACEHOLDER.fullmatch(v.id)
+            if placeholder is not None:
+                # A close whose fail reply was lost, never retried: the build failed and
+                # nothing else settles its record.
+                build = builds.get(placeholder.group(1))
+                if build is not None and build.state == "failed":
+                    unsettled_placeholders.append((v.id, v.version))
                 continue
             observed = _OBSERVED.match(v.id)
             if observed is not None:
@@ -2145,6 +2155,8 @@ class Ledger:
         if not dry_run:
             for v in orphans:
                 self.store.fail_artifact(v.id, v.version)
+            for artifact_id, version in unsettled_placeholders:
+                self.store.fail_artifact(artifact_id, version)
             for build, release in dead.values():
                 self.releases.abandon(release.release_id, release.attempt)
                 self.store.fail_artifact(build.artifact_id, build.version)
@@ -3160,13 +3172,15 @@ class Run:
         if self.ledger.releases.latest_accepted(self.execution_id) is not None:
             # Not a renewal to zero seconds, which is live through this clock reading.
             builds.lapse_lease(self.execution_id, self.attempt)
-        elif builds.fail_build(
-            self.execution_id, "ended before a checkpoint", lease_owner=self.attempt
-        ):
-            # Its placeholder too, once the build is this attempt's to fail: nothing
-            # would ever settle it.
-            build = builds.get_build(self.execution_id)
-            assert build is not None
+            return
+        # By attempt, not owner: a run that lapsed its own lease (a changed input, a
+        # closed write window) has none, yet the build is still its to fail.
+        builds.fail_build(self.execution_id, "ended before a checkpoint", attempt=self.attempt)
+        # Its placeholder too, once the build failed under this attempt, whichever call
+        # failed it: a close retried after a lost reply finds the build failed already,
+        # and nothing else would ever settle the placeholder.
+        build = builds.get_build(self.execution_id)
+        if build is not None and build.state == "failed" and build.attempt == self.attempt:
             self.ledger.store.fail_artifact(build.artifact_id, build.version)
 
 

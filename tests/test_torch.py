@@ -788,6 +788,75 @@ def test_a_failed_manager_close_still_drops_the_lease(
         assert resumed.restores_from == run.release_of(1).release_id
 
 
+def test_a_close_after_the_run_lapsed_its_own_lease_fails_the_build(ledger: Ledger, tmp_path: Path):
+    """A changed input on the first save lapses the lease and clears its owner; the build
+    and its placeholder still fail, and collect takes what the save staged."""
+    data = _file(tmp_path / "train.bin")
+    trainer = Trainer(ledger)
+    run = _run(ledger, trainer, {"train": data})
+    data.write_bytes(b"rowz")
+    with pytest.raises(InputChanged):
+        trainer.train(run, 1)
+    run.close()
+
+    build = ledger.builds.get_build(run.execution_id)
+    staged = ledger.store.list_versions_by_id_prefix(f"torch_{run.execution_id}@")
+    result = ledger.collect(keep=1)
+    left = [v for v in staged if ledger.store.get_artifact(v.id, v.version) is not None]
+    placeholder = ledger.store.get_artifact(build.artifact_id, build.version)
+    assert (build.state, placeholder.state, result["orphaned"], len(left)) == (
+        "failed",
+        "failed",
+        len(staged),
+        0,
+    )
+
+
+def test_a_close_retried_after_a_lost_fail_reply_fails_the_placeholder(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    """The retry finds the build failed already; nothing else would settle the placeholder."""
+    lost = ledger.store.dialect.operational_error
+    fail_build = BuildStore.fail_build
+
+    def committed_then_dropped(self: BuildStore, *args, **kwargs) -> bool:
+        fail_build(self, *args, **kwargs)
+        raise lost("the reply was lost")
+
+    run = ledger.start(Trainer(ledger).program)
+    with monkeypatch.context() as patch:
+        patch.setattr(BuildStore, "fail_build", committed_then_dropped)
+        with pytest.raises(lost):
+            run.close()
+    run.close()
+
+    build = ledger.builds.get_build(run.execution_id)
+    placeholder = ledger.store.get_artifact(build.artifact_id, build.version)
+    assert (build.state, placeholder.state) == ("failed", "failed")
+
+
+def test_collect_fails_the_placeholder_a_close_never_retried_left_building(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+):
+    lost = ledger.store.dialect.operational_error
+    fail_build = BuildStore.fail_build
+
+    def committed_then_dropped(self: BuildStore, *args, **kwargs) -> bool:
+        fail_build(self, *args, **kwargs)
+        raise lost("the reply was lost")
+
+    run = ledger.start(Trainer(ledger).program)
+    with monkeypatch.context() as patch:
+        patch.setattr(BuildStore, "fail_build", committed_then_dropped)
+        with pytest.raises(lost):
+            run.close()
+    ledger.collect(keep=1)
+
+    build = ledger.builds.get_build(run.execution_id)
+    placeholder = ledger.store.get_artifact(build.artifact_id, build.version)
+    assert (build.state, placeholder.state) == ("failed", "failed")
+
+
 def test_a_failed_close_does_not_hide_why_the_block_was_left(
     ledger: Ledger, monkeypatch: pytest.MonkeyPatch
 ):

@@ -681,6 +681,22 @@ class TestAttemptsAndFences:
         with pytest.raises(ReleaseRejected):
             ledger.releases.prepare(build_id, "a2", "checkpoint")
 
+    def test_a_build_fails_by_attempt_after_its_own_lapse_and_not_after_a_takeover(
+        self, ledger: Ledger
+    ):
+        """A lapse clears the owner, so only the attempt still names whose build it is."""
+        build_id = _build(ledger)
+        assert ledger.builds.lapse_lease(build_id, "runner-1")
+        assert not ledger.builds.fail_build(build_id, "ended", lease_owner="runner-1")
+        assert ledger.builds.fail_build(build_id, "ended", attempt="a1")
+        assert ledger.builds.get_build(build_id).state == "failed"
+
+        taken = _build(ledger)
+        ledger.clock.now += 120
+        _resume(ledger, taken, "a2")
+        assert not ledger.builds.fail_build(taken, "ended", attempt="a1")
+        assert ledger.builds.get_build(taken).state == "building"
+
     def test_only_its_own_attempt_abandons_attaches_or_marks_a_release(self, ledger: Ledger):
         build_id = _build(ledger)
         _resume(ledger, build_id, "a2")
