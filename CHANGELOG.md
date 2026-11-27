@@ -14,6 +14,50 @@ All notable changes to vestigo are recorded here. The format follows
   unlink it. The caller must own the file alone: a writable descriptor still open on it
   could change the blob after it is published. `ArtifactStore.adopt_blob_file` takes a
   build's `attempt`, as `publish_blob_from_path` does. (#118)
+- `BuildStore.fail_build(..., attempt=)` fails a build only while it is still that
+  attempt's, whether or not its lease is live. (#124)
+- `BuildStore.renew_lease(..., attempt=)` renews only while that is still the build's
+  attempt, so a fenced attempt's heartbeat cannot renew a successor that shares its
+  lease owner. (#129)
+- `approve_alias_change` and `reject_alias_change` take `reviewed=`, the change as
+  `list_pending_changes` listed it, and refuse when the pending change is no longer that
+  request. (#130)
+
+### Changed
+
+- `renew_lease` takes the build's key and reads the clock under it, as every fence check
+  does, so time spent waiting for the key counts against the lease: renew well inside it.
+  Every host sharing a ledger must keep its clock synchronized. (#122)
+- `create_artifact(release_id=)` and `stage_promotion` raise `ValueError` for a release
+  that does not exist or has settled. (#123)
+- `delete_artifact` raises `ValueError` for a version a pending alias change targets,
+  as it does for a published or held one, until the change is rejected. (#128)
+
+### Fixed
+
+- `cleanup_failed` locks each failed row and checks it again before deleting it, so it no
+  longer deletes a row an import filled meanwhile, a root placed meanwhile, or a younger
+  row at a reused key, and it keeps the id's top failed version so no number is reused.
+  (#119)
+- An `AssignAuthority` slot goes only to an accepted release or the one being accepted.
+  (#120)
+- `require` and `require_many` lock each requirer, so no edge outlives a requirer deleted
+  meanwhile. (#121)
+- A renewal that read the clock before a lapse no longer revives a lease a fence check
+  had already called lapsed. (#122)
+- A row staged or copied under a release while the release is accepted or rejected is
+  refused instead of left `building` in a settled release, and a copy whose source a
+  sweep took meanwhile copies nothing. (#123)
+- `vestigo.torch`: a run that lapsed its own lease (a changed input, a closed write
+  window) fails its build and placeholder on close; a close retried after a lost reply
+  fails the placeholder; `collect` fails a placeholder a failed build left `building`.
+  (#124)
+- A name or alias move, or deletion, is audited from the target it replaced, though
+  another writer moved the pointer meanwhile; a deletion's audit row names the id too.
+  (#125)
+- A restage racing the drop of its stale staging keeps its row and bytes. (#126)
+- `vestigo.torch`'s `collect` reaps a dead derivation that has no unsettled release (an
+  open whose reply was lost, a cleanup that failed). (#127)
 
 ## 0.8.0 - 2026-11-24
 
