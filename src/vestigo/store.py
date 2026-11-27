@@ -499,6 +499,32 @@ class AliasChange(TypedDict):
     requested_by: str | None
 
 
+_CHANGE_FIELDS = ("name", "alias", "action", "artifact_id", "version", "requested_by")
+
+
+def _is_change(pending: Mapping[str, object], reviewed: Mapping[str, object]) -> bool:
+    """Whether *pending* (a ``registry_pending`` row) is the request *reviewed* describes:
+    the same alias, action, target and requester, and, as listed, the same request."""
+    return all(pending[field] == reviewed.get(field) for field in _CHANGE_FIELDS) and all(
+        pending[field] == reviewed[field]
+        for field in ("requested_at", "tenant")
+        if field in reviewed
+    )
+
+
+def _replaced(name: str, alias: str, pending: Mapping[str, object]) -> str:
+    target = (
+        f"{pending['artifact_id']}@v={pending['version']}"
+        if pending["action"] == "set"
+        else "a delete"
+    )
+    by = pending["requested_by"] if pending["requested_by"] is not None else "a request"
+    return (
+        f"The pending change for alias '{name}@{alias}' is no longer the one reviewed: "
+        f"{by} now asks for {target}"
+    )
+
+
 class PendingChange(AliasChange):
     """A change waiting for approval, as :meth:`ArtifactStore.list_pending_changes` lists it."""
 
@@ -2039,11 +2065,13 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
-            for (artifact_id, version), requires in requirements.items():
-                row = conn.execute(
-                    "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
-                    (artifact_id, version),
-                ).fetchone()
+            # Each requirer locked, in key order: a delete or a sweep that went first left
+            # no row, and one that comes after sees the edges. Unlocked, an edge from a
+            # requirer deleted meanwhile held its target for good.
+            for index, ((artifact_id, version), requires) in enumerate(
+                sorted(requirements.items())
+            ):
+                row = self._lock_target(conn, artifact_id, version, "tenant", locked=index > 0)
                 if row is None:
                     raise ValueError(f"Artifact {artifact_id}@v={version} not found")
                 self._write_requirements(conn, artifact_id, version, row["tenant"], requires)
@@ -3703,17 +3731,25 @@ class ArtifactStore:
             )
 
     def _lock_target(
-        self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
+        self,
+        conn: StoreConnection,
+        artifact_id: str,
+        version: int,
+        columns: str = "state, tenant",
+        *,
+        locked: bool = False,
     ):
         """The version row a pointer or a hold is about to name, kept until commit.
 
         A delete or a sweep's claim then waits for the caller, or went first and the
         row reads as missing. Postgres takes the row ``FOR SHARE``, which conflicts
-        with both; SQLite takes the write lock before the read. The lock comes before
-        the audit lock, as the delete takes them.
+        with both; SQLite takes the write lock before the read, unless *locked* says an
+        earlier call on this transaction took it. The lock comes before the audit lock,
+        as the delete takes them.
         """
         if self._dialect.name == "sqlite":
-            self._dialect.begin_write(conn, artifact_id)
+            if not locked:
+                self._dialect.begin_write(conn, artifact_id)
             suffix = ""
         else:
             suffix = " FOR SHARE"
@@ -4753,15 +4789,19 @@ class ArtifactStore:
         tenant: str | None = None,
         actor: str | None = None,
         require_distinct_approver: bool = False,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Apply a pending alias change (audited with the approver as actor) and return it.
 
         ``require_distinct_approver`` forbids the requester approving their own change.
+        ``reviewed`` is the change the approver read (from :meth:`list_pending_changes`):
+        a request that replaced it since is not applied in its stead.
 
         Raises:
-            ValueError: If no change is pending for ``name @ alias``, the target is no
-                longer available, or the approver is the requester under
-                ``require_distinct_approver``.
+            ValueError: If no change is pending for ``name @ alias``, it is not
+                ``reviewed``, the target is no longer available, or the approver is the
+                requester under ``require_distinct_approver``.
         """
         conn = self._get_connection()
         try:
@@ -4771,14 +4811,18 @@ class ArtifactStore:
             # consumed while the stale change read here is applied.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
-            entry = cast(AliasChange, dict(pending))
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
+            entry = cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
 
             if require_distinct_approver and actor is not None and entry["requested_by"] == actor:
                 conn.rollback()
@@ -4869,11 +4913,17 @@ class ArtifactStore:
         alias: str,
         tenant: str | None = None,
         actor: str | None = None,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Discard a pending alias change (audited).
 
+        ``reviewed`` is the change the rejecter read: a request that replaced it since
+        is not discarded unseen.
+
         Raises:
-            ValueError: If no change is pending for ``name @ alias``.
+            ValueError: If no change is pending for ``name @ alias``, or it is not
+                ``reviewed``.
         """
         conn = self._get_connection()
         try:
@@ -4881,13 +4931,17 @@ class ArtifactStore:
             # Lock before reading, so an approve cannot apply the change rejected here.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
             conn.execute(
                 "DELETE FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
@@ -4903,7 +4957,7 @@ class ArtifactStore:
                 tenant=tenant,
             )
             conn.commit()
-            return cast(AliasChange, dict(pending))
+            return cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
         finally:
             conn.close()
 

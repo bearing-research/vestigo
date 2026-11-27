@@ -859,8 +859,8 @@ class ReleaseStore:
     ) -> None:
         """The operations in order on the caller's transaction; *subject* names an audit row.
 
-        *accepting* is the release this transaction accepts, which a reference may
-        name before it is accepted.
+        *accepting* is the release this transaction accepts, which a reference or a slot
+        may name before it is accepted.
         """
         if any(isinstance(op, InsertAuditEvent) for op in operations):
             # Before the operations' own writes; after any version rows, as the store
@@ -896,6 +896,8 @@ class ReleaseStore:
                 )
             asserted[op.name] = revision
         elif isinstance(op, AssignAuthority):
+            # A slot is held for good, so never by a release that may yet be abandoned.
+            self._check_release_named(conn, tenant, op.release_id, accepting, f"slot {op.target}")
             conn.execute(
                 "INSERT INTO release_authorities (tenant, target, release_id, created_at) "
                 "VALUES (?, ?, ?, ?) ON CONFLICT (tenant, target) DO NOTHING",
@@ -910,16 +912,9 @@ class ReleaseStore:
             if row["release_id"] != op.release_id:
                 raise OperationFailed(f"slot {op.target} already belongs to {row['release_id']}")
         elif isinstance(op, AdvanceReference):
-            if op.release_id != accepting:
-                target = conn.execute(
-                    "SELECT tenant, state FROM build_releases WHERE release_id = ?",
-                    (op.release_id,),
-                ).fetchone()
-                if target is None or target["tenant"] != tenant or target["state"] != "accepted":
-                    raise OperationFailed(
-                        f"reference {op.name}: {op.release_id} is not an accepted release "
-                        f"of tenant {tenant!r}"
-                    )
+            self._check_release_named(
+                conn, tenant, op.release_id, accepting, f"reference {op.name}"
+            )
             self._advance(conn, tenant, op.name, op.release_id, now, asserted.get(op.name))
             if op.name in asserted:
                 asserted[op.name] += 1
@@ -940,6 +935,21 @@ class ReleaseStore:
             )
         else:
             raise OperationFailed(f"{type(op).__name__} is not an operation")
+
+    @staticmethod
+    def _check_release_named(
+        conn: StoreConnection, tenant: str, release_id: str, accepting: str | None, what: str
+    ) -> None:
+        """Fail unless *release_id* is the release being accepted or an accepted one of *tenant*."""
+        if release_id == accepting:
+            return
+        target = conn.execute(
+            "SELECT tenant, state FROM build_releases WHERE release_id = ?", (release_id,)
+        ).fetchone()
+        if target is None or target["tenant"] != tenant or target["state"] != "accepted":
+            raise OperationFailed(
+                f"{what}: {release_id} is not an accepted release of tenant {tenant!r}"
+            )
 
     @staticmethod
     def _advance(
