@@ -477,6 +477,7 @@ class TestASweepBatchHoldsOffHoldWriters:
         "accept",
         "apply",
         "delete_artifact",
+        "cleanup_failed",
     )
 
     @pytest.mark.parametrize("writer", WRITERS)
@@ -499,6 +500,8 @@ class TestASweepBatchHoldsOffHoldWriters:
         release = releases.prepare("b1", "a1", "final")
         if writer == "approve_alias_change":
             store.request_alias_change("m", "prod", "set", "v", version)
+        if writer == "cleanup_failed":
+            store.fail_artifact("failed", store.create_artifact("failed", "prov-f", _spec()))
         cached = replace(record, id="cached", provenance_hash="p3")
         if writer == "import_artifact_lineage":
             store.import_artifact(cached, b"bytes")  # as the team cache writes it, no inputs
@@ -528,6 +531,7 @@ class TestASweepBatchHoldsOffHoldWriters:
             "accept": lambda: releases.accept(release.release_id, [], [event]),
             "apply": lambda: releases.apply("b1", "a1", [event]),
             "delete_artifact": lambda: store.delete_artifact("v", version),
+            "cleanup_failed": lambda: store.cleanup_failed(max_age_seconds=-10),
         }
         errors: list[BaseException] = []
 

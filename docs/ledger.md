@@ -87,7 +87,7 @@ if hit is None:
 - **An id holds versions.** Each `create_artifact` adds the next version (1, 2, ...).
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
-  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
+  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows, in batches that each commit on their own.
   `sweep_zombie_builds` fails every `building` row older than its cutoff, except the
   rows of a build whose lease is live (its target, its releases' outputs, its
   computation's rows), so run it only where no writer without a lease can hold a row

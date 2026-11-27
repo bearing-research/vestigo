@@ -632,6 +632,88 @@ class TestCleanup:
         assert store.get_artifact("model", 2) is None
         assert store.get_artifact("model", 3).state == "failed"
 
+    @staticmethod
+    def _before_the_lock(monkeypatch, write) -> None:
+        """Run *write* between cleanup's read of the failed rows and its batch's locks."""
+        lock = ArtifactStore._cleanup_failed_batch
+
+        def write_then_lock(self, *args):
+            write()
+            return lock(self, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", write_then_lock)
+
+    @staticmethod
+    def _filled(store, version: int):
+        """An import of a ready result into the failed row ``x@v=version``."""
+        data = _ipc_bytes(2)
+        record = replace(
+            store.get_artifact("x", version),
+            state="ready",
+            byte_size=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+            schema_json="{}",
+            row_count=2,
+        )
+        return lambda: store.import_artifact(record, data), data
+
+    def test_cleanup_failed_spares_a_row_an_import_filled_after_its_read(
+        self, backend_store, monkeypatch
+    ):
+        """Filled in, the row is a ready version whose bytes are under the import's key."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        fill, data = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "ready"
+        assert store.read_blob("x", 1) == data
+
+    def test_cleanup_failed_keeps_the_top_failed_version_over_one_an_import_filled(
+        self, backend_store, monkeypatch
+    ):
+        """The gap rule runs on the rows still failed once locked, or v2 is handed out twice."""
+        store = backend_store
+        for provenance in ("prov-1", "prov-2"):
+            store.fail_artifact("x", store.create_artifact("x", provenance))
+        fill, _ = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 2).state == "failed"
+        assert store.create_artifact("x", "prov-3") == 3
+
+    def test_cleanup_failed_spares_a_younger_row_put_at_a_key_it_read(
+        self, backend_store, monkeypatch
+    ):
+        """Deleted and failed again since the read, the key holds a row too young to go."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-1"))
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET created_at = created_at - 7200")
+        conn.commit()
+        conn.close()
+
+        def fail_anew():
+            assert store.delete_artifact("x", 1)
+            assert store.create_artifact("x", "prov-2") == 1
+            store.fail_artifact("x", 1)
+
+        self._before_the_lock(monkeypatch, fail_anew)
+
+        assert store.cleanup_failed(max_age_seconds=3600) == 0
+        assert store.get_artifact("x", 1).provenance_hash == "prov-2"
+
+    def test_cleanup_failed_keeps_a_root_retained_after_its_read(self, backend_store, monkeypatch):
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        self._before_the_lock(monkeypatch, lambda: store.retain("x", 1, kind="pin", holder="h"))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+        assert store.retention_roots("x", 1)
+
     def test_cleanup_preserves_ready(self, store):
         version = store.create_artifact("test-id", "hash123")
         store.finalize_artifact("test-id", version, "{}", 100, 1000)

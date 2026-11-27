@@ -6497,14 +6497,16 @@ class ArtifactStore:
 
         As the sweep, it leaves an id's highest version while a lower one stays, so a
         version number is never reused, and it spares a version a retention root holds
-        or a publication names: either is a promise someone else was given.
+        or a publication names: either is a promise someone else was given. Each batch
+        commits on its own, so one that raises leaves the earlier batches' deletes done.
         """
+        cutoff = time.time() - max_age_seconds
         conn = self._get_connection()
         try:
-            cutoff = time.time() - max_age_seconds
+            # The holds here only spare locking a row that stays; the batch looks again.
             cursor = conn.execute(
                 """
-                SELECT id, version, blob_attempt FROM artifact_versions av
+                SELECT id, version FROM artifact_versions av
                 WHERE state = 'failed' AND created_at < ?
                   AND NOT EXISTS (SELECT 1 FROM retention_roots r
                                   WHERE r.artifact_id = av.id AND r.version = av.version)
@@ -6513,17 +6515,60 @@ class ArtifactStore:
                 """,
                 (cutoff,),
             )
-            rows = list(
-                self._without_version_gaps(
-                    conn, {(row["id"], row["version"]): row for row in cursor.fetchall()}
-                ).values()
-            )
+            # Sorted here, not by the database's collation: every writer locking several
+            # version rows takes them in this one order.
+            candidates = sorted((row["id"], row["version"]) for row in cursor.fetchall())
+        finally:
+            conn.close()
+        removed = 0
+        # In batches, as the sweep's: each holds sweeps off, so a sweep waiting on one,
+        # and every hold writer queued behind that sweep, waits for a batch, not for all.
+        for start in range(0, len(candidates), _GC_DELETE_BATCH):
+            batch = candidates[start : start + _GC_DELETE_BATCH]
+            removed += self._cleanup_failed_batch(batch, cutoff)
+        return removed
+
+    def _cleanup_failed_batch(self, batch: list[tuple[str, int]], cutoff: float) -> int:
+        """Delete the failed versions of *batch* that may still go; return how many went.
+
+        Each row is locked, in key order, and looked at again: since the read an import
+        may have filled it, making it a ready version with bytes under another key, a
+        root or a publication may hold it, or a delete and a new failure may have put a
+        younger row at its key. The gap rule then runs on what is left.
+        """
+        conn = self._get_connection()
+        try:
+            # Its deletes lock rows a sweep's claim locks.
+            self._hold_off_sweeps(conn)
+            locked: dict[tuple[str, int], StoreRow] = {}
+            for key in batch:
+                if not conn.execute(
+                    "UPDATE artifact_versions SET last_used_at = last_used_at "
+                    "WHERE id = ? AND version = ? AND state = 'failed' AND created_at < ?",
+                    (*key, cutoff),
+                ).rowcount:
+                    continue
+                # Under the row lock, which a retain or a publish takes before writing.
+                row = conn.execute(
+                    """
+                    SELECT id, version, blob_attempt FROM artifact_versions av
+                    WHERE id = ? AND version = ?
+                      AND NOT EXISTS (SELECT 1 FROM retention_roots r
+                                      WHERE r.artifact_id = av.id AND r.version = av.version)
+                      AND NOT EXISTS (SELECT 1 FROM artifact_publications p
+                                      WHERE p.artifact_id = av.id AND p.version = av.version)
+                    """,
+                    key,
+                ).fetchone()
+                if row is not None:
+                    locked[key] = row
+            rows = list(self._without_version_gaps(conn, locked).values())
 
             # Metadata first, then blobs: a mid-sweep failure then orphans bytes rather than leaving
-            # rows pointing at deleted blobs, as garbage_collect does.
+            # rows pointing at deleted blobs, as garbage_collect does. A failed build's row
+            # still references its version.
+            self._delete_versions_children(conn, [(row["id"], row["version"]) for row in rows])
             for row in rows:
-                # A failed build's row still references the version.
-                self._delete_versions_children(conn, [(row["id"], row["version"])])
                 conn.execute(
                     "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                     (row["id"], row["version"]),
