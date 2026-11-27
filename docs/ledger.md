@@ -85,12 +85,15 @@ if hit is None:
   no part in it. Two inputs that hold the same bytes but came from different places
   give different keys, which is what `cache.py`'s third command shows.
 - **An id holds versions.** Each `create_artifact` adds the next version (1, 2, ...).
+  A number is never handed out twice: a rebuild after a delete is numbered past the
+  deleted version, so an edge, a review or a link naming `id@v=N` never comes to mean
+  other bytes here. An import keeps the number its source store gave it.
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
 - **A finalize with no bytes stored** raises `ValueError` and leaves the row
   `building`, so a lost upload is never served as a hit. With `content_sha256` given it
   costs one existence check on the blob store; without it, the bytes are hashed anyway.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
-  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows.
+  stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows, in batches that each commit on their own.
   `sweep_zombie_builds` fails every `building` row older than its cutoff, except the
   rows of a build whose lease is live (its target, its releases' outputs, its
   computation's rows), so run it only where no writer without a lease can hold a row
@@ -121,7 +124,10 @@ store.set_tag("train", 7, "dataset", "2026-10")
 
 A protected alias changes only by approval: `request_alias_change`, then
 `approve_alias_change` or `reject_alias_change`. With
-`require_distinct_approver=True`, the requester cannot approve their own change. Every change goes to the audit log (`read_audit`).
+`require_distinct_approver=True`, the requester cannot approve their own change. Pass
+the change you reviewed, as `list_pending_changes` listed it, as `reviewed=`: a request
+that replaced it since is refused rather than applied or discarded unseen. Every change
+goes to the audit log (`read_audit`).
 
 ## Lineage
 
@@ -168,7 +174,7 @@ builds.create_build(
 builds.open_attempt(
     build_id,
     "worker-1",
-    writable_until=time.time() + 3600,
+    writable_until=builds.now() + 3600,
     lease_owner="worker-1",
     lease_duration_seconds=60,
 )
@@ -191,7 +197,7 @@ build = builds.open_build(
     "worker-1",
     computation_key=key,
     executor_ref="train@v1",
-    writable_until=time.time() + 3600,
+    writable_until=builds.now() + 3600,
     lease_owner="worker-1",
 )
 if build.build_id != build_id:
@@ -210,14 +216,29 @@ dialect's integrity error; `builds.get_build(build_id)` says whether the first c
 committed.
 
 An attempt holds the build under a lease, which the worker renews with
-`builds.renew_lease(build_id, lease_owner)` well inside its duration. A lease that
-lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
+`builds.renew_lease(build_id, lease_owner)` well inside its duration; passing the
+optional `attempt=attempt` keeps a fenced attempt's heartbeat from renewing a successor
+that shares its owner. A renewal takes
+the build's write lock and reads the clock once it holds it, as an acceptance does, so
+time spent waiting for the lock counts against the lease. Every lease and write-window
+decision reads `builds.now()`: the database server's clock on Postgres, so hosts whose
+clocks disagree still agree on when a lease lapses (SQLite's is the one host's). Take
+`writable_until` from it too, as above: a deadline from a host's own clock is off by that
+host's skew. Housekeeping still reads each host's clock and is off by the same skew:
+`cleanup_failed(max_age_seconds=)` and `sweep_zombie_builds`'s age cutoff,
+`garbage_collect`'s idle floor (`min_idle_seconds`, against a last use an acceptance
+records by the database's clock and other writes by the host's), `settled_attempts`
+(a signed URL's expiry is the signing host's), and the day staged import bytes wait. Keep hosts within seconds of each other and those bounds are seconds off; a lease
+is never decided by them. A lease that lapses stays lapsed: `renew_lease` returns False, the attempt cannot be opened again,
 and its releases are rejected, so the build goes on only in a new attempt (a resume)
 or a reclaim. An attempt a resume or a reclaim took the build from cannot be opened
 again either, even once its successor's lease lapses. `builds.lapse_lease(build_id,
 lease_owner)` ends a lease at once, under the build's write lock, so an acceptance
 already under way commits before it and nothing of the attempt after it; it clears the
-owner, so a renewal racing it from another thread cannot revive it. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
+owner, so a renewal racing it from another thread cannot revive it; `attempt=`, as for a
+renewal, and on `builds.complete_build`, keeps a fenced attempt from ending its
+successor's lease or completing its build, and `complete_build` with it refuses an
+attempt whose lease has lapsed. `writable_until` bounds the attempt's whole write window. `builds.find_open_build(key)` finds the
 build again after a crash.
 
 ## Releases
@@ -275,7 +296,7 @@ start from.
 | --- | --- |
 | `AdvanceReference(name, release_id)` | points a head at an accepted release, which it then retains |
 | `AssertReferenceRevision(name, revision)` | fails unless the head is at that revision (0: absent), guarding an advance after it |
-| `AssignAuthority(target, release_id)` | makes the release the single winner of an output slot |
+| `AssignAuthority(target, release_id)` | makes an accepted release the single winner of an output slot |
 | `CheckBuildLease(build_id, attempt)` | fails unless that attempt holds that build |
 | `InsertAuditEvent(event)` | writes an audit row with the release |
 

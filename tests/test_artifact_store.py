@@ -12,6 +12,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
+import vestigo.store as store_module
 from vestigo import uris
 from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES, S3BlobStore
 from vestigo.build_store import BuildStore
@@ -34,6 +35,7 @@ from vestigo.store import (
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
+    ImportStagingLost,
     NameStatus,
     StagedVersion,
     _deletion_order,
@@ -652,6 +654,143 @@ class TestCleanup:
         assert store.get_artifact("model", 2) is None
         assert store.get_artifact("model", 3).state == "failed"
 
+    @staticmethod
+    def _before_the_lock(monkeypatch, write) -> None:
+        """Run *write* between cleanup's read of the failed rows and its batch's locks."""
+        lock = ArtifactStore._cleanup_failed_batch
+
+        def write_then_lock(self, *args):
+            write()
+            return lock(self, *args)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", write_then_lock)
+
+    @staticmethod
+    def _filled(store, version: int):
+        """An import of a ready result into the failed row ``x@v=version``."""
+        data = _ipc_bytes(2)
+        record = replace(
+            store.get_artifact("x", version),
+            state="ready",
+            byte_size=len(data),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+            schema_json="{}",
+            row_count=2,
+        )
+        return lambda: store.import_artifact(record, data), data
+
+    def test_cleanup_failed_spares_a_row_an_import_filled_after_its_read(
+        self, backend_store, monkeypatch
+    ):
+        """Filled in, the row is a ready version whose bytes are under the import's key."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        fill, data = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "ready"
+        assert store.read_blob("x", 1) == data
+
+    def test_cleanup_failed_keeps_the_top_failed_version_over_one_an_import_filled(
+        self, backend_store, monkeypatch
+    ):
+        """The gap rule runs on the rows still failed once locked, or v2 is handed out twice."""
+        store = backend_store
+        for provenance in ("prov-1", "prov-2"):
+            store.fail_artifact("x", store.create_artifact("x", provenance))
+        fill, _ = self._filled(store, 1)
+        self._before_the_lock(monkeypatch, fill)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 2).state == "failed"
+        assert store.create_artifact("x", "prov-3") == 3
+
+    def test_cleanup_failed_spares_a_younger_row_put_at_a_key_it_read(
+        self, backend_store, monkeypatch
+    ):
+        """Deleted and put back since the read (only an import, which keeps its version,
+        can reuse a number), the key holds a row too young to go."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-1"))
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET created_at = created_at - 7200")
+        conn.commit()
+        conn.close()
+
+        def fail_anew():
+            # The younger row, as such an import leaves it once it fails.
+            conn = store._get_connection()
+            conn.execute(
+                "UPDATE artifact_versions SET provenance_hash = 'prov-2', created_at = ? "
+                "WHERE id = 'x' AND version = 1",
+                (time.time(),),
+            )
+            conn.commit()
+            conn.close()
+
+        self._before_the_lock(monkeypatch, fail_anew)
+
+        assert store.cleanup_failed(max_age_seconds=3600) == 0
+        assert store.get_artifact("x", 1).provenance_hash == "prov-2"
+
+    def test_cleanup_failed_keeps_a_root_retained_after_its_read(self, backend_store, monkeypatch):
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        self._before_the_lock(monkeypatch, lambda: store.retain("x", 1, kind="pin", holder="h"))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+        assert store.retention_roots("x", 1)
+
+    def test_cleanup_failed_spares_a_version_a_requirer_needs(self, backend_store):
+        """Taken, the requirer would point at a hole the next version of x could fill."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "y", "prov-y")
+        store.require("y", 1, [("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_a_failed_requirer_requires(self, backend_store):
+        """The gap rule keeps z@2, and an import may yet fill it, edges and all."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x"))
+        _make_ready_artifact(store, "z", "prov-z1")
+        store.fail_artifact("z", store.create_artifact("z", "prov-z2", requires=[("x", 1)]))
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_spares_a_version_another_tenant_requires(self, backend_store):
+        """Taken, x's last row goes, and the requirer's own tenant may make x@1 anew."""
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-x", tenant="acme"), tenant="acme")
+        store.create_artifact("y", "prov-y", tenant="other", requires=[("x", 1)])
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 0
+        assert store.get_artifact("x", 1).state == "failed"
+
+    def test_cleanup_failed_ends_a_batch_when_its_time_is_up(self, backend_store, monkeypatch):
+        """A batch holds hold writers off, so it stops at the sweep's cap and the next one
+        goes on from there, at least one row each."""
+        store = backend_store
+        for artifact_id in ("a", "b", "c"):
+            store.fail_artifact(artifact_id, store.create_artifact(artifact_id, "prov"))
+        monkeypatch.setattr(store_module, "_GC_BATCH_SECONDS", 0.0)
+        batches = []
+        batch = ArtifactStore._cleanup_failed_batch
+
+        def counted(self, keys, cutoff):
+            batches.append(keys)
+            return batch(self, keys, cutoff)
+
+        monkeypatch.setattr(ArtifactStore, "_cleanup_failed_batch", counted)
+
+        assert store.cleanup_failed(max_age_seconds=-10) == 3
+        assert [keys[0] for keys in batches] == [("a", 1), ("b", 1), ("c", 1)]
+
     def test_cleanup_preserves_ready(self, store):
         version = store.create_artifact("test-id", "hash123")
         store.write_blob("test-id", version, b"bytes")
@@ -1056,12 +1195,12 @@ class TestVersionPromotion:
         store.blob_store.write_blob("file-1", 1, b"file")
         store.finalize_artifact("file-1", 1, "{}", 1, 4)
         manifest = store.create_artifact(
-            "manifest",
-            "prov-m",
-            requires=[("file-1", 1)],
-            release_id="rel-1",
-            computation_key="comp-1",
+            "manifest", "prov-m", requires=[("file-1", 1)], computation_key="comp-1"
         )
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET release_id = 'rel-1' WHERE id = 'manifest'")
+        conn.commit()
+        conn.close()
         store.blob_store.write_blob("manifest", manifest, b"m")
         store.finalize_artifact("manifest", manifest, "{}", 1, 1)
         self._ready(store, "manifest", "prov-m2", b"m2")
@@ -1665,6 +1804,26 @@ class TestRegistryAudit:
         actions = [e["action"] for e in store.read_audit(name="demo/model")]
         assert actions[0] == "name_delete"
 
+    def test_a_deleted_version_s_names_and_aliases_are_audited_from_it(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "m1", "prov-1")
+        store.set_name("demo/model", "m1", 1, tenant="acme")
+        store.set_alias("demo/model", "champion", "m1", 1, tenant="acme")
+
+        assert store.delete_artifact("m1", 1)
+
+        assert [
+            (e["action"], e["alias"], e["from_artifact_id"], e["from_version"], e["tenant"])
+            for e in store.read_audit(name="demo/model", tenant="acme")[:2]
+        ] == [
+            ("alias_delete", "champion", "m1", 1, "acme"),
+            ("name_delete", None, "m1", 1, "acme"),
+        ]
+        assert {e["action"] for e in store.read_audit(artifact_id="m1")} >= {
+            "alias_delete",
+            "name_delete",
+        }
+
     def test_finalize_promotion_audited(self, store):
         """Names set through finalize_and_set_name land in the audit too."""
         store.create_artifact("m1", "prov-f")
@@ -1715,6 +1874,58 @@ class TestPendingAliasChanges:
             e for e in store.read_audit(name="demo/model") if e["action"] == "alias_approved"
         )
         assert approved["actor"] == "approver"
+
+    @pytest.mark.parametrize(
+        ("replacement", "message"),
+        [
+            (("set", "m2", 1, "alice"), "alice now asks for m2@v=1"),
+            (("set", "m1", 1, "carol"), "carol now asks for m1@v=1"),
+            (("delete", None, None, "alice"), "alice now asks for a delete"),
+            (("set", "m1", 1, None), "a request now asks for m1@v=1"),
+            (("set", "m1", 1, "alice"), "alice now asks for m1@v=1"),  # asked again
+        ],
+    )
+    def test_an_approval_applies_only_the_change_its_approver_reviewed(
+        self, store, monkeypatch, replacement, message
+    ):
+        for artifact_id in ("m1", "m2", "m3"):
+            _make_ready_artifact(store, artifact_id, f"prov-{artifact_id}")
+        store.set_alias("demo/model", "champion", "m3", 1)
+        # A clock that always moves on, so a request asked again is stamped anew.
+        ticks = [1000.0]
+        monkeypatch.setattr(time, "time", lambda: ticks.append(ticks[-1] + 1) or ticks[-1])
+        store.request_alias_change("demo/model", "champion", "set", "m1", 1, actor="alice")
+        (seen,) = store.list_pending_changes()
+        # Replaced after the approver read it and before they approve.
+        action, artifact_id, version, actor = replacement
+        store.request_alias_change(
+            "demo/model", "champion", action, artifact_id, version, actor=actor
+        )
+        monkeypatch.undo()
+
+        with pytest.raises(ValueError, match=f"no longer the one reviewed: {message}"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.reject_alias_change("demo/model", "champion", actor="bob", reviewed=seen)
+
+        assert store.resolve_alias("demo/model", "champion").id == "m3"
+        (pending,) = store.list_pending_changes()
+        assert (
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=pending)[
+                "requested_by"
+            ]
+            == actor
+        )
+
+    def test_a_review_of_one_alias_approves_no_other(self, store):
+        _make_ready_artifact(store, "m1", "prov-1")
+        for alias in ("staging", "champion"):
+            store.request_alias_change("demo/model", alias, "set", "m1", 1, actor="alice")
+        staging = next(c for c in store.list_pending_changes() if c["alias"] == "staging")
+
+        with pytest.raises(ValueError, match="no longer the one reviewed"):
+            store.approve_alias_change("demo/model", "champion", actor="bob", reviewed=staging)
+        assert store.approve_alias_change("demo/model", "staging", actor="bob", reviewed=staging)
 
     def test_reject_discards(self, store):
         _make_ready_artifact(store, "m1", "prov-1")
@@ -1806,7 +2017,12 @@ class TestApproveAtomicity:
     def test_dead_target_keeps_pending_intact(self, store):
         _make_ready_artifact(store, "m1", "prov-1")
         store.request_alias_change("demo/model", "champion", "set", artifact_id="m1", version=1)
-        store.delete_artifact("m1", 1)  # target dies between request and approve
+        # The target dies between request and approve: not by delete_artifact, which
+        # refuses a pending change's target, but as a row lost some other way.
+        conn = store._get_connection()
+        conn.execute("DELETE FROM artifact_versions WHERE id = 'm1' AND version = 1")
+        conn.commit()
+        conn.close()
 
         with pytest.raises(ValueError, match="no longer available"):
             store.approve_alias_change("demo/model", "champion")
@@ -2014,6 +2230,165 @@ class TestAliasIdempotence:
             is True
         )
         assert len(store.list_pending_changes()) == 1
+
+
+class _PausedAfterRead:
+    """A connection that, once it has read *table*, gives another writer a moment."""
+
+    def __init__(self, conn, table: str, read: threading.Event, other_done: threading.Event):
+        self._conn, self._table, self._read, self._other_done = conn, table, read, other_done
+
+    def execute(self, sql, *args, **kwargs):
+        cursor = self._conn.execute(sql, *args, **kwargs)
+        if not self._read.is_set() and sql.lstrip().startswith("SELECT") and self._table in sql:
+            self._read.set()
+            # Long enough for an unserialized writer to commit; one that waits for this
+            # transaction does not finish, so the wait times out.
+            self._other_done.wait(1)
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _moves(store, name: str, alias: str | None) -> list[tuple[str, int | None, int | None]]:
+    events = sorted(store.read_audit(name=name), key=lambda event: event["seq"])
+    return [
+        (event["action"], event["from_version"], event["to_version"])
+        for event in events
+        if event["alias"] == alias and event["action"] != "alias_approved"
+    ]
+
+
+class TestAuditedMovesFromWhatWasThere:
+    """A pointer's audited move or deletion names the target it replaced, though another
+    writer moves it meanwhile."""
+
+    @pytest.mark.parametrize(
+        ("alias", "slow", "expected"),
+        [
+            (None, "set", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            (None, "finalize", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            (None, "delete", [("set", None, 1), ("delete", 1, None), ("set", None, 3)]),
+            ("prod", "set", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            ("prod", "delete", [("set", None, 1), ("delete", 1, None), ("set", None, 3)]),
+        ],
+    )
+    def test_a_move_racing_another_is_audited_from_its_predecessor(
+        self, backend_store, monkeypatch, alias, slow, expected
+    ):
+        store = backend_store
+        if slow == "set" and store.dialect.name == "sqlite":
+            pytest.skip("a move locks its target, which on SQLite is the write lock")
+        for version in (1, 2, 3):
+            store.create_artifact("x", f"prov-{version}")
+            store.write_blob("x", version, _ipc_bytes(version))
+            store.finalize_artifact("x", version, "{}", 1, 10)
+
+        def point(version: int) -> None:
+            if alias is None:
+                store.set_name("m", "x", version)
+            else:
+                store.set_alias("m", alias, "x", version)
+
+        def drop() -> None:
+            if alias is None:
+                store.delete_name("m")
+            else:
+                store.delete_alias("m", alias)
+
+        writes = {
+            "set": lambda: point(2),
+            # A retry of x@2's finalize, which names its result again.
+            "finalize": lambda: store.finalize_and_set_name("x", 2, "{}", 1, 10, "m"),
+            "delete": drop,
+        }
+        point(1)
+        read, other_done = threading.Event(), threading.Event()
+        table = "artifact_names" if alias is None else "artifact_aliases"
+        connect = store._get_connection
+        writer = threading.Thread(target=writes[slow])
+        monkeypatch.setattr(
+            store,
+            "_get_connection",
+            lambda: (
+                _PausedAfterRead(connect(), table, read, other_done)
+                if threading.current_thread() is writer
+                else connect()
+            ),
+        )
+        writer.start()
+        assert read.wait(10)
+        point(3)
+        other_done.set()
+        writer.join(10)
+        assert not writer.is_alive()
+
+        kind = "name" if alias is None else "alias"
+        assert _moves(store, "m", alias) == [
+            (f"{kind}_{action}", before, after) for action, before, after in expected
+        ]
+
+    def test_a_request_racing_a_move_is_audited_before_it(self, backend_store, monkeypatch):
+        store = backend_store
+        if store.dialect.name == "sqlite":
+            pytest.skip("a request locks its target, which on SQLite is the write lock")
+        for version in (1, 2):
+            store.create_artifact("x", f"prov-{version}")
+            store.write_blob("x", version, _ipc_bytes(version))
+            store.finalize_artifact("x", version, "{}", 1, 10)
+        store.set_alias("m", "prod", "x", 1)
+        read, other_done, moving = threading.Event(), threading.Event(), threading.Event()
+        connect = store._get_connection
+        requested = {}
+        requester = threading.Thread(
+            target=lambda: requested.update(
+                queued=store.request_alias_change("m", "prod", "set", "x", 2)
+            )
+        )
+        mover = threading.Thread(target=lambda: store.set_alias("m", "prod", "x", 2))
+
+        def connection():
+            if threading.current_thread() is requester:
+                return _PausedAfterRead(connect(), "artifact_aliases", read, other_done)
+            if threading.current_thread() is mover:
+                moving.set()
+            return connect()
+
+        monkeypatch.setattr(store, "_get_connection", connection)
+        requester.start()
+        try:
+            assert read.wait(10)
+            mover.start()
+            assert moving.wait(10)
+            # Time for a mover that does not wait for the request to commit.
+            mover.join(1)
+        finally:
+            other_done.set()
+            requester.join(10)
+            if mover.ident is not None:  # started
+                mover.join(10)
+        assert not requester.is_alive() and not mover.is_alive()
+
+        # Queued because the alias was on x@1, so its audit row comes before the move.
+        assert requested == {"queued": True}
+        assert [
+            (event["action"], event["to_version"])
+            for event in sorted(store.read_audit(name="m"), key=lambda event: event["seq"])
+        ] == [("alias_set", 1), ("alias_request_set", 2), ("alias_set", 2)]
+
+    @pytest.mark.parametrize("alias", [None, "prod"])
+    def test_a_deletion_is_audited_from_the_id_and_version_it_removed(self, store, alias):
+        _make_ready_artifact(store, "y", "prov-y")
+        if alias is None:
+            store.set_name("m", "y", 1)
+            store.delete_name("m")
+        else:
+            store.set_alias("m", alias, "y", 1)
+            store.delete_alias("m", alias)
+
+        deletion = store.read_audit(name="m")[0]
+        assert (deletion["from_artifact_id"], deletion["from_version"]) == ("y", 1)
 
 
 class TestAuditTenantScoping:
@@ -3149,6 +3524,32 @@ class _Racing:
         competitor.dialect.close()
 
 
+class TestWhatADeleteLeavesBehind:
+    """A pending change's target is not stood in for by one built later under its number."""
+
+    @staticmethod
+    def _ready(store, provenance: str, data: bytes) -> int:
+        version = store.create_artifact("x", provenance)
+        store.write_blob("x", version, data)
+        store.finalize_artifact("x", version, "{}", 0, len(data))
+        return version
+
+    def test_a_version_a_pending_change_targets_is_deleted_only_once_it_is_rejected(
+        self, backend_store
+    ):
+        store = backend_store
+        self._ready(store, "prov-1", b"one")
+        reviewed = self._ready(store, "prov-2", b"reviewed")
+        store.request_alias_change("m", "prod", "set", "x", reviewed, actor="alice")
+
+        with pytest.raises(ValueError, match="pending change to m@prod"):
+            store.delete_artifact("x", reviewed)
+        assert store.get_artifact("x", reviewed) is not None
+
+        store.reject_alias_change("m", "prod", actor="bob")
+        assert store.delete_artifact("x", reviewed)
+
+
 class TestDeleteAgainstADuplicateFinalize(_Racing):
     """A duplicate's finalize and a delete of its canonical, in every order, leave the
     duplicate reading bytes (audit SR-B)."""
@@ -3918,6 +4319,63 @@ class TestPromotionIsNotARelease:
         assert ("model-1", 2) not in releases.collectable_checkpoints(keep=1)
 
 
+class TestASourceIsHeldWhileItsCopyStreams:
+    """A promotion's bytes stream after its row commits: a sweep then must spare the source."""
+
+    @staticmethod
+    def _during_copy(store, monkeypatch, step):
+        """Run *step* once the copy's row has committed, before its bytes are written."""
+        open_writer = store.blob_store.open_blob_writer
+
+        def opened(blob_id, version):
+            step()
+            return open_writer(blob_id, version)
+
+        monkeypatch.setattr(store.blob_store, "open_blob_writer", opened)
+
+    def test_a_sweep_mid_copy_spares_the_source(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        swept = []
+        self._during_copy(
+            store, monkeypatch, lambda: swept.append(store.garbage_collect(max_idle_days=0))
+        )
+
+        promoted = store.promote_version("art", old)
+
+        assert swept and store.get_artifact("art", old) is not None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_the_copy_holds_its_source_no_longer_once_it_lands(self, backend_store):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        promoted = store.promote_version("art", old)
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_a_failed_copy_holds_its_source_no_longer(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+
+        def broken():
+            raise OSError("the disk filled up")
+
+        self._during_copy(store, monkeypatch, broken)
+        with pytest.raises(OSError, match="disk filled"):
+            store.promote_version("art", old)
+        monkeypatch.undo()
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
+
+
 class TestAReadThroughAPointer:
     def test_both_uses_are_noted_after_every_read(self, store):
         """The note turns SQLite's busy handler off for what follows (audit SL-9)."""
@@ -4165,6 +4623,100 @@ class TestSetDefinitionsCount:
         assert store.set_definitions({("out", 1): node}) == 0
 
 
+class TestAVersionNumberIsNeverHandedOutTwice:
+    """A requirer's edge, a review and a blob key name id@v=N: a rebuild after a delete
+    gets a number of its own."""
+
+    @staticmethod
+    def _ready(store, artifact_id, provenance, data=b"bytes") -> int:
+        version = store.create_artifact(artifact_id, provenance)
+        store.write_blob(artifact_id, version, data)
+        store.finalize_artifact(artifact_id, version, "{}", row_count=0, byte_size=len(data))
+        return version
+
+    def test_a_rebuild_after_the_top_version_is_deleted_is_numbered_past_it(self, backend_store):
+        store = backend_store
+        self._ready(store, "x", "prov-1")
+        top = self._ready(store, "x", "prov-2")
+        requirer = store.create_artifact("y", "prov-y", requires=[("x", top)])
+        assert store.delete_artifact("x", top)
+
+        rebuilt = self._ready(store, "x", "prov-3", b"other bytes")
+
+        assert rebuilt == top + 1
+        assert store.get_artifact("x", top) is None
+        assert not store.requirements_met(store.get_artifact("y", requirer))
+
+    def test_a_rebuild_after_an_id_s_only_version_is_deleted_is_not_v1(self, backend_store):
+        store = backend_store
+        only = self._ready(store, "x", "prov-1")
+        assert store.delete_artifact("x", only)
+
+        assert store.create_artifact("x", "prov-2") == only + 1
+
+    def test_a_rebuild_after_cleanup_takes_every_failed_version_is_not_v1(self, backend_store):
+        store = backend_store
+        store.fail_artifact("x", store.create_artifact("x", "prov-1"))
+        store.fail_artifact("x", store.create_artifact("x", "prov-2"))
+        assert store.cleanup_failed(max_age_seconds=-1) == 2
+
+        assert store.create_artifact("x", "prov-3") == 3
+
+    def test_a_rebuild_after_a_sweep_takes_the_whole_id_is_not_v1(self, backend_store):
+        store = backend_store
+        self._ready(store, "loose", "prov-1")
+        assert store.garbage_collect(max_idle_days=0, collect_latest=True)["deleted_count"] == 1
+        assert store.get_artifact("loose", 1) is None
+
+        assert store.create_artifact("loose", "prov-2") == 2
+
+    def test_a_delete_below_the_top_leaves_the_numbering_alone(self, backend_store):
+        """Against numbering from the high water alone, which hands out the top again."""
+        store = backend_store
+        low = self._ready(store, "x", "prov-1")
+        self._ready(store, "x", "prov-2")
+        assert store.delete_artifact("x", low)
+
+        assert store.create_artifact("x", "prov-3") == 3
+
+    @pytest.mark.parametrize("namer", ["name", "requirer"])
+    def test_an_upgraded_store_numbers_past_the_versions_it_still_names(self, tmp_path, namer):
+        """A delete from before the high water: an audit row or an edge names it."""
+        store = ArtifactStore(tmp_path / "s")
+        self._ready(store, "x", "prov-1")
+        named = self._ready(store, "x", "prov-2")
+        if namer == "name":
+            store.set_name("m", "x", named)
+        else:
+            store.create_artifact("y", "prov-y", requires=[("x", named)])
+        assert store.delete_artifact("x", named)
+        conn = sqlite3.connect(store.db_path)
+        conn.execute("DROP TABLE artifact_high_water")
+        conn.execute("DELETE FROM schema_version WHERE version = 22")
+        conn.commit()
+        conn.close()
+        store.close()
+
+        reopened = ArtifactStore(tmp_path / "s")
+        try:
+            assert reopened.create_artifact("x", "prov-3") == named + 1
+        finally:
+            reopened.close()
+
+    def test_an_import_keeps_its_version_below_the_high_water(self, backend_store):
+        store = backend_store
+        first = self._ready(store, "x", "prov-1")
+        record = store.get_artifact("x", first)
+        self._ready(store, "x", "prov-2")
+        assert store.delete_artifact("x", 2)
+        assert store.delete_artifact("x", first)
+
+        landed = store.import_artifact(record, b"bytes")
+
+        assert (landed.id, landed.version) == ("x", first)
+        assert store.create_artifact("x", "prov-3") == 3
+
+
 class TestADeletedBuildsChildren:
     def test_its_console_goes_and_its_attempts_stay_for_the_attempt_sweep(
         self, backend_store, tmp_path
@@ -4192,6 +4744,321 @@ class TestADeletedBuildsChildren:
         assert [a[:4] for a in builds.settled_attempts()] == [
             ("build-1", "built", version, "att-1")
         ]
+
+
+class TestEachStagingHasItsOwnBytes:
+    """Each upload has a blob key of its own: ending a staging never takes bytes a later
+    one holds, and nothing an upload writes outlives every row naming it."""
+
+    T0 = 1_000_000.0
+    LATER = T0 + IMPORT_STAGING_TTL_SECONDS + 1
+
+    @staticmethod
+    def _source(tmp_path, data: bytes):
+        source = tmp_path / hashlib.sha256(data).hexdigest()
+        source.write_bytes(data)
+        return source, hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _read(store, digest) -> bytes | None:
+        reader = store.open_staged_import("acme", digest)
+        if reader is None:
+            return None
+        with reader:
+            return reader.read()
+
+    @staticmethod
+    def _rows(store, digest) -> int:
+        conn = store._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM import_staging WHERE content_sha256 = ?", (digest,)
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _recording_publishes(store, monkeypatch) -> list:
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def recording(blob_id, version, path):
+            published.append((blob_id, version))
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", recording)
+        return published
+
+    @staticmethod
+    def _before_first_staged_delete(store, monkeypatch, act) -> list:
+        """Run *act* once, just before the first staged bytes are deleted."""
+        delete = store.blob_store.delete_blob
+        acted = []
+
+        def act_then_delete(blob_id, version):
+            if blob_id.startswith("import-staging-") and not acted:
+                acted.append(True)
+                act()
+            return delete(blob_id, version)
+
+        monkeypatch.setattr(store.blob_store, "delete_blob", act_then_delete)
+        return acted
+
+    @staticmethod
+    def _unreachable(blob_id, version):
+        raise ConnectionError("the object store is unreachable")
+
+    def test_a_retried_upload_joins_the_staging_and_leaves_no_copy(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """The held bytes stay, which an import may be reading; one release ends it."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1)
+
+        first, second = published
+        assert first != second
+        assert store.blob_store.blob_exists(*first)
+        assert not store.blob_store.blob_exists(*second)
+        assert self._rows(store, digest) == 1
+        store.release_staged_import("acme", digest)
+        assert self._read(store, digest) is None
+        assert not store.blob_store.blob_exists(*first)
+        assert self._rows(store, digest) == 0
+
+    def test_an_upload_the_drop_took_meanwhile_raises_and_leaves_no_bytes(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """One that outlasted the TTL: its client is told, rather than answered 201."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def swept_before_landing(blob_id, version, path):
+            if not published:
+                published.append((blob_id, version))
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ImportStagingLost):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+        assert self._read(store, other_digest) == b"other"
+
+    def test_a_lost_upload_whose_bytes_fail_to_go_leaves_them_for_the_next_drop(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def swept_before_landing(blob_id, version, path):
+            if not published:
+                published.append((blob_id, version))
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+                # The object store goes away once the drop is done.
+                monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ConnectionError):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+        assert store.blob_store.blob_exists(*published[0])
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+
+    def test_an_upload_whose_row_a_drop_is_ending_is_lost_not_ready(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """The drop took the row out of reach and could not delete its bytes yet: the
+        upload must not make the row ready again."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        delete = store.blob_store.delete_blob
+
+        def swept_before_landing(blob_id, version, path):
+            if blob_id.endswith(tuple("0123456789abcdef")) and digest in blob_id:
+                store.blob_store.delete_blob = self._unreachable
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+                store.blob_store.delete_blob = delete
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ImportStagingLost):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+
+        assert self._read(store, digest) is None
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+        assert self._rows(store, digest) == 0
+
+    def test_a_restage_repairs_a_staging_whose_bytes_are_gone(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        store.blob_store.delete_blob(*published[0])  # a lifecycle rule, an operator
+        assert self._read(store, digest) is None
+
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1)
+
+        assert self._read(store, digest) == b"payload"
+        assert self._rows(store, digest) == 1
+
+    def test_an_upload_during_a_release_keeps_its_bytes(self, backend_store, monkeypatch, tmp_path):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        acted = self._before_first_staged_delete(
+            store,
+            monkeypatch,
+            lambda: store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1),
+        )
+
+        store.release_staged_import("acme", digest)
+
+        assert acted
+        assert self._read(store, digest) == b"payload"
+
+    def test_an_upload_as_the_sweep_drops_a_stale_staging_keeps_its_bytes(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        acted = self._before_first_staged_delete(
+            store,
+            monkeypatch,
+            lambda: store.stage_import_blob("acme", digest, source, 7, now=self.LATER),
+        )
+        other, other_digest = self._source(tmp_path, b"other")
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+
+        assert acted
+        assert self._read(store, digest) == b"payload"
+        assert self._rows(store, digest) == 1
+
+    def test_a_released_staging_is_out_of_reach_before_its_bytes_go(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        seen = []
+        self._before_first_staged_delete(
+            store, monkeypatch, lambda: seen.append(store.open_staged_import("acme", digest))
+        )
+
+        store.release_staged_import("acme", digest)
+
+        assert seen == [None]
+
+    def test_an_upload_that_dies_is_dropped_with_the_stale_stagings(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        publish = store.blob_store.publish_blob_from_path
+        written = []
+
+        def dies_after_writing(blob_id, version, path):
+            publish(blob_id, version, path)
+            written.append((blob_id, version))
+            raise ConnectionError("the connection dropped")
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", dies_after_writing)
+        with pytest.raises(ConnectionError):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+        assert self._read(store, digest) is None
+
+        other, other_digest = self._source(tmp_path, b"other")
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+
+        (upload,) = written
+        assert not store.blob_store.blob_exists(*upload)
+        assert self._rows(store, digest) == 0
+
+    def test_a_release_whose_bytes_fail_to_go_leaves_them_for_the_stale_drop(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+
+        with pytest.raises(ConnectionError):
+            store.release_staged_import("acme", digest)
+        monkeypatch.undo()
+        assert self._read(store, digest) is None
+
+        other, other_digest = self._source(tmp_path, b"other")
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+
+    def test_a_stale_staging_whose_bytes_fail_to_go_stays_for_the_next_sweep(
+        self, backend_store, monkeypatch, tmp_path, caplog
+    ):
+        """And the upload whose staging swept it still stages."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        other, other_digest = self._source(tmp_path, b"other")
+        monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+        monkeypatch.undo()
+
+        assert "could not drop a staging" in caplog.text
+        assert self._read(store, other_digest) == b"other"
+        assert self._rows(store, digest) == 1
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+        assert self._rows(store, digest) == 0
+
+    def test_a_staging_from_before_tokens_reads_and_releases_the_shared_key(
+        self, backend_store, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        # The key every staging of the digest had then.
+        tenant_key = hashlib.sha256(b"acme").hexdigest()[:16]
+        shared = (f"import-staging-{tenant_key}-{digest}", 0)
+        store.blob_store.publish_blob_from_path(*shared, source)
+        conn = store._get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO import_staging (tenant, content_sha256, byte_size, staged_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("acme", digest, 7, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._read(store, digest) == b"payload"
+        store.release_staged_import("acme", digest)
+        assert self._read(store, digest) is None
+        assert not store.blob_store.blob_exists(*shared)
 
 
 class TestPublicCallablesTheSuiteMissed:
@@ -4429,10 +5296,9 @@ class TestProtectedAliasEvents:
             store.approve_alias_change(
                 "team/model", "champion", actor="ana", require_distinct_approver=True
             )
-        assert store.delete_artifact("gone", 1)
+        with pytest.raises(ValueError, match="pending change"):
+            store.delete_artifact("gone", 1)
         after_delete = len(store.read_events())
-        with pytest.raises(ValueError, match="no longer available"):
-            store.approve_alias_change("team/model", "champion", actor="ben")
 
         assert queued == baseline + 1
         assert len(store.read_events()) == after_delete

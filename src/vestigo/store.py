@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NoReturn, NotRequired, TypedDict, cast
 
 from vestigo import uris
 from vestigo.build_store import OPEN_BUILD_INDEX_SQL
@@ -134,14 +134,21 @@ def attempt_blob_id(artifact_id: str, attempt: str) -> str:
 IMPORT_STAGING_TTL_SECONDS = 86_400.0
 
 
-def staged_import_key(tenant: str | None, content_sha256: str) -> tuple[str, int]:
+def staged_import_key(tenant: str | None, content_sha256: str, token: str) -> tuple[str, int]:
     """The blob key bytes uploaded ahead of an import wait under.
 
     Uses version 0, which no artifact can have, so a staged upload never collides
-    with an artifact's key.
+    with an artifact's key. Each staging's *token* gives it a key of its own, so ending
+    one staging never takes another's bytes; a staging from before tokens (``""``) has
+    the digest's shared key.
     """
     tenant_key = hashlib.sha256((tenant or "").encode()).hexdigest()[:16]
-    return f"import-staging-{tenant_key}-{content_sha256}", 0
+    suffix = f"-{token}" if token else ""
+    return f"import-staging-{tenant_key}-{content_sha256}{suffix}", 0
+
+
+class ImportStagingLost(RuntimeError):
+    """A staging's upload outlasted ``IMPORT_STAGING_TTL_SECONDS``, and a drop took it."""
 
 
 def _no_bytes_error(artifact_id: str, version: int) -> ValueError:
@@ -503,6 +510,32 @@ class AliasChange(TypedDict):
     artifact_id: str | None
     version: int | None
     requested_by: str | None
+
+
+_CHANGE_FIELDS = ("name", "alias", "action", "artifact_id", "version", "requested_by")
+
+
+def _is_change(pending: Mapping[str, object], reviewed: Mapping[str, object]) -> bool:
+    """Whether *pending* (a ``registry_pending`` row) is the request *reviewed* describes:
+    the same alias, action, target and requester, and, as listed, the same request."""
+    return all(pending[field] == reviewed.get(field) for field in _CHANGE_FIELDS) and all(
+        pending[field] == reviewed[field]
+        for field in ("requested_at", "tenant")
+        if field in reviewed
+    )
+
+
+def _replaced(name: str, alias: str, pending: Mapping[str, object]) -> str:
+    target = (
+        f"{pending['artifact_id']}@v={pending['version']}"
+        if pending["action"] == "set"
+        else "a delete"
+    )
+    by = pending["requested_by"] if pending["requested_by"] is not None else "a request"
+    return (
+        f"The pending change for alias '{name}@{alias}' is no longer the one reviewed: "
+        f"{by} now asks for {target}"
+    )
 
 
 class PendingChange(AliasChange):
@@ -926,6 +959,91 @@ def _add_import_staging(conn: StoreConnection, dialect: SqlDialect) -> None:
     )
 
 
+_STAGING_KEY = "tenant, content_sha256, blob_token"
+_ONE_STAGING = "WHERE tenant = ? AND content_sha256 = ? AND blob_token = ?"
+_IMPORT_STAGING_DDL = f"""
+CREATE TABLE IF NOT EXISTS import_staging (
+    tenant TEXT NOT NULL DEFAULT '',
+    content_sha256 TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    staged_at REAL NOT NULL,
+    blob_token TEXT NOT NULL DEFAULT '',  -- its blob key; '' = the digest's (migration 21)
+    state TEXT NOT NULL DEFAULT 'ready',  -- uploading, ready (an import reads it), ending
+    PRIMARY KEY ({_STAGING_KEY})
+)"""
+
+
+def _add_staging_tokens(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Each staging's row keyed by its token too, so an upload's row is written before
+    its bytes beside the staging it may join; a row from before has the digest's shared
+    key (``''``) and is ready.
+
+    Postgres adds the columns and swaps the constraint; SQLite cannot change a primary
+    key, so it copies the table.
+    """
+    if dialect.name != "sqlite":
+        for column, declaration in (
+            ("blob_token", "TEXT NOT NULL DEFAULT ''"),
+            ("state", "TEXT NOT NULL DEFAULT 'ready'"),
+        ):
+            if not dialect.column_exists(conn, "import_staging", column):
+                conn.execute(f"ALTER TABLE import_staging ADD COLUMN {column} {declaration}")
+        conn.execute("ALTER TABLE import_staging DROP CONSTRAINT IF EXISTS import_staging_pkey")
+        conn.execute(f"ALTER TABLE import_staging ADD PRIMARY KEY ({_STAGING_KEY})")
+        return
+    conn.execute(_IMPORT_STAGING_DDL.replace("import_staging", "import_staging_keyed", 1))
+    columns = "tenant, content_sha256, byte_size, staged_at"
+    conn.execute(
+        f"INSERT INTO import_staging_keyed ({columns}) SELECT {columns} FROM import_staging"
+    )
+    conn.execute("DROP TABLE import_staging")
+    conn.execute("ALTER TABLE import_staging_keyed RENAME TO import_staging")
+
+
+_HIGH_WATER_DDL = """
+CREATE TABLE IF NOT EXISTS artifact_high_water (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL
+)"""
+
+
+# Where a version once named outlives its delete: a set, move or delete of a reference
+# or a tag (its audit rows, a pending change), a publication, and a requirer's edge.
+_NAMED_VERSIONS = (
+    "SELECT artifact_id AS id, to_version AS version FROM registry_audit "
+    "WHERE artifact_id IS NOT NULL AND to_version IS NOT NULL",
+    "SELECT from_artifact_id AS id, from_version AS version FROM registry_audit "
+    "WHERE from_artifact_id IS NOT NULL AND from_version IS NOT NULL",
+    "SELECT artifact_id AS id, from_version AS version FROM registry_audit "
+    "WHERE from_artifact_id IS NULL AND artifact_id IS NOT NULL AND from_version IS NOT NULL",
+    "SELECT artifact_id AS id, version FROM registry_pending "
+    "WHERE artifact_id IS NOT NULL AND version IS NOT NULL",
+    "SELECT artifact_id AS id, version FROM artifact_publications",
+    # An edge may name a version never made, so only one of the tenant still holding the
+    # id counts, and only a number a store could reach.
+    "SELECT e.to_artifact_id AS id, e.to_version AS version FROM retention_edges e "
+    "WHERE e.to_version < 2147483647 AND EXISTS (SELECT 1 FROM artifact_versions v "
+    "WHERE v.id = e.to_artifact_id AND v.tenant = e.tenant)",
+)
+_NAMED_VERSION_TABLES = ("registry_audit", "registry_pending", "artifact_publications")
+
+
+def _add_high_water(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Each id's highest deleted version, below which no new version is numbered; for a
+    delete from before it, the highest version the store still names above the id's
+    rows."""
+    conn.execute(dialect.adapt_ddl(_HIGH_WATER_DDL))
+    # Tables made by the constants on SQLite, which a store this old may lack.
+    if not all(dialect.schema_exists(conn, table) for table in _NAMED_VERSION_TABLES):
+        return
+    conn.execute(
+        "INSERT INTO artifact_high_water (id, version) "
+        f"SELECT n.id, MAX(n.version) FROM ({' UNION ALL '.join(_NAMED_VERSIONS)}) n "
+        "GROUP BY n.id HAVING MAX(n.version) > COALESCE("
+        "(SELECT MAX(v.version) FROM artifact_versions v WHERE v.id = n.id), 0)"
+    )
+
+
 # How stale ``last_used_at`` may get before a use writes it again: recording
 # every read would turn reads into writes, and a hot artifact costs one UPDATE
 # per interval this way. A sweep adds it to its recent-use floor, because the
@@ -938,6 +1056,12 @@ _USE_RESOLUTION_SECONDS = 300.0
 _GC_DELETE_BATCH = 1000
 _GC_BATCH_SECONDS = 0.25
 _GC_BATCH_PAUSE_SECONDS = 0.1
+
+# A required edge that holds the version ``av`` against cleanup_failed. Any edge, as the
+# sweep's holds over-protect: a failed requirer may yet be filled by an import, and one
+# of another tenant would point at a number the id's tenant may hand out again.
+_REQUIREMENT_SQL = """SELECT 1 FROM retention_edges e
+    WHERE e.to_artifact_id = av.id AND e.to_version = av.version"""
 
 # How long a temp file goes untouched before a sweep takes it for a dead write's.
 _ABANDONED_WRITE_SECONDS = 3600.0
@@ -1245,6 +1369,8 @@ _MIGRATIONS: list[_Migration] = [
     _Migration(18, "idx_versions_superseded_by", _index_pointers),
     _Migration(19, "idx_names_version, idx_aliases_version, idx_pending_version", _index_holds),
     _Migration(20, "idx_build_open replaces idx_build_computation", _index_open_builds),
+    _Migration(21, "import_staging keyed by blob_token; state", _add_staging_tokens),
+    _Migration(22, "artifact_high_water", _add_high_water),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1347,6 +1473,9 @@ _SCHEMA_SQL += "\n" + ";\n".join(GRAPH_DDL) + ";\n"
 # Releases (ADR 002 §7.2): a build's publication events, the references that follow
 # them and the slots they win.
 _SCHEMA_SQL += "\n" + ";\n".join(RELEASE_DDL) + ";\n"
+# The highest version each id ever had deleted, so a number is never handed out twice:
+# a requirer's edge, a descendant's lineage, a review and a blob key all name id@v=N.
+_SCHEMA_SQL += _HIGH_WATER_DDL + ";\n"
 
 # Registry tables (aliases / tags / audit). Run unconditionally at init; CREATE IF NOT EXISTS makes
 # it idempotent for fresh and existing databases.
@@ -1484,15 +1613,10 @@ CREATE TABLE IF NOT EXISTS store_upgrades (
 -- /v1/artifacts/import/blobs/{sha256}). Per tenant: a digest is no proof of
 -- holding the bytes, since a publication's page prints it, so one tenant's
 -- upload must never satisfy another's import. The BlobStore interface lists
--- no keys, so this is also how an upload that is never imported is found again.
-CREATE TABLE IF NOT EXISTS import_staging (
-    tenant TEXT NOT NULL DEFAULT '',
-    content_sha256 TEXT NOT NULL,
-    byte_size INTEGER NOT NULL,
-    staged_at REAL NOT NULL,
-    PRIMARY KEY (tenant, content_sha256)
-);
+-- no keys, so this is also how an upload that is never imported is found again,
+-- its row written before its bytes.
 """
+_PUBLICATION_SCHEMA_SQL += _IMPORT_STAGING_DDL + ";\n"
 
 # Bound on the retry of finalize_canonical_together and finalize_and_set_name. A
 # conflict means a competing writer committed a ready row with our provenance; one
@@ -1825,7 +1949,8 @@ class ArtifactStore:
     ) -> int:
         """Create a new artifact version in "building" state and return its number.
 
-        Versions are numbered ``MAX(version) + 1`` per id. ``input_versions`` maps input
+        Versions are numbered per id past every version it has had, deleted ones too,
+        so a number is never handed out twice. ``input_versions`` maps input
         URI to version for staleness checks. ``minted`` means the caller made the id up
         (``uuid4``) for this computation, so retention may collect its latest version;
         later versions of a minted id stay minted. ``requires`` names the versions this
@@ -1840,13 +1965,16 @@ class ArtifactStore:
         Raises:
             ArtifactIdTaken: If a version of ``artifact_id`` belongs to another tenant.
             ValueError: If ``artifact_id`` is empty, holds ``@v=``, ``/`` or ``\\``, is
-                ``..``, or ends as an attempt's blob id does (:func:`reject_unsafe_artifact_id`).
+                ``..``, or ends as an attempt's blob id does (:func:`reject_unsafe_artifact_id`);
+                or ``release_id`` names no release, or one already settled.
         """
         reject_unsafe_artifact_id(artifact_id)
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
             version, was_minted = self._next_version(conn, artifact_id, tenant)
+            if release_id is not None:
+                self._stage_under(conn, release_id, final=False)
 
             input_versions_json = json.dumps(input_versions) if input_versions else None
             definition_id = (
@@ -1884,6 +2012,42 @@ class ArtifactStore:
         finally:
             conn.close()
 
+    def _stage_under(self, conn: StoreConnection, release_id: str, *, final: bool) -> None:
+        """Hold *release_id*'s build key shared and refuse a settled release, on the
+        transaction that writes a row staged under it.
+
+        An acceptance holds the key exclusively from its read of the release's rows to
+        its commit, so the row lands before that read, where it counts, or after the
+        commit, where the release reads as settled here. Stagers do not queue on each
+        other. Taken after the id's key: a build id that is also an artifact id is then
+        held already, and the shared lock is no upgrade to wait for. On SQLite the write
+        lock already serializes them all.
+
+        Raises:
+            ValueError: *release_id* names no release, one accepted, rejected or
+                abandoned, or with *final* one that is not a ``final``.
+        """
+        row = conn.execute(
+            "SELECT build_id FROM build_releases WHERE release_id = ?", (release_id,)
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            if final:
+                raise ValueError(f"release {release_id} is not an unsettled final release")
+            raise ValueError(f"release {release_id} does not exist")
+        self._dialect.share_write(conn, row["build_id"])
+        row = one(
+            conn.execute(
+                "SELECT kind, state FROM build_releases WHERE release_id = ?", (release_id,)
+            )
+        )
+        if row["state"] in ("preparing", "prepared") and (not final or row["kind"] == "final"):
+            return
+        conn.rollback()
+        if final:
+            raise ValueError(f"release {release_id} is not an unsettled final release")
+        raise ValueError(f"release {release_id} is {row['state']}")
+
     def _next_version(
         self, conn: StoreConnection, artifact_id: str, tenant: str | None
     ) -> tuple[int, int]:
@@ -1908,8 +2072,14 @@ class ArtifactStore:
                 (artifact_id,),
             )
         )
+        # A delete writes the high water with the row it takes, so this read and the one
+        # above see one or the other.
+        deleted = conn.execute(
+            "SELECT version FROM artifact_high_water WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        floor = int(deleted["version"]) + 1 if deleted is not None else 1
         # By name: a Postgres row unpacks to its column names, not values.
-        return int(row["next_version"]), row["was_minted"]
+        return max(int(row["next_version"]), floor), row["was_minted"]
 
     @staticmethod
     def _write_requirements(
@@ -2045,11 +2215,13 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
-            for (artifact_id, version), requires in requirements.items():
-                row = conn.execute(
-                    "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
-                    (artifact_id, version),
-                ).fetchone()
+            # Each requirer locked, in key order: a delete or a sweep that went first left
+            # no row, and one that comes after sees the edges. Unlocked, an edge from a
+            # requirer deleted meanwhile held its target for good.
+            for index, ((artifact_id, version), requires) in enumerate(
+                sorted(requirements.items())
+            ):
+                row = self._lock_target(conn, artifact_id, version, "tenant", locked=index > 0)
                 if row is None:
                     raise ValueError(f"Artifact {artifact_id}@v={version} not found")
                 self._write_requirements(conn, artifact_id, version, row["tenant"], requires)
@@ -2332,66 +2504,189 @@ class ArtifactStore:
     ) -> None:
         """Hold bytes, already checked against ``content_sha256``, for an import.
 
-        Restaging the same digest refreshes the hold. Each call also drops this
-        tenant's stagings older than ``IMPORT_STAGING_TTL_SECONDS``.
+        A digest has one ready staging per tenant, which the first import to release it
+        ends, whoever staged it. Restaging it refreshes the hold and keeps the bytes
+        held, which an import may be reading (the same digest is the same bytes), unless
+        they are gone; one that lands after a release or a drop took the staging stages
+        its own. Each call also drops this tenant's stagings older than
+        ``IMPORT_STAGING_TTL_SECONDS``, an upload that died with them.
+
+        Raises:
+            ImportStagingLost: the upload outlasted the TTL and a drop took its row.
         """
         now = time.time() if now is None else now
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        self.blob_store.publish_blob_from_path(blob_id, version, source_path)
-
         effective_tenant = tenant or ""
+        token = secrets.token_hex(8)
+        key = (effective_tenant, content_sha256, token)
+        # The row before the bytes, so bytes that outlive this call are found again.
         conn = self._get_connection()
         try:
             conn.execute(
-                """
-                INSERT INTO import_staging (tenant, content_sha256, byte_size, staged_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(tenant, content_sha256) DO UPDATE SET
-                    byte_size = excluded.byte_size, staged_at = excluded.staged_at
-                """,
-                (effective_tenant, content_sha256, byte_size, now),
+                "INSERT INTO import_staging "
+                "(tenant, content_sha256, blob_token, byte_size, staged_at, state) "
+                "VALUES (?, ?, ?, ?, ?, 'uploading')",
+                (*key, byte_size, now),
             )
-            stale = conn.execute(
-                "SELECT content_sha256 FROM import_staging WHERE tenant = ? AND staged_at < ?",
-                (effective_tenant, now - IMPORT_STAGING_TTL_SECONDS),
-            ).fetchall()
             conn.commit()
         finally:
             conn.close()
-        for row in stale:
-            self.release_staged_import(tenant, row["content_sha256"])
+        self.blob_store.publish_blob_from_path(
+            *staged_import_key(tenant, content_sha256, token), source_path
+        )
+        # Read before the lock, which on SQLite is the whole file's: a ready staging's
+        # bytes go only once it is ending, so bytes found gone stay gone.
+        held = self._ready_staging(effective_tenant, content_sha256)
+        held_lost = held is not None and not self.blob_store.blob_exists(
+            *staged_import_key(tenant, content_sha256, held)
+        )
+        conn = self._get_connection()
+        try:
+            self._dialect.begin_write(conn, f"import_staging:{effective_tenant}")
+            mine = conn.execute(f"SELECT state FROM import_staging {_ONE_STAGING}", key).fetchone()
+            lost = mine is None or mine["state"] != "uploading"
+            if lost:
+                # Named again, ending, so a delete of bytes that landed after the drop's
+                # is retried by a later drop if it fails.
+                conn.execute(
+                    "INSERT INTO import_staging "
+                    "(tenant, content_sha256, blob_token, byte_size, staged_at, state) "
+                    "VALUES (?, ?, ?, ?, ?, 'ending') "
+                    f"ON CONFLICT ({_STAGING_KEY}) DO UPDATE SET state = 'ending'",
+                    (*key, byte_size, now),
+                )
+            else:
+                ending = self._settle_upload(conn, key, byte_size, now, held if held_lost else None)
+            conn.commit()
+        finally:
+            conn.close()
+        if lost:
+            self._lose_staging(effective_tenant, content_sha256, token)
+        for digest, ending_token in ending:
+            try:
+                self._end_staging(effective_tenant, digest, ending_token)
+            except Exception as exc:
+                # Not this upload's to fail; the row stays, so a later staging retries it.
+                logger.warning(
+                    "could not drop a staging of %s for tenant %r: %s",
+                    digest,
+                    effective_tenant,
+                    exc,
+                )
+
+    @staticmethod
+    def _settle_upload(
+        conn: StoreConnection,
+        key: tuple[str, str, str],
+        byte_size: int,
+        now: float,
+        lost_token: str | None,
+    ) -> list[tuple[str, str]]:
+        """Under the tenant's staging lock, join the digest's ready staging or make this
+        upload it, and take the tenant's stale stagings out of reach. Returns the
+        stagings to end: this upload's when it joined, and the stale ones.
+
+        *lost_token* names a ready staging found without its bytes, which ends here.
+        """
+        tenant, content_sha256, token = key
+        if lost_token is not None:
+            conn.execute(
+                f"UPDATE import_staging SET state = 'ending' {_ONE_STAGING} AND state = 'ready'",
+                (tenant, content_sha256, lost_token),
+            )
+        joined = conn.execute(
+            "UPDATE import_staging SET byte_size = ?, staged_at = ? "
+            "WHERE tenant = ? AND content_sha256 = ? AND state = 'ready'",
+            (byte_size, now, tenant, content_sha256),
+        ).rowcount
+        new_state = "ending" if joined else "ready"
+        conn.execute(f"UPDATE import_staging SET state = ? {_ONE_STAGING}", (new_state, *key))
+        # Out of reach under the lock: a restage either refreshed one before this, and
+        # it is not stale, or finds none and stages its own; an upload still under way
+        # finds its row ending.
+        cutoff = now - IMPORT_STAGING_TTL_SECONDS
+        stale = conn.execute(
+            "SELECT content_sha256, blob_token FROM import_staging "
+            "WHERE tenant = ? AND (staged_at < ? OR state = 'ending')",
+            (tenant, cutoff),
+        ).fetchall()
+        conn.execute(
+            "UPDATE import_staging SET state = 'ending' WHERE tenant = ? AND staged_at < ?",
+            (tenant, cutoff),
+        )
+        return [(row["content_sha256"], row["blob_token"]) for row in stale]
+
+    def _lose_staging(self, tenant: str, content_sha256: str, token: str) -> NoReturn:
+        # Its bytes may have landed after the drop that took its row deleted them.
+        self._end_staging(tenant, content_sha256, token)
+        raise ImportStagingLost(f"the staging of {content_sha256} was dropped while it uploaded")
+
+    def _end_staging(self, tenant: str, content_sha256: str, token: str) -> None:
+        """Delete the bytes of a staging that is ending, then its row.
+
+        A delete that fails leaves the row ending, out of reach, for a later staging's
+        drop to retry.
+        """
+        self.blob_store.delete_blob(*staged_import_key(tenant, content_sha256, token))
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                f"DELETE FROM import_staging {_ONE_STAGING}", (tenant, content_sha256, token)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ready_staging(
+        self, tenant: str, content_sha256: str, conn: StoreConnection | None = None
+    ) -> str | None:
+        """The token of *tenant*'s staging of the digest an import reads, on *conn* when
+        given."""
+        own = conn is None
+        conn = self._get_connection() if conn is None else conn
+        try:
+            row = conn.execute(
+                "SELECT blob_token FROM import_staging "
+                "WHERE tenant = ? AND content_sha256 = ? AND state = 'ready'",
+                (tenant, content_sha256),
+            ).fetchone()
+        finally:
+            if own:
+                conn.close()
+        return None if row is None else row["blob_token"]
 
     def open_staged_import(self, tenant: str | None, content_sha256: str):
         """A reader for bytes *tenant* staged under *content_sha256*, or ``None``.
 
-        Only the tenant that uploaded them can import them.
+        Only the tenant that uploaded them can import them. Nothing holds them while
+        they are read: a release or a drop of the staging meanwhile ends the read.
         """
-        conn = self._get_connection()
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM import_staging WHERE tenant = ? AND content_sha256 = ?",
-                (tenant or "", content_sha256),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
+        token = self._ready_staging(tenant or "", content_sha256)
+        if token is None:
             return None
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        return self.blob_store.open_blob_reader(blob_id, version)
+        return self.blob_store.open_blob_reader(*staged_import_key(tenant, content_sha256, token))
 
     def release_staged_import(self, tenant: str | None, content_sha256: str) -> None:
-        """Drop staged bytes, once an import has used them or never will."""
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        self.blob_store.delete_blob(blob_id, version)
+        """End the digest's ready staging, once an import has used it or never will.
+
+        Whichever is ready when it runs, which is the one the import read unless a
+        release and a restage came between. Out of reach first, so a restage after it
+        stages its own; its bytes, then its row.
+        """
+        effective_tenant = tenant or ""
         conn = self._get_connection()
         try:
-            conn.execute(
-                "DELETE FROM import_staging WHERE tenant = ? AND content_sha256 = ?",
-                (tenant or "", content_sha256),
-            )
+            self._dialect.begin_write(conn, f"import_staging:{effective_tenant}")
+            token = self._ready_staging(effective_tenant, content_sha256, conn)
+            if token is not None:
+                conn.execute(
+                    f"UPDATE import_staging SET state = 'ending' {_ONE_STAGING}",
+                    (effective_tenant, content_sha256, token),
+                )
             conn.commit()
         finally:
             conn.close()
+        if token is not None:
+            self._end_staging(effective_tenant, content_sha256, token)
 
     def import_artifact(
         self,
@@ -2707,7 +3002,9 @@ class ArtifactStore:
         writing nothing, when the source version or its blob is gone or the source is not
         a result. A copy whose bytes fail to write raises and leaves its row ``building``
         under the release, which then cannot be accepted: a partial revert is abandoned,
-        never made current.
+        never made current. A sweep spares the source until its bytes are copied; an
+        explicit :meth:`delete_artifact` does not wait, as it does not ask what requires a
+        version, and on a backend reading in ranges the copy then fails.
 
         Raises:
             ArtifactIdTaken: If ``artifact_id`` belongs to another tenant than *tenant*,
@@ -2755,6 +3052,19 @@ class ArtifactStore:
             try:
                 self._hold_off_sweeps(conn)
                 new_version, was_minted = self._next_version(conn, artifact_id, tenant)
+                if release_id is not None:
+                    self._stage_under(conn, release_id, final=True)
+                # The source again, locked as a pointer's target is: a sweep or a delete
+                # that took it since the look above leaves no row, and one that comes
+                # after waits for the copy's row and the edges below.
+                lock = "" if self._dialect.name == "sqlite" else " FOR SHARE"
+                held = conn.execute(
+                    f"SELECT state FROM artifact_versions WHERE id = ? AND version = ?{lock}",
+                    (artifact_id, version),
+                ).fetchone()
+                if held is None or held["state"] not in _RESULT_STATES:
+                    conn.rollback()
+                    return None
                 conn.execute(
                     """
                     INSERT INTO artifact_versions
@@ -2793,6 +3103,25 @@ class ArtifactStore:
                     "FROM retention_edges WHERE from_artifact_id = ? AND from_version = ?",
                     (new_version, artifact_id, version),
                 )
+                # And the source itself, until its bytes are copied: they stream after this
+                # commits, and a sweep would otherwise take the source mid-copy, where an
+                # object store reading in ranges (GCS, Azure) fails the rest of the copy.
+                # The building copy is a root, so the edge holds the source. Dropped after
+                # only if inserted here: the source's own edges, copied above, stay.
+                holds_source = conn.execute(
+                    "INSERT INTO retention_edges "
+                    "(tenant, from_artifact_id, from_version, to_artifact_id, to_version) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT (from_artifact_id, from_version, to_artifact_id, to_version) "
+                    "DO NOTHING",
+                    (
+                        source.tenant if source.tenant is not None else "",
+                        artifact_id,
+                        new_version,
+                        artifact_id,
+                        version,
+                    ),
+                ).rowcount
                 conn.commit()
             finally:
                 conn.close()
@@ -2803,14 +3132,31 @@ class ArtifactStore:
             from vestigo.blob_store import BLOB_STREAM_CHUNK_BYTES
 
             copied = 0
-            with self.blob_store.open_blob_writer(artifact_id, new_version) as writer:
-                # Hashed in passing: the bytes go by anyway, and reading them again for the
-                # digest would be wasteful.
-                hasher = hashlib.sha256()
-                while chunk := reader.read(BLOB_STREAM_CHUNK_BYTES):
-                    writer.write(chunk)
-                    hasher.update(chunk)
-                    copied += len(chunk)
+            try:
+                with self.blob_store.open_blob_writer(artifact_id, new_version) as writer:
+                    # Hashed in passing: the bytes go by anyway, and reading them again for
+                    # the digest would be wasteful.
+                    hasher = hashlib.sha256()
+                    while chunk := reader.read(BLOB_STREAM_CHUNK_BYTES):
+                        writer.write(chunk)
+                        hasher.update(chunk)
+                        copied += len(chunk)
+            except BaseException:
+                # Copied or not, the copy needs its source no longer; the copy's own
+                # error is the one to raise. A crash before this leaves the edge on a
+                # building row, which goes with that row.
+                if holds_source:
+                    try:
+                        self._release_copy_source(artifact_id, new_version, version)
+                    except self._dialect.operational_error:
+                        logger.exception(
+                            "stage_promotion: %s@v=%d still holds its source",
+                            artifact_id,
+                            new_version,
+                        )
+                raise
+            if holds_source:
+                self._release_copy_source(artifact_id, new_version, version)
 
         return StagedVersion(
             artifact_id=artifact_id,
@@ -2820,6 +3166,22 @@ class ArtifactStore:
             byte_size=copied,
             content_sha256=hasher.hexdigest(),
         )
+
+    def _release_copy_source(self, artifact_id: str, copy_version: int, version: int) -> None:
+        """Drop the edge :meth:`stage_promotion` holds its source by during the copy."""
+        conn = self._get_connection()
+        try:
+            # The edge is a row a sweep's claim may delete with a demoted copy.
+            self._hold_off_sweeps(conn)
+            conn.execute(
+                "DELETE FROM retention_edges "
+                "WHERE from_artifact_id = ? AND from_version = ? "
+                "AND to_artifact_id = ? AND to_version = ?",
+                (artifact_id, copy_version, artifact_id, version),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _reclaim_blob(
         self, canonical_blob: tuple[str, int], ref: str, artifact_id: str, version: int
@@ -3025,6 +3387,10 @@ class ArtifactStore:
                     if not self._can_assign_name_for_tenant(artifact_tenant, tenant):
                         raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
                     self._hold_off_sweeps(conn)
+                    # As every other name write locks its target: a delete waits, and on
+                    # SQLite the name's previous target is read under the write lock.
+                    if self._lock_target(conn, *canonical) is None:
+                        raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
                     self._set_name_in_connection(conn, name, *canonical, tenant)
                 _commit_through_fence(conn, *canonical)
                 return self.get_artifact(*canonical)
@@ -3238,7 +3604,9 @@ class ArtifactStore:
         # '' not NULL for personal mode: SQLite NULL != NULL in unique constraints.
         effective_tenant = tenant if tenant is not None else ""
 
-        # Audit: record what the name pointed at before this move.
+        # Audit: record what the name pointed at before this move, read under the audit
+        # lock so no other move commits in between.
+        self._serialize_audit(conn)
         cursor = conn.execute(
             "SELECT artifact_id, version FROM artifact_names WHERE name = ? AND tenant = ?",
             (name, effective_tenant),
@@ -3728,17 +4096,25 @@ class ArtifactStore:
             )
 
     def _lock_target(
-        self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
+        self,
+        conn: StoreConnection,
+        artifact_id: str,
+        version: int,
+        columns: str = "state, tenant",
+        *,
+        locked: bool = False,
     ):
         """The version row a pointer or a hold is about to name, kept until commit.
 
         A delete or a sweep's claim then waits for the caller, or went first and the
         row reads as missing. Postgres takes the row ``FOR SHARE``, which conflicts
-        with both; SQLite takes the write lock before the read. The lock comes before
-        the audit lock, as the delete takes them.
+        with both; SQLite takes the write lock before the read, unless *locked* says an
+        earlier call on this transaction took it. The lock comes before the audit lock,
+        as the delete takes them.
         """
         if self._dialect.name == "sqlite":
-            self._dialect.begin_write(conn, artifact_id)
+            if not locked:
+                self._dialect.begin_write(conn, artifact_id)
             suffix = ""
         else:
             suffix = " FOR SHARE"
@@ -3907,12 +4283,14 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             effective_tenant = tenant if tenant is not None else ""
+            # The audit's key (SQLite's write lock) before the read, so the deletion is
+            # audited from what it deleted.
+            self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT version FROM artifact_names WHERE name = ? AND tenant = ?",
+                "SELECT artifact_id, version FROM artifact_names WHERE name = ? AND tenant = ?",
                 (name, effective_tenant),
             )
             previous = cursor.fetchone()
-            self._serialize_audit(conn)
             cursor = conn.execute(
                 "DELETE FROM artifact_names WHERE name = ? AND tenant = ?",
                 (name, effective_tenant),
@@ -3922,6 +4300,7 @@ class ArtifactStore:
                     conn,
                     action="name_delete",
                     name=name,
+                    from_artifact_id=previous["artifact_id"] if previous else None,
                     from_version=previous["version"] if previous else None,
                     tenant=tenant,
                 )
@@ -4316,6 +4695,9 @@ class ArtifactStore:
             # Aliases have no foreign key: without the lock a delete in between leaves one
             # pointing at nothing.
             self._lock_readable_target(conn, artifact_id, version, tenant)
+            # Before the read: a move committed after it would be audited from the wrong
+            # target.
+            self._serialize_audit(conn)
 
             effective_tenant = tenant if tenant is not None else ""
             cursor = conn.execute(
@@ -4454,12 +4836,14 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             effective_tenant = tenant if tenant is not None else ""
+            # As in delete_name.
+            self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT version FROM artifact_aliases WHERE name = ? AND alias = ? AND tenant = ?",
+                "SELECT artifact_id, version FROM artifact_aliases "
+                "WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             previous = cursor.fetchone()
-            self._serialize_audit(conn)
             cursor = conn.execute(
                 "DELETE FROM artifact_aliases WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
@@ -4470,6 +4854,7 @@ class ArtifactStore:
                     action="alias_delete",
                     name=name,
                     alias=alias,
+                    from_artifact_id=previous["artifact_id"] if previous else None,
                     from_version=previous["version"] if previous else None,
                     actor=actor,
                     tenant=tenant,
@@ -4714,6 +5099,9 @@ class ArtifactStore:
 
             effective_tenant = tenant if tenant is not None else ""
             if action == "set":
+                # The audit lock before the read, as set_alias takes it: a move committed
+                # after the read would be audited before the request it decided.
+                self._serialize_audit(conn)
                 cursor = conn.execute(
                     "SELECT artifact_id, version FROM artifact_aliases "
                     "WHERE name = ? AND alias = ? AND tenant = ?",
@@ -4778,15 +5166,19 @@ class ArtifactStore:
         tenant: str | None = None,
         actor: str | None = None,
         require_distinct_approver: bool = False,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Apply a pending alias change (audited with the approver as actor) and return it.
 
         ``require_distinct_approver`` forbids the requester approving their own change.
+        ``reviewed`` is the change the approver read (from :meth:`list_pending_changes`):
+        a request that replaced it since is not applied in its stead.
 
         Raises:
-            ValueError: If no change is pending for ``name @ alias``, the target is no
-                longer available, or the approver is the requester under
-                ``require_distinct_approver``.
+            ValueError: If no change is pending for ``name @ alias``, it is not
+                ``reviewed``, the target is no longer available, or the approver is the
+                requester under ``require_distinct_approver``.
         """
         conn = self._get_connection()
         try:
@@ -4796,14 +5188,18 @@ class ArtifactStore:
             # consumed while the stale change read here is applied.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
-            entry = cast(AliasChange, dict(pending))
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
+            entry = cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
 
             if require_distinct_approver and actor is not None and entry["requested_by"] == actor:
                 conn.rollback()
@@ -4894,11 +5290,17 @@ class ArtifactStore:
         alias: str,
         tenant: str | None = None,
         actor: str | None = None,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Discard a pending alias change (audited).
 
+        ``reviewed`` is the change the rejecter read: a request that replaced it since
+        is not discarded unseen.
+
         Raises:
-            ValueError: If no change is pending for ``name @ alias``.
+            ValueError: If no change is pending for ``name @ alias``, or it is not
+                ``reviewed``.
         """
         conn = self._get_connection()
         try:
@@ -4906,13 +5308,17 @@ class ArtifactStore:
             # Lock before reading, so an approve cannot apply the change rejected here.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
             conn.execute(
                 "DELETE FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
@@ -4928,7 +5334,7 @@ class ArtifactStore:
                 tenant=tenant,
             )
             conn.commit()
-            return cast(AliasChange, dict(pending))
+            return cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
         finally:
             conn.close()
 
@@ -5244,9 +5650,11 @@ class ArtifactStore:
     def delete_artifact(self, artifact_id: str, version: int, tenant: str | None = None) -> bool:
         """Delete an artifact version, its blob, and every name, alias and tag pointing at it.
 
-        With ``tenant`` the artifact must belong to that tenant or be tenantless.
-        Returns False if it does not exist or belongs to another tenant. A version
-        that reads these bytes through ``superseded_by`` gets a copy of its own first.
+        Each name and alias it removes is audited (``name_delete``, ``alias_delete``)
+        from this version, whose id the rows also carry. With ``tenant`` the
+        artifact must belong to that tenant or be tenantless. Returns False if it does
+        not exist or belongs to another tenant. A version that reads these bytes
+        through ``superseded_by`` gets a copy of its own first.
 
         An explicit delete beats lineage and requirements: unlike a sweep, it does not
         ask whether a named, published or held version descends from this one or
@@ -5255,8 +5663,10 @@ class ArtifactStore:
         must not break its descendants checks :meth:`find_dependents` first.
 
         Raises:
-            ValueError: If the version is published or held by a retention root; a
-                hold is a promise to restore it, so it is released first, deliberately.
+            ValueError: If the version is published, held by a retention root, or the
+                target of a pending alias change; a hold is a promise to restore it, and
+                a pending change one to review it, so each is released first,
+                deliberately.
         """
         ref = f"{artifact_id}@v={version}"
         conn = self._get_connection()
@@ -5301,10 +5711,8 @@ class ArtifactStore:
             if not locked:
                 conn.rollback()
                 return False
-            # A published version is cited by a link somebody else holds, and
-            # version numbers are reused (``MAX(version) + 1``), so deleting
-            # one and rebuilding the cell would leave that link serving
-            # different bytes under the same title and authors. Withdraw the
+            # A published version is cited by a link somebody else holds, and the
+            # link would answer for nothing once the version goes. Withdraw the
             # publication first, deliberately, and then it can go.
             published = conn.execute(
                 "SELECT token FROM artifact_publications "
@@ -5325,6 +5733,19 @@ class ArtifactStore:
                 raise ValueError(
                     f"{artifact_id}@v={version} is held ({root['kind']} {root['holder']}); "
                     "release the hold before deleting it"
+                )
+            # Else an approval moves the alias to what the reviewer never saw: a version
+            # built later under this number, or none.
+            pending = conn.execute(
+                "SELECT name, alias FROM registry_pending "
+                "WHERE artifact_id = ? AND version = ? AND action = 'set' "
+                "ORDER BY name, alias LIMIT 1",
+                (artifact_id, version),
+            ).fetchone()
+            if pending is not None:
+                raise ValueError(
+                    f"{artifact_id}@v={version} is the target of a pending change to "
+                    f"{pending['name']}@{pending['alias']}; reject it before deleting it"
                 )
             held_pointers = conn.execute(
                 "SELECT id, version FROM artifact_versions WHERE superseded_by = ?", (ref,)
@@ -5350,13 +5771,29 @@ class ArtifactStore:
             # Past this point the delete is committed to; the blob cleanup
             # below the finally runs only for rows that actually existed.
 
+            # Name and alias deletions are audited, from this version, so a pointer
+            # vanishing with its target stays reconstructible. Read
+            # under the audit lock and this row's lock: no name or alias can move onto
+            # the version meanwhile.
+            cursor = conn.execute(
+                "SELECT name, tenant FROM artifact_names WHERE artifact_id = ? AND version = ?",
+                (artifact_id, version),
+            )
+            for row in cursor.fetchall():
+                self._audit_in_connection(
+                    conn,
+                    action="name_delete",
+                    name=row["name"],
+                    artifact_id=artifact_id,
+                    from_artifact_id=artifact_id,
+                    from_version=version,
+                    tenant=row["tenant"] if row["tenant"] else None,
+                )
             conn.execute(
                 "DELETE FROM artifact_names WHERE artifact_id = ? AND version = ?",
                 (artifact_id, version),
             )
 
-            # Alias deletions are audited, so an alias vanishing with its target stays
-            # reconstructible.
             cursor = conn.execute(
                 "SELECT name, alias, tenant FROM artifact_aliases "
                 "WHERE artifact_id = ? AND version = ?",
@@ -5368,7 +5805,9 @@ class ArtifactStore:
                     action="alias_delete",
                     name=row["name"],
                     alias=row["alias"],
+                    # As before, so read_audit(artifact_id=...) finds the removal.
                     artifact_id=artifact_id,
+                    from_artifact_id=artifact_id,
                     from_version=version,
                     tenant=row["tenant"] if row["tenant"] else None,
                 )
@@ -5392,6 +5831,7 @@ class ArtifactStore:
                 "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                 (artifact_id, version),
             )
+            self._raise_high_water(conn, [(artifact_id, version)])
             conn.commit()
         finally:
             conn.close()
@@ -5401,6 +5841,22 @@ class ArtifactStore:
         # Holding a pooled one across it parks a slot for the round trip.
         self.blob_store.delete_blob(blob_id, version)
         return True
+
+    @staticmethod
+    def _raise_high_water(conn: StoreConnection, keys: Collection[tuple[str, int]]) -> None:
+        """Record *keys*' versions as deleted, on the transaction that deletes them, so
+        ``_next_version`` never hands their numbers out again."""
+        tops: dict[str, int] = {}
+        for artifact_id, version in keys:
+            tops[artifact_id] = max(version, tops.get(artifact_id, version))
+        for artifact_id, version in sorted(tops.items()):
+            conn.execute(
+                "INSERT INTO artifact_high_water (id, version) VALUES (?, ?) "
+                "ON CONFLICT (id) DO UPDATE SET version = CASE "
+                "WHEN excluded.version > artifact_high_water.version THEN excluded.version "
+                "ELSE artifact_high_water.version END",
+                (artifact_id, version),
+            )
 
     def _delete_versions_children(
         self, conn: StoreConnection, keys: Collection[tuple[str, int]]
@@ -5724,8 +6180,8 @@ class ArtifactStore:
         together or not at all. With none of the four set nothing is collected. A version of an
         id ``exempt`` accepts goes only as ``collectable``, and a version in ``spare``
         never goes (nor its inputs, if it is a current value). An id never loses its
-        highest version while keeping a lower one, so a version number is never
-        reused. A folder file goes only with every manifest of its tenant naming it,
+        highest version while keeping a lower one, and a number it frees is never
+        handed out again. A folder file goes only with every manifest of its tenant naming it,
         and the cap evicts a folder whole, at its newest member's use.
 
         ``tenant`` limits the sweep, and the ``max_bytes`` measure, to that tenant;
@@ -5950,6 +6406,10 @@ class ArtifactStore:
             # losing a blob whose row is gone only wastes bytes.
             collected: list[tuple[str, int]] = []
             pending: list[tuple[str, int]] = []
+            # The batch's deleted versions, whose high water it writes last, just before
+            # its commit: a group's claim then never waits for a row lock while the batch
+            # holds an id's high water, which a delete writes after its rows.
+            taken: list[tuple[str, int]] = []
             # Pointers before their canonicals, so a canonical goes only once nothing reads it;
             # folder files after their manifests, so a file goes only once its folders did;
             # an id's lower versions before its top, which goes only once they did. A failed
@@ -5993,6 +6453,8 @@ class ArtifactStore:
                     or time.monotonic() - batch_began >= _GC_BATCH_SECONDS
                 ):
                     if in_batch:
+                        self._raise_high_water(conn, taken)
+                        taken.clear()
                         conn.commit()
                         collected.extend(pending)
                         pending.clear()
@@ -6020,9 +6482,11 @@ class ArtifactStore:
                     attempt = row["blob_attempt"]
                     blob_id = attempt_blob_id(row["id"], attempt) if attempt else row["id"]
                     pending.append((blob_id, row["version"]))
+                    taken.append((row["id"], row["version"]))
                     deleted_count += 1
                     deleted_bytes += row["byte_size"] or 0
 
+            self._raise_high_water(conn, taken)
             conn.commit()
             # Only rows whose delete committed lose their bytes.
             collected.extend(pending)
@@ -6063,8 +6527,9 @@ class ArtifactStore:
 
         A batch takes the sweep's key exclusively and reads the holds again under it, so
         no hold lands while it claims, which on Postgres a claim could otherwise act on
-        unseen (SQLite's write lock already serializes them). Before any other lock, or a
-        writer holding a row waits on a batch that waits on the row.
+        unseen (SQLite's write lock already serializes them). A cleanup_failed batch
+        takes it exclusively too. Before any other lock, or a writer holding a row waits
+        on a batch that waits on the row.
         """
         self._dialect.share_write(conn, _SWEEP_KEY)
 
@@ -6302,7 +6767,8 @@ class ArtifactStore:
     ) -> dict[tuple[str, int], StoreRow]:
         """``chosen``, less any id's highest version whose lower versions stay.
 
-        Otherwise the next ``create_artifact`` for that id would reuse the number.
+        No longer what keeps a number from being handed out again (``artifact_high_water``
+        does, for every delete); a sweep still takes an id from the top down.
         """
         by_id: dict[str, int] = {}
         for artifact_id, _ in chosen:
@@ -6370,6 +6836,8 @@ class ArtifactStore:
 
         A row a build with a live lease may still write is spared: the build's target,
         its releases' outputs, and every row of its computation (``computation_key``).
+        Live by the database's clock, as ``BuildStore.now`` reads it by default; the age
+        is by this host's.
         Any other old enough ``building`` row is demoted, which is safe only where no
         writer without a lease holds one that long: a server before its build runner
         accepts work, or a notebook's own store.
@@ -6391,7 +6859,9 @@ class ArtifactStore:
                              OR b.build_id IN (SELECT r.build_id FROM build_releases r
                                                WHERE r.release_id = artifact_versions.release_id)))
                 """
-                params.append(now)
+                # By the database's clock, as every lease decision is: a sweeping host
+                # whose clock runs ahead would otherwise demote a live build's rows.
+                params.append(self._dialect.server_time(conn))
             cursor = conn.execute(
                 f"""
                 UPDATE artifact_versions
@@ -6520,39 +6990,101 @@ class ArtifactStore:
     def cleanup_failed(self, max_age_seconds: float = 3600) -> int:
         """Delete failed artifacts older than ``max_age_seconds``; return the count.
 
-        As the sweep, it leaves an id's highest version while a lower one stays, so a
-        version number is never reused, and it spares a version a retention root holds
-        or a publication names: either is a promise someone else was given.
+        As the sweep, it leaves an id's highest version while a lower one stays, and it
+        spares a version a retention root holds, a publication names or a required edge
+        points at: each is a promise someone else was given. A number it frees is never
+        handed out again. Each batch commits on its own, so one that raises leaves the
+        earlier batches' deletes done.
         """
+        cutoff = time.time() - max_age_seconds
         conn = self._get_connection()
         try:
-            cutoff = time.time() - max_age_seconds
+            # The holds here only spare locking a row that stays; the batch looks again.
             cursor = conn.execute(
-                """
-                SELECT id, version, blob_attempt FROM artifact_versions av
+                f"""
+                SELECT id, version FROM artifact_versions av
                 WHERE state = 'failed' AND created_at < ?
                   AND NOT EXISTS (SELECT 1 FROM retention_roots r
                                   WHERE r.artifact_id = av.id AND r.version = av.version)
                   AND NOT EXISTS (SELECT 1 FROM artifact_publications p
                                   WHERE p.artifact_id = av.id AND p.version = av.version)
+                  AND NOT EXISTS ({_REQUIREMENT_SQL})
                 """,
                 (cutoff,),
             )
-            rows = list(
-                self._without_version_gaps(
-                    conn, {(row["id"], row["version"]): row for row in cursor.fetchall()}
-                ).values()
-            )
+            # Sorted here, not by the database's collation: every writer locking several
+            # version rows takes them in this one order.
+            candidates = sorted((row["id"], row["version"]) for row in cursor.fetchall())
+        finally:
+            conn.close()
+        removed = start = 0
+        # In batches, as the sweep's, capped in rows and in time: each holds the sweep's
+        # key exclusively, so every hold writer waits for a batch, not for all.
+        while start < len(candidates):
+            if start and self._dialect.name == "sqlite":
+                # As the sweep pauses: a waiting writer polls the lock rather than queueing.
+                time.sleep(_GC_BATCH_PAUSE_SECONDS)
+            batch = candidates[start : start + _GC_DELETE_BATCH]
+            went, looked_at = self._cleanup_failed_batch(batch, cutoff)
+            removed += went
+            start += looked_at
+        return removed
+
+    def _cleanup_failed_batch(self, batch: list[tuple[str, int]], cutoff: float) -> tuple[int, int]:
+        """Delete the failed versions of *batch* that may still go; return how many went
+        and how many of *batch* it looked at, at least one, before its time ran out.
+
+        Each row is locked, in key order, and looked at again: since the read an import
+        may have filled it, making it a ready version with bytes under another key, a
+        root, a publication or a requirement may hold it, or a delete and a new failure
+        may have put a younger row at its key. The gap rule then runs on what is left.
+        """
+        conn = self._get_connection()
+        looked_at = 0
+        try:
+            # The sweep's key exclusively, as a sweep batch takes it: a required edge's
+            # writer locks no row of its target, only this key shared, so its edge is
+            # committed before the look below or waits for the batch.
+            self._dialect.begin_write(conn, _SWEEP_KEY)
+            began = time.monotonic()
+            locked: dict[tuple[str, int], StoreRow] = {}
+            for key in batch:
+                if looked_at and time.monotonic() - began >= _GC_BATCH_SECONDS:
+                    break
+                looked_at += 1
+                if not conn.execute(
+                    "UPDATE artifact_versions SET last_used_at = last_used_at "
+                    "WHERE id = ? AND version = ? AND state = 'failed' AND created_at < ?",
+                    (*key, cutoff),
+                ).rowcount:
+                    continue
+                # Under the row lock, which a retain or a publish takes before writing.
+                row = conn.execute(
+                    f"""
+                    SELECT id, version, blob_attempt FROM artifact_versions av
+                    WHERE id = ? AND version = ?
+                      AND NOT EXISTS (SELECT 1 FROM retention_roots r
+                                      WHERE r.artifact_id = av.id AND r.version = av.version)
+                      AND NOT EXISTS (SELECT 1 FROM artifact_publications p
+                                      WHERE p.artifact_id = av.id AND p.version = av.version)
+                      AND NOT EXISTS ({_REQUIREMENT_SQL})
+                    """,
+                    key,
+                ).fetchone()
+                if row is not None:
+                    locked[key] = row
+            rows = list(self._without_version_gaps(conn, locked).values())
 
             # Metadata first, then blobs: a mid-sweep failure then orphans bytes rather than leaving
-            # rows pointing at deleted blobs, as garbage_collect does.
+            # rows pointing at deleted blobs, as garbage_collect does. A failed build's row
+            # still references its version.
+            self._delete_versions_children(conn, [(row["id"], row["version"]) for row in rows])
             for row in rows:
-                # A failed build's row still references the version.
-                self._delete_versions_children(conn, [(row["id"], row["version"])])
                 conn.execute(
                     "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                     (row["id"], row["version"]),
                 )
+            self._raise_high_water(conn, [(row["id"], row["version"]) for row in rows])
             conn.commit()
         finally:
             conn.close()
@@ -6571,7 +7103,7 @@ class ArtifactStore:
                     row["id"],
                     row["version"],
                 )
-        return len(rows)
+        return len(rows), looked_at
 
     def stats(
         self,

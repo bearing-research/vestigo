@@ -102,13 +102,15 @@ entry point, and the README's overview when a capability is added.
    and required edges are one closure. On Postgres a batch holds the sweep's
    key exclusively, and a writer that can create a hold (or lock rows a claim
    locks, as a delete does) calls `_hold_off_sweeps` before any other lock and
-   opens no nested connection while it holds it;
+   opens no nested connection while it holds it; a `cleanup_failed` batch takes
+   the key exclusively, as a sweep batch does;
    `TestASweepBatchHoldsOffHoldWriters` lists the writers.
 3. **A release is accepted only once every output's bytes are stored**, and
    only by the attempt whose lease is live; a lapsed lease fences its attempt.
 4. **The ledger never parses a node's payload**; traversals are bounded.
 5. **Immutable means immutable.** Versions are never rewritten; a promote
-   writes a new version; `cleanup_failed` never reuses a version number.
+   writes a new version; `create_artifact` never hands out a number twice, a
+   deleted one included (`artifact_high_water`); an import keeps its source's.
 6. **Only a missing object is "absent"** on a blob backend; access denied,
    expired credentials and connection errors propagate as the SDK's error.
 7. **The URI scheme is persisted** in `input_versions`, so a store keeps the

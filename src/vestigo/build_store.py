@@ -3,8 +3,9 @@
 States: ``pending`` -> ``building`` (under a runner's lease) -> ``ready`` or ``failed``.
 
 Every writer of a build's state, owner or attempt runs under the build's write key
-(``begin_write``), so none lands between a release's fence check and its commit;
-``renew_lease``, which only moves the deadline, does not.
+(``begin_write``), so none lands between a release's fence check and its commit.
+``renew_lease``, which only moves the deadline, takes it too, and reads the clock under
+it, so a lease every fence check under the key would call lapsed is never renewed.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypedDict
 
@@ -359,7 +360,7 @@ class BuildStore:
         self,
         db_path: Path,
         dialect: SqlDialect | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
     ):
         """Open the store and create its schema.
 
@@ -367,13 +368,35 @@ class BuildStore:
             db_path: SQLite database; ignored when ``dialect`` is given.
             dialect: Metadata backend; pass the artifact store's to share its database.
             clock: Wall-clock source in seconds, injectable so tests can expire a
-                lease without sleeping.
+                lease without sleeping; by default the database's (:meth:`now`).
         """
         self.db_path = db_path
         self._dialect: SqlDialect = dialect if dialect is not None else SqliteDialect(db_path)
         self._owns_dialect = dialect is None
         self._clock = clock
         self._init_schema()
+
+    def now(self, conn: StoreConnection | None = None) -> float:
+        """The time every lease and write-window decision reads, in seconds: the injected
+        clock, else the database's, so hosts whose clocks disagree still agree on when a
+        lease lapses. Read on *conn*, which a thread already holding a connection must
+        pass (Postgres lends it no second one), else on a connection of its own. Each
+        fence here reads it once it holds the build's key. Take an attempt's
+        ``writable_until`` from it: a deadline from another clock is off by the skew."""
+        if self._clock is not None:
+            return self._clock()
+        if conn is not None:
+            return self._dialect.server_time(conn)
+        own = self._get_connection()
+        try:
+            return self._dialect.server_time(own)
+        finally:
+            own.close()
+
+    def _host_now(self) -> float:
+        """The injected clock, else this host's: for a signed URL's expiry, which the
+        signing host's clock set and the object store enforces, not the database."""
+        return self._clock() if self._clock is not None else time.time()
 
     def close(self) -> None:
         """Close the connections kept open between calls, when the dialect is this
@@ -521,7 +544,7 @@ class BuildStore:
             executor_url=executor_url,
             tenant_id=tenant_id,
             principal_id=principal_id,
-            created_at=self._clock(),
+            created_at=0.0,
             input_uris=input_uris,
             params=params,
             name=name,
@@ -531,6 +554,7 @@ class BuildStore:
         )
         conn = self._get_connection()
         try:
+            build = replace(build, created_at=self.now(conn))
             _insert_build(conn, build)
             conn.commit()
             return build
@@ -602,7 +626,7 @@ class BuildStore:
                 if row is not None:
                     conn.commit()
                     return _row_to_build_state(row)
-            now = self._clock()
+            now = self.now(conn)
             _insert_build(
                 conn,
                 BuildState(
@@ -678,7 +702,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             opened = self.open_attempt_within(
                 conn,
                 build_id,
@@ -921,7 +945,7 @@ class BuildStore:
                 SET state = 'building', started_at = ?
                 WHERE build_id = ? AND state = 'pending'
                 """,
-                (self._clock(), build_id),
+                (self.now(conn), build_id),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -943,7 +967,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
             cursor = conn.execute(
                 """
@@ -967,56 +991,73 @@ class BuildStore:
         build_id: str,
         lease_owner: str,
         lease_duration_seconds: float = 60.0,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Extend a live lease from now.
 
         Returns False unless ``lease_owner`` holds it, it has not lapsed and the build
-        is building. A lapsed lease stays lapsed: its attempt is fenced for good, and
-        the build goes on only in a new attempt or a reclaim.
+        is building, and with ``attempt`` unless that is still the build's attempt: a
+        runner that resumes a build under the same owner otherwise has the fenced
+        attempt's heartbeat renew its successor's lease. A claim's lease, before an
+        attempt opens, is renewed without it. A lapsed lease stays lapsed:
+        its attempt is fenced for good, and the build goes on only in a new attempt or a
+        reclaim. It has lapsed by :meth:`now`, read once this holds the build's key, so
+        time spent waiting for the key counts: renew well before the deadline.
         """
         conn = self._get_connection()
         try:
-            now = self._clock()
+            # Read under the key, where every fence is decided. A reading taken before
+            # the wait could predate a lapse a fence check acted on meanwhile, and the
+            # renewal would revive the fenced attempt.
+            self._dialect.begin_write(conn, build_id)
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
-            cursor = conn.execute(
-                """
+            sql = """
                 UPDATE artifact_builds
                 SET lease_expires_at = ?
                 WHERE build_id = ?
                   AND state = 'building'
                   AND lease_owner = ?
                   AND (lease_expires_at IS NULL OR lease_expires_at >= ?)
-                """,
-                (lease_expires_at, build_id, lease_owner, now),
-            )
+            """
+            params: list[SqlValue] = [lease_expires_at, build_id, lease_owner, now]
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
+            cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
         finally:
             conn.close()
 
-    def lapse_lease(self, build_id: str, lease_owner: str) -> bool:
+    def lapse_lease(self, build_id: str, lease_owner: str, *, attempt: str | None = None) -> bool:
         """End ``lease_owner``'s lease now, for good, from any thread or process.
 
-        Unlike a renewal to zero seconds, a renewal that read the clock first cannot
-        revive it: the lease has no owner left to renew. Under the build's key, so it
-        waits for an acceptance or an attempt opening that already holds the lease, and
-        either fences what follows. Returns False unless ``lease_owner`` holds it and
-        the build is building.
+        Unlike a renewal to zero seconds, which leaves the lease live through its
+        deadline, it clears the owner, so no later renewal can take it up again. Under
+        the build's key, so it waits for an acceptance or an attempt opening that already
+        holds the lease, and either fences what follows. Returns False unless
+        ``lease_owner`` holds it and the build is building, and with ``attempt`` unless
+        that is still the build's attempt, as for :meth:`renew_lease`: otherwise a
+        fenced attempt lapses the successor that shares its owner.
         """
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
             # Strictly past: a lease is live through its deadline, so one ending at now
             # would still let the attempt through within the same clock reading.
-            lapsed_at = math.nextafter(self._clock(), -math.inf)
-            cursor = conn.execute(
-                """
+            lapsed_at = math.nextafter(self.now(conn), -math.inf)
+            sql = """
                 UPDATE artifact_builds
                 SET lease_owner = NULL, lease_expires_at = ?
                 WHERE build_id = ? AND state = 'building' AND lease_owner = ?
-                """,
-                (lapsed_at, build_id, lease_owner),
-            )
+            """
+            params: list[SqlValue] = [lapsed_at, build_id, lease_owner]
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
+            cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
         finally:
@@ -1045,7 +1086,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
             row = conn.execute(
                 "SELECT attempt FROM artifact_builds WHERE build_id = ?", (build_id,)
@@ -1085,7 +1126,7 @@ class BuildStore:
         dispatch_clause, dispatch_params = _dispatch_filter(dispatch)
         conn = self._get_connection()
         try:
-            now = self._clock()
+            now = self.now(conn)
             cursor = conn.execute(
                 f"""
                 SELECT {_BUILD_COLUMNS}
@@ -1109,15 +1150,21 @@ class BuildStore:
         output_byte_count: int | None = None,
         logs: str | None = None,
         lease_owner: str | None = None,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Mark a build ready (building -> ready).
 
         Args:
             lease_owner: When given, apply only if this owner still holds the lease,
                 so a runner whose lease was taken over cannot publish over the new owner.
+            attempt: When given, apply only if this is still the build's attempt and
+                its lease has not lapsed, so a fenced attempt cannot complete its build,
+                nor a successor that shares its owner.
 
         Returns:
-            False if not found, not building, or the lease is held by someone else.
+            False if not found, not building, or the lease or the attempt is someone
+            else's.
         """
         conn = self._get_connection()
         try:
@@ -1127,10 +1174,14 @@ class BuildStore:
                 SET state = 'ready', completed_at = ?, output_byte_count = ?, logs = ?
                 WHERE build_id = ? AND state = 'building'
             """
-            params: list[SqlValue] = [self._clock(), output_byte_count, logs, build_id]
+            now = self.now(conn)
+            params: list[SqlValue] = [now, output_byte_count, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
+            if attempt is not None:
+                sql += " AND attempt = ? AND (lease_expires_at IS NULL OR lease_expires_at >= ?)"
+                params += [attempt, now]
             cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
@@ -1166,7 +1217,7 @@ class BuildStore:
             WHERE build_id = ? AND state = 'building' AND lease_owner = ?
         """
         params: list[SqlValue] = [
-            self._clock(),
+            self.now(conn),
             output_byte_count,
             logs,
             artifact_id,
@@ -1191,7 +1242,8 @@ class BuildStore:
         """Record a blob key a build attempt may write, before anything can write it.
 
         ``writable_until`` is when the last write capability expires (a signed URL's
-        expiry, or now for a runner). Re-recording keeps the later time.
+        expiry, or now for a runner), by this host's clock, which
+        :meth:`settled_attempts` reads too. Re-recording keeps the later time.
         """
         conn = self._get_connection()
         try:
@@ -1206,7 +1258,7 @@ class BuildStore:
                     ELSE build_attempts.writable_until
                 END
                 """,
-                (build_id, artifact_id, version, attempt, writable_until, self._clock()),
+                (build_id, artifact_id, version, attempt, writable_until, self._host_now()),
             )
             conn.commit()
         finally:
@@ -1231,7 +1283,7 @@ class BuildStore:
                   AND (b.build_id IS NULL OR b.state NOT IN ('pending', 'building'))
                 LIMIT ?
                 """,
-                (self._clock(), limit),
+                (self._host_now(), limit),
             ).fetchall()
         finally:
             conn.close()
@@ -1270,7 +1322,7 @@ class BuildStore:
                 )
                 ON CONFLICT (build_id, stream, seq) DO NOTHING
                 """,
-                (build_id, stream, seq, chunk, self._clock(), build_id),
+                (build_id, stream, seq, chunk, self.now(conn), build_id),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -1319,6 +1371,8 @@ class BuildStore:
         logs: str | None = None,
         lease_owner: str | None = None,
         lease_expires_at: float | None = None,
+        *,
+        attempt: str | None = None,
     ) -> bool:
         """Mark a build failed (pending or building -> failed).
 
@@ -1327,9 +1381,13 @@ class BuildStore:
                 as in ``complete_build``.
             lease_expires_at: With ``lease_owner``, also pin the exact claim, as in
                 ``complete_within``.
+            attempt: When given, apply only if this is still the build's attempt, its
+                lease live or not: an attempt that lapsed its own lease has no owner
+                left to match, and nothing has taken the build from it.
 
         Returns:
-            False if not found, not pending or building, or the lease is someone else's.
+            False if not found, not pending or building, the lease is someone else's,
+            or with ``attempt`` the build is another attempt's.
         """
         conn = self._get_connection()
         try:
@@ -1339,13 +1397,16 @@ class BuildStore:
                 SET state = 'failed', completed_at = ?, error_message = ?, error_code = ?, logs = ?
                 WHERE build_id = ? AND state IN ('pending', 'building')
             """
-            params: list[SqlValue] = [self._clock(), error_message, error_code, logs, build_id]
+            params: list[SqlValue] = [self.now(conn), error_message, error_code, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
                 if lease_expires_at is not None:
                     sql += " AND lease_expires_at = ?"
                     params.append(lease_expires_at)
+            if attempt is not None:
+                sql += " AND attempt = ?"
+                params.append(attempt)
             cursor = conn.execute(sql, params)
             conn.commit()
             return cursor.rowcount > 0
@@ -1444,7 +1505,7 @@ class BuildStore:
         """
         conn = self._get_connection()
         try:
-            cutoff = self._clock() - (max_age_days * 86400)
+            cutoff = self.now(conn) - (max_age_days * 86400)
             conn.execute(
                 """
                 DELETE FROM build_console_chunks
