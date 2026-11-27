@@ -499,6 +499,32 @@ class AliasChange(TypedDict):
     requested_by: str | None
 
 
+_CHANGE_FIELDS = ("name", "alias", "action", "artifact_id", "version", "requested_by")
+
+
+def _is_change(pending: Mapping[str, object], reviewed: Mapping[str, object]) -> bool:
+    """Whether *pending* (a ``registry_pending`` row) is the request *reviewed* describes:
+    the same alias, action, target and requester, and, as listed, the same request."""
+    return all(pending[field] == reviewed.get(field) for field in _CHANGE_FIELDS) and all(
+        pending[field] == reviewed[field]
+        for field in ("requested_at", "tenant")
+        if field in reviewed
+    )
+
+
+def _replaced(name: str, alias: str, pending: Mapping[str, object]) -> str:
+    target = (
+        f"{pending['artifact_id']}@v={pending['version']}"
+        if pending["action"] == "set"
+        else "a delete"
+    )
+    by = pending["requested_by"] if pending["requested_by"] is not None else "a request"
+    return (
+        f"The pending change for alias '{name}@{alias}' is no longer the one reviewed: "
+        f"{by} now asks for {target}"
+    )
+
+
 class PendingChange(AliasChange):
     """A change waiting for approval, as :meth:`ArtifactStore.list_pending_changes` lists it."""
 
@@ -932,6 +958,12 @@ _USE_RESOLUTION_SECONDS = 300.0
 _GC_DELETE_BATCH = 1000
 _GC_BATCH_SECONDS = 0.25
 _GC_BATCH_PAUSE_SECONDS = 0.1
+
+# A required edge that holds the version ``av`` against cleanup_failed. Any edge, as the
+# sweep's holds over-protect: a failed requirer may yet be filled by an import, and one
+# of another tenant would point at a number the id's tenant may hand out again.
+_REQUIREMENT_SQL = """SELECT 1 FROM retention_edges e
+    WHERE e.to_artifact_id = av.id AND e.to_version = av.version"""
 
 # How long a temp file goes untouched before a sweep takes it for a dead write's.
 _ABANDONED_WRITE_SECONDS = 3600.0
@@ -2078,11 +2110,13 @@ class ArtifactStore:
         conn = self._get_connection()
         try:
             self._hold_off_sweeps(conn)
-            for (artifact_id, version), requires in requirements.items():
-                row = conn.execute(
-                    "SELECT tenant FROM artifact_versions WHERE id = ? AND version = ?",
-                    (artifact_id, version),
-                ).fetchone()
+            # Each requirer locked, in key order: a delete or a sweep that went first left
+            # no row, and one that comes after sees the edges. Unlocked, an edge from a
+            # requirer deleted meanwhile held its target for good.
+            for index, ((artifact_id, version), requires) in enumerate(
+                sorted(requirements.items())
+            ):
+                row = self._lock_target(conn, artifact_id, version, "tenant", locked=index > 0)
                 if row is None:
                     raise ValueError(f"Artifact {artifact_id}@v={version} not found")
                 self._write_requirements(conn, artifact_id, version, row["tenant"], requires)
@@ -3756,17 +3790,25 @@ class ArtifactStore:
             )
 
     def _lock_target(
-        self, conn: StoreConnection, artifact_id: str, version: int, columns: str = "state, tenant"
+        self,
+        conn: StoreConnection,
+        artifact_id: str,
+        version: int,
+        columns: str = "state, tenant",
+        *,
+        locked: bool = False,
     ):
         """The version row a pointer or a hold is about to name, kept until commit.
 
         A delete or a sweep's claim then waits for the caller, or went first and the
         row reads as missing. Postgres takes the row ``FOR SHARE``, which conflicts
-        with both; SQLite takes the write lock before the read. The lock comes before
-        the audit lock, as the delete takes them.
+        with both; SQLite takes the write lock before the read, unless *locked* says an
+        earlier call on this transaction took it. The lock comes before the audit lock,
+        as the delete takes them.
         """
         if self._dialect.name == "sqlite":
-            self._dialect.begin_write(conn, artifact_id)
+            if not locked:
+                self._dialect.begin_write(conn, artifact_id)
             suffix = ""
         else:
             suffix = " FOR SHARE"
@@ -4806,15 +4848,19 @@ class ArtifactStore:
         tenant: str | None = None,
         actor: str | None = None,
         require_distinct_approver: bool = False,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Apply a pending alias change (audited with the approver as actor) and return it.
 
         ``require_distinct_approver`` forbids the requester approving their own change.
+        ``reviewed`` is the change the approver read (from :meth:`list_pending_changes`):
+        a request that replaced it since is not applied in its stead.
 
         Raises:
-            ValueError: If no change is pending for ``name @ alias``, the target is no
-                longer available, or the approver is the requester under
-                ``require_distinct_approver``.
+            ValueError: If no change is pending for ``name @ alias``, it is not
+                ``reviewed``, the target is no longer available, or the approver is the
+                requester under ``require_distinct_approver``.
         """
         conn = self._get_connection()
         try:
@@ -4824,14 +4870,18 @@ class ArtifactStore:
             # consumed while the stale change read here is applied.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
-            entry = cast(AliasChange, dict(pending))
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
+            entry = cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
 
             if require_distinct_approver and actor is not None and entry["requested_by"] == actor:
                 conn.rollback()
@@ -4922,11 +4972,17 @@ class ArtifactStore:
         alias: str,
         tenant: str | None = None,
         actor: str | None = None,
+        *,
+        reviewed: AliasChange | None = None,
     ) -> AliasChange:
         """Discard a pending alias change (audited).
 
+        ``reviewed`` is the change the rejecter read: a request that replaced it since
+        is not discarded unseen.
+
         Raises:
-            ValueError: If no change is pending for ``name @ alias``.
+            ValueError: If no change is pending for ``name @ alias``, or it is not
+                ``reviewed``.
         """
         conn = self._get_connection()
         try:
@@ -4934,13 +4990,17 @@ class ArtifactStore:
             # Lock before reading, so an approve cannot apply the change rejected here.
             self._dialect.begin_write(conn, "registry_audit")
             cursor = conn.execute(
-                "SELECT name, alias, action, artifact_id, version, requested_by "
+                "SELECT name, alias, action, artifact_id, version, requested_by, "
+                "requested_at, tenant "
                 "FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
             )
             pending = cursor.fetchone()
             if pending is None:
                 raise ValueError(f"No pending change for alias '{name}@{alias}'")
+            if reviewed is not None and not _is_change(dict(pending), reviewed):
+                conn.rollback()
+                raise ValueError(_replaced(name, alias, dict(pending)))
             conn.execute(
                 "DELETE FROM registry_pending WHERE name = ? AND alias = ? AND tenant = ?",
                 (name, alias, effective_tenant),
@@ -4956,7 +5016,7 @@ class ArtifactStore:
                 tenant=tenant,
             )
             conn.commit()
-            return cast(AliasChange, dict(pending))
+            return cast(AliasChange, {field: pending[field] for field in _CHANGE_FIELDS})
         finally:
             conn.close()
 
@@ -6091,8 +6151,9 @@ class ArtifactStore:
 
         A batch takes the sweep's key exclusively and reads the holds again under it, so
         no hold lands while it claims, which on Postgres a claim could otherwise act on
-        unseen (SQLite's write lock already serializes them). Before any other lock, or a
-        writer holding a row waits on a batch that waits on the row.
+        unseen (SQLite's write lock already serializes them). A cleanup_failed batch
+        takes it exclusively too. Before any other lock, or a writer holding a row waits
+        on a batch that waits on the row.
         """
         self._dialect.share_write(conn, _SWEEP_KEY)
 
@@ -6398,6 +6459,8 @@ class ArtifactStore:
 
         A row a build with a live lease may still write is spared: the build's target,
         its releases' outputs, and every row of its computation (``computation_key``).
+        Live by the database's clock, as ``BuildStore.now`` reads it by default; the age
+        is by this host's.
         Any other old enough ``building`` row is demoted, which is safe only where no
         writer without a lease holds one that long: a server before its build runner
         accepts work, or a notebook's own store.
@@ -6419,7 +6482,9 @@ class ArtifactStore:
                              OR b.build_id IN (SELECT r.build_id FROM build_releases r
                                                WHERE r.release_id = artifact_versions.release_id)))
                 """
-                params.append(now)
+                # By the database's clock, as every lease decision is: a sweeping host
+                # whose clock runs ahead would otherwise demote a live build's rows.
+                params.append(self._dialect.server_time(conn))
             cursor = conn.execute(
                 f"""
                 UPDATE artifact_versions
@@ -6549,34 +6614,95 @@ class ArtifactStore:
         """Delete failed artifacts older than ``max_age_seconds``; return the count.
 
         As the sweep, it leaves an id's highest version while a lower one stays, so a
-        version number is never reused, and it spares a version a retention root holds
-        or a publication names: either is a promise someone else was given.
+        version number is never reused, and it spares a version a retention root holds,
+        a publication names or a required edge points at: each is a promise someone else
+        was given. Each batch commits on its own, so one that raises leaves the earlier
+        batches' deletes done.
         """
+        cutoff = time.time() - max_age_seconds
         conn = self._get_connection()
         try:
-            cutoff = time.time() - max_age_seconds
+            # The holds here only spare locking a row that stays; the batch looks again.
             cursor = conn.execute(
-                """
-                SELECT id, version, blob_attempt FROM artifact_versions av
+                f"""
+                SELECT id, version FROM artifact_versions av
                 WHERE state = 'failed' AND created_at < ?
                   AND NOT EXISTS (SELECT 1 FROM retention_roots r
                                   WHERE r.artifact_id = av.id AND r.version = av.version)
                   AND NOT EXISTS (SELECT 1 FROM artifact_publications p
                                   WHERE p.artifact_id = av.id AND p.version = av.version)
+                  AND NOT EXISTS ({_REQUIREMENT_SQL})
                 """,
                 (cutoff,),
             )
-            rows = list(
-                self._without_version_gaps(
-                    conn, {(row["id"], row["version"]): row for row in cursor.fetchall()}
-                ).values()
-            )
+            # Sorted here, not by the database's collation: every writer locking several
+            # version rows takes them in this one order.
+            candidates = sorted((row["id"], row["version"]) for row in cursor.fetchall())
+        finally:
+            conn.close()
+        removed = start = 0
+        # In batches, as the sweep's, capped in rows and in time: each holds the sweep's
+        # key exclusively, so every hold writer waits for a batch, not for all.
+        while start < len(candidates):
+            if start and self._dialect.name == "sqlite":
+                # As the sweep pauses: a waiting writer polls the lock rather than queueing.
+                time.sleep(_GC_BATCH_PAUSE_SECONDS)
+            batch = candidates[start : start + _GC_DELETE_BATCH]
+            went, looked_at = self._cleanup_failed_batch(batch, cutoff)
+            removed += went
+            start += looked_at
+        return removed
+
+    def _cleanup_failed_batch(self, batch: list[tuple[str, int]], cutoff: float) -> tuple[int, int]:
+        """Delete the failed versions of *batch* that may still go; return how many went
+        and how many of *batch* it looked at, at least one, before its time ran out.
+
+        Each row is locked, in key order, and looked at again: since the read an import
+        may have filled it, making it a ready version with bytes under another key, a
+        root, a publication or a requirement may hold it, or a delete and a new failure
+        may have put a younger row at its key. The gap rule then runs on what is left.
+        """
+        conn = self._get_connection()
+        looked_at = 0
+        try:
+            # The sweep's key exclusively, as a sweep batch takes it: a required edge's
+            # writer locks no row of its target, only this key shared, so its edge is
+            # committed before the look below or waits for the batch.
+            self._dialect.begin_write(conn, _SWEEP_KEY)
+            began = time.monotonic()
+            locked: dict[tuple[str, int], StoreRow] = {}
+            for key in batch:
+                if looked_at and time.monotonic() - began >= _GC_BATCH_SECONDS:
+                    break
+                looked_at += 1
+                if not conn.execute(
+                    "UPDATE artifact_versions SET last_used_at = last_used_at "
+                    "WHERE id = ? AND version = ? AND state = 'failed' AND created_at < ?",
+                    (*key, cutoff),
+                ).rowcount:
+                    continue
+                # Under the row lock, which a retain or a publish takes before writing.
+                row = conn.execute(
+                    f"""
+                    SELECT id, version, blob_attempt FROM artifact_versions av
+                    WHERE id = ? AND version = ?
+                      AND NOT EXISTS (SELECT 1 FROM retention_roots r
+                                      WHERE r.artifact_id = av.id AND r.version = av.version)
+                      AND NOT EXISTS (SELECT 1 FROM artifact_publications p
+                                      WHERE p.artifact_id = av.id AND p.version = av.version)
+                      AND NOT EXISTS ({_REQUIREMENT_SQL})
+                    """,
+                    key,
+                ).fetchone()
+                if row is not None:
+                    locked[key] = row
+            rows = list(self._without_version_gaps(conn, locked).values())
 
             # Metadata first, then blobs: a mid-sweep failure then orphans bytes rather than leaving
-            # rows pointing at deleted blobs, as garbage_collect does.
+            # rows pointing at deleted blobs, as garbage_collect does. A failed build's row
+            # still references its version.
+            self._delete_versions_children(conn, [(row["id"], row["version"]) for row in rows])
             for row in rows:
-                # A failed build's row still references the version.
-                self._delete_versions_children(conn, [(row["id"], row["version"])])
                 conn.execute(
                     "DELETE FROM artifact_versions WHERE id = ? AND version = ?",
                     (row["id"], row["version"]),
@@ -6599,7 +6725,7 @@ class ArtifactStore:
                     row["id"],
                     row["version"],
                 )
-        return len(rows)
+        return len(rows), looked_at
 
     def stats(
         self,
