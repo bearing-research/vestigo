@@ -14,6 +14,82 @@ All notable changes to vestigo are recorded here. The format follows
   unlink it. The caller must own the file alone: a writable descriptor still open on it
   could change the blob after it is published. `ArtifactStore.adopt_blob_file` takes a
   build's `attempt`, as `publish_blob_from_path` does. (#118)
+- `BuildStore.fail_build(..., attempt=)` fails a build only while it is still that
+  attempt's, whether or not its lease is live. (#124)
+- `BuildStore.renew_lease(..., attempt=)` renews only while that is still the build's
+  attempt, so a fenced attempt's heartbeat cannot renew a successor that shares its
+  lease owner. (#129)
+- `approve_alias_change` and `reject_alias_change` take `reviewed=`, the change as
+  `list_pending_changes` listed it, and refuse when the pending change is no longer that
+  request. (#130)
+- `BuildStore.lapse_lease(..., attempt=)` and `complete_build(..., attempt=)` act only
+  while that is still the build's attempt, as `renew_lease` does; `complete_build` given
+  an attempt also refuses one whose lease has lapsed. (#133)
+- `SqlDialect.server_time(conn)` reads the database's clock (`clock_timestamp()` on
+  Postgres), and `BuildStore.now(conn=None)` returns it unless a clock was injected. (#138)
+- `ImportStagingLost`, raised by `stage_import_blob` when a drop took the staging's row
+  while its upload was still running; the upload can be retried. (#126)
+
+### Changed
+
+- `renew_lease` takes the build's key and reads the clock under it, as every fence check
+  does, so time spent waiting for the key counts against the lease: renew well inside it.
+  (#122)
+- `create_artifact(release_id=)` and `stage_promotion` raise `ValueError` for a release
+  that does not exist or has settled. (#123)
+- `delete_artifact` raises `ValueError` for a version a pending alias change targets,
+  as it does for a published or held one, until the change is rejected. (#128)
+- Schema 21: `import_staging` is keyed by tenant, digest and a token naming each upload's
+  own blob key, and records whether the upload is under way, ready or ending. A row from
+  before keeps the shared key. Stop writers for the upgrade. (#126)
+- `finalize_artifact`, `finalize_and_set_name` and `finalize_canonical_together` raise
+  `ValueError` for a row with no stored bytes, which stays `building`. Given a digest,
+  finalize costs one existence check on the blob store. (#136)
+- `cleanup_failed` spares a failed version a required edge names, and on Postgres each of
+  its batches holds the sweep's key exclusively, so writers that create a hold wait for a
+  batch, which is bounded in time. (#137)
+- On Postgres, lease decisions (claims, attempts, renewals, lapses, release prepare and
+  accept, `vestigo.torch`'s fences and `collect`, the zombie sweep's live-lease check)
+  read the database's clock, so hosts' clocks need not agree for leases. `clock=` on
+  `BuildStore` and `ReleaseStore` defaults to `None`. Age cutoffs and TTLs still read the
+  host's clock and are off by its skew. (#138)
+- Schema 22: a version number is never handed out twice. The new ledger table
+  `artifact_high_water` keeps each id's highest deleted version, and `create_artifact`
+  numbers past it. It is in `LEDGER_TABLES`, so a copy carries it; Strata's table
+  inventory moves with it. (#139)
+
+### Fixed
+
+- `cleanup_failed` locks each failed row and checks it again before deleting it, so it no
+  longer deletes a row an import filled meanwhile, a root placed meanwhile, or a younger
+  row at a reused key, and it keeps the id's top failed version so no number is reused.
+  (#119)
+- An `AssignAuthority` slot goes only to an accepted release or the one being accepted.
+  (#120)
+- `require` and `require_many` lock each requirer, so no edge outlives a requirer deleted
+  meanwhile. (#121)
+- A renewal that read the clock before a lapse no longer revives a lease a fence check
+  had already called lapsed. (#122)
+- A row staged or copied under a release while the release is accepted or rejected is
+  refused instead of left `building` in a settled release, and a copy whose source a
+  sweep took meanwhile copies nothing. (#123)
+- `vestigo.torch`: a run that lapsed its own lease (a changed input, a closed write
+  window) fails its build and placeholder on close; a close retried after a lost reply
+  fails the placeholder; `collect` fails a placeholder a failed build left `building`.
+  (#124)
+- A name or alias move, or deletion, is audited from the target it replaced, though
+  another writer moved the pointer meanwhile; a deletion's audit row names the id too.
+  (#125)
+- A staged import's bytes and its row never part: a restage racing a release or the drop
+  of its stale staging keeps its bytes, and an upload that dies is dropped later. (#126)
+- `vestigo.torch`'s `collect` reaps a dead derivation that has no unsettled release (an
+  open whose reply was lost, a cleanup that failed). (#127)
+- `delete_artifact` audits each name it removes, and its name and alias deletions carry
+  the target they replaced, as `delete_name` and `delete_alias` do. (#132)
+- A promotion's source is held while its bytes copy, so a sweep no longer takes it
+  mid-copy. (#134)
+- `request_alias_change` reads the alias under the audit lock, so the log never shows a
+  request queued for the alias's current target. (#135)
 
 ## 0.8.0 - 2026-11-24
 
