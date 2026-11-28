@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NoReturn, NotRequired, TypedDict, cast
 
 from vestigo import uris
 from vestigo.build_store import OPEN_BUILD_INDEX_SQL
@@ -134,14 +134,21 @@ def attempt_blob_id(artifact_id: str, attempt: str) -> str:
 IMPORT_STAGING_TTL_SECONDS = 86_400.0
 
 
-def staged_import_key(tenant: str | None, content_sha256: str) -> tuple[str, int]:
+def staged_import_key(tenant: str | None, content_sha256: str, token: str) -> tuple[str, int]:
     """The blob key bytes uploaded ahead of an import wait under.
 
     Uses version 0, which no artifact can have, so a staged upload never collides
-    with an artifact's key.
+    with an artifact's key. Each staging's *token* gives it a key of its own, so ending
+    one staging never takes another's bytes; a staging from before tokens (``""``) has
+    the digest's shared key.
     """
     tenant_key = hashlib.sha256((tenant or "").encode()).hexdigest()[:16]
-    return f"import-staging-{tenant_key}-{content_sha256}", 0
+    suffix = f"-{token}" if token else ""
+    return f"import-staging-{tenant_key}-{content_sha256}{suffix}", 0
+
+
+class ImportStagingLost(RuntimeError):
+    """A staging's upload outlasted ``IMPORT_STAGING_TTL_SECONDS``, and a drop took it."""
 
 
 class BuildLeaseLost(RuntimeError):
@@ -946,6 +953,47 @@ def _add_import_staging(conn: StoreConnection, dialect: SqlDialect) -> None:
     )
 
 
+_STAGING_KEY = "tenant, content_sha256, blob_token"
+_ONE_STAGING = "WHERE tenant = ? AND content_sha256 = ? AND blob_token = ?"
+_IMPORT_STAGING_DDL = f"""
+CREATE TABLE IF NOT EXISTS import_staging (
+    tenant TEXT NOT NULL DEFAULT '',
+    content_sha256 TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    staged_at REAL NOT NULL,
+    blob_token TEXT NOT NULL DEFAULT '',  -- its blob key; '' = the digest's (migration 21)
+    state TEXT NOT NULL DEFAULT 'ready',  -- uploading, ready (an import reads it), ending
+    PRIMARY KEY ({_STAGING_KEY})
+)"""
+
+
+def _add_staging_tokens(conn: StoreConnection, dialect: SqlDialect) -> None:
+    """Each staging's row keyed by its token too, so an upload's row is written before
+    its bytes beside the staging it may join; a row from before has the digest's shared
+    key (``''``) and is ready.
+
+    Postgres adds the columns and swaps the constraint; SQLite cannot change a primary
+    key, so it copies the table.
+    """
+    if dialect.name != "sqlite":
+        for column, declaration in (
+            ("blob_token", "TEXT NOT NULL DEFAULT ''"),
+            ("state", "TEXT NOT NULL DEFAULT 'ready'"),
+        ):
+            if not dialect.column_exists(conn, "import_staging", column):
+                conn.execute(f"ALTER TABLE import_staging ADD COLUMN {column} {declaration}")
+        conn.execute("ALTER TABLE import_staging DROP CONSTRAINT IF EXISTS import_staging_pkey")
+        conn.execute(f"ALTER TABLE import_staging ADD PRIMARY KEY ({_STAGING_KEY})")
+        return
+    conn.execute(_IMPORT_STAGING_DDL.replace("import_staging", "import_staging_keyed", 1))
+    columns = "tenant, content_sha256, byte_size, staged_at"
+    conn.execute(
+        f"INSERT INTO import_staging_keyed ({columns}) SELECT {columns} FROM import_staging"
+    )
+    conn.execute("DROP TABLE import_staging")
+    conn.execute("ALTER TABLE import_staging_keyed RENAME TO import_staging")
+
+
 # How stale ``last_used_at`` may get before a use writes it again: recording
 # every read would turn reads into writes, and a hot artifact costs one UPDATE
 # per interval this way. A sweep adds it to its recent-use floor, because the
@@ -1271,6 +1319,7 @@ _MIGRATIONS: list[_Migration] = [
     _Migration(18, "idx_versions_superseded_by", _index_pointers),
     _Migration(19, "idx_names_version, idx_aliases_version, idx_pending_version", _index_holds),
     _Migration(20, "idx_build_open replaces idx_build_computation", _index_open_builds),
+    _Migration(21, "import_staging keyed by blob_token; state", _add_staging_tokens),
 ]
 
 RETENTION_SCHEMA_VERSION = 12
@@ -1510,15 +1559,10 @@ CREATE TABLE IF NOT EXISTS store_upgrades (
 -- /v1/artifacts/import/blobs/{sha256}). Per tenant: a digest is no proof of
 -- holding the bytes, since a publication's page prints it, so one tenant's
 -- upload must never satisfy another's import. The BlobStore interface lists
--- no keys, so this is also how an upload that is never imported is found again.
-CREATE TABLE IF NOT EXISTS import_staging (
-    tenant TEXT NOT NULL DEFAULT '',
-    content_sha256 TEXT NOT NULL,
-    byte_size INTEGER NOT NULL,
-    staged_at REAL NOT NULL,
-    PRIMARY KEY (tenant, content_sha256)
-);
+-- no keys, so this is also how an upload that is never imported is found again,
+-- its row written before its bytes.
 """
+_PUBLICATION_SCHEMA_SQL += _IMPORT_STAGING_DDL + ";\n"
 
 # Bound on the retry of finalize_canonical_together and finalize_and_set_name. A
 # conflict means a competing writer committed a ready row with our provenance; one
@@ -2399,66 +2443,189 @@ class ArtifactStore:
     ) -> None:
         """Hold bytes, already checked against ``content_sha256``, for an import.
 
-        Restaging the same digest refreshes the hold. Each call also drops this
-        tenant's stagings older than ``IMPORT_STAGING_TTL_SECONDS``.
+        A digest has one ready staging per tenant, which the first import to release it
+        ends, whoever staged it. Restaging it refreshes the hold and keeps the bytes
+        held, which an import may be reading (the same digest is the same bytes), unless
+        they are gone; one that lands after a release or a drop took the staging stages
+        its own. Each call also drops this tenant's stagings older than
+        ``IMPORT_STAGING_TTL_SECONDS``, an upload that died with them.
+
+        Raises:
+            ImportStagingLost: the upload outlasted the TTL and a drop took its row.
         """
         now = time.time() if now is None else now
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        self.blob_store.publish_blob_from_path(blob_id, version, source_path)
-
         effective_tenant = tenant or ""
+        token = secrets.token_hex(8)
+        key = (effective_tenant, content_sha256, token)
+        # The row before the bytes, so bytes that outlive this call are found again.
         conn = self._get_connection()
         try:
             conn.execute(
-                """
-                INSERT INTO import_staging (tenant, content_sha256, byte_size, staged_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(tenant, content_sha256) DO UPDATE SET
-                    byte_size = excluded.byte_size, staged_at = excluded.staged_at
-                """,
-                (effective_tenant, content_sha256, byte_size, now),
+                "INSERT INTO import_staging "
+                "(tenant, content_sha256, blob_token, byte_size, staged_at, state) "
+                "VALUES (?, ?, ?, ?, ?, 'uploading')",
+                (*key, byte_size, now),
             )
-            stale = conn.execute(
-                "SELECT content_sha256 FROM import_staging WHERE tenant = ? AND staged_at < ?",
-                (effective_tenant, now - IMPORT_STAGING_TTL_SECONDS),
-            ).fetchall()
             conn.commit()
         finally:
             conn.close()
-        for row in stale:
-            self.release_staged_import(tenant, row["content_sha256"])
+        self.blob_store.publish_blob_from_path(
+            *staged_import_key(tenant, content_sha256, token), source_path
+        )
+        # Read before the lock, which on SQLite is the whole file's: a ready staging's
+        # bytes go only once it is ending, so bytes found gone stay gone.
+        held = self._ready_staging(effective_tenant, content_sha256)
+        held_lost = held is not None and not self.blob_store.blob_exists(
+            *staged_import_key(tenant, content_sha256, held)
+        )
+        conn = self._get_connection()
+        try:
+            self._dialect.begin_write(conn, f"import_staging:{effective_tenant}")
+            mine = conn.execute(f"SELECT state FROM import_staging {_ONE_STAGING}", key).fetchone()
+            lost = mine is None or mine["state"] != "uploading"
+            if lost:
+                # Named again, ending, so a delete of bytes that landed after the drop's
+                # is retried by a later drop if it fails.
+                conn.execute(
+                    "INSERT INTO import_staging "
+                    "(tenant, content_sha256, blob_token, byte_size, staged_at, state) "
+                    "VALUES (?, ?, ?, ?, ?, 'ending') "
+                    f"ON CONFLICT ({_STAGING_KEY}) DO UPDATE SET state = 'ending'",
+                    (*key, byte_size, now),
+                )
+            else:
+                ending = self._settle_upload(conn, key, byte_size, now, held if held_lost else None)
+            conn.commit()
+        finally:
+            conn.close()
+        if lost:
+            self._lose_staging(effective_tenant, content_sha256, token)
+        for digest, ending_token in ending:
+            try:
+                self._end_staging(effective_tenant, digest, ending_token)
+            except Exception as exc:
+                # Not this upload's to fail; the row stays, so a later staging retries it.
+                logger.warning(
+                    "could not drop a staging of %s for tenant %r: %s",
+                    digest,
+                    effective_tenant,
+                    exc,
+                )
+
+    @staticmethod
+    def _settle_upload(
+        conn: StoreConnection,
+        key: tuple[str, str, str],
+        byte_size: int,
+        now: float,
+        lost_token: str | None,
+    ) -> list[tuple[str, str]]:
+        """Under the tenant's staging lock, join the digest's ready staging or make this
+        upload it, and take the tenant's stale stagings out of reach. Returns the
+        stagings to end: this upload's when it joined, and the stale ones.
+
+        *lost_token* names a ready staging found without its bytes, which ends here.
+        """
+        tenant, content_sha256, token = key
+        if lost_token is not None:
+            conn.execute(
+                f"UPDATE import_staging SET state = 'ending' {_ONE_STAGING} AND state = 'ready'",
+                (tenant, content_sha256, lost_token),
+            )
+        joined = conn.execute(
+            "UPDATE import_staging SET byte_size = ?, staged_at = ? "
+            "WHERE tenant = ? AND content_sha256 = ? AND state = 'ready'",
+            (byte_size, now, tenant, content_sha256),
+        ).rowcount
+        new_state = "ending" if joined else "ready"
+        conn.execute(f"UPDATE import_staging SET state = ? {_ONE_STAGING}", (new_state, *key))
+        # Out of reach under the lock: a restage either refreshed one before this, and
+        # it is not stale, or finds none and stages its own; an upload still under way
+        # finds its row ending.
+        cutoff = now - IMPORT_STAGING_TTL_SECONDS
+        stale = conn.execute(
+            "SELECT content_sha256, blob_token FROM import_staging "
+            "WHERE tenant = ? AND (staged_at < ? OR state = 'ending')",
+            (tenant, cutoff),
+        ).fetchall()
+        conn.execute(
+            "UPDATE import_staging SET state = 'ending' WHERE tenant = ? AND staged_at < ?",
+            (tenant, cutoff),
+        )
+        return [(row["content_sha256"], row["blob_token"]) for row in stale]
+
+    def _lose_staging(self, tenant: str, content_sha256: str, token: str) -> NoReturn:
+        # Its bytes may have landed after the drop that took its row deleted them.
+        self._end_staging(tenant, content_sha256, token)
+        raise ImportStagingLost(f"the staging of {content_sha256} was dropped while it uploaded")
+
+    def _end_staging(self, tenant: str, content_sha256: str, token: str) -> None:
+        """Delete the bytes of a staging that is ending, then its row.
+
+        A delete that fails leaves the row ending, out of reach, for a later staging's
+        drop to retry.
+        """
+        self.blob_store.delete_blob(*staged_import_key(tenant, content_sha256, token))
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                f"DELETE FROM import_staging {_ONE_STAGING}", (tenant, content_sha256, token)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ready_staging(
+        self, tenant: str, content_sha256: str, conn: StoreConnection | None = None
+    ) -> str | None:
+        """The token of *tenant*'s staging of the digest an import reads, on *conn* when
+        given."""
+        own = conn is None
+        conn = self._get_connection() if conn is None else conn
+        try:
+            row = conn.execute(
+                "SELECT blob_token FROM import_staging "
+                "WHERE tenant = ? AND content_sha256 = ? AND state = 'ready'",
+                (tenant, content_sha256),
+            ).fetchone()
+        finally:
+            if own:
+                conn.close()
+        return None if row is None else row["blob_token"]
 
     def open_staged_import(self, tenant: str | None, content_sha256: str):
         """A reader for bytes *tenant* staged under *content_sha256*, or ``None``.
 
-        Only the tenant that uploaded them can import them.
+        Only the tenant that uploaded them can import them. Nothing holds them while
+        they are read: a release or a drop of the staging meanwhile ends the read.
         """
-        conn = self._get_connection()
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM import_staging WHERE tenant = ? AND content_sha256 = ?",
-                (tenant or "", content_sha256),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
+        token = self._ready_staging(tenant or "", content_sha256)
+        if token is None:
             return None
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        return self.blob_store.open_blob_reader(blob_id, version)
+        return self.blob_store.open_blob_reader(*staged_import_key(tenant, content_sha256, token))
 
     def release_staged_import(self, tenant: str | None, content_sha256: str) -> None:
-        """Drop staged bytes, once an import has used them or never will."""
-        blob_id, version = staged_import_key(tenant, content_sha256)
-        self.blob_store.delete_blob(blob_id, version)
+        """End the digest's ready staging, once an import has used it or never will.
+
+        Whichever is ready when it runs, which is the one the import read unless a
+        release and a restage came between. Out of reach first, so a restage after it
+        stages its own; its bytes, then its row.
+        """
+        effective_tenant = tenant or ""
         conn = self._get_connection()
         try:
-            conn.execute(
-                "DELETE FROM import_staging WHERE tenant = ? AND content_sha256 = ?",
-                (tenant or "", content_sha256),
-            )
+            self._dialect.begin_write(conn, f"import_staging:{effective_tenant}")
+            token = self._ready_staging(effective_tenant, content_sha256, conn)
+            if token is not None:
+                conn.execute(
+                    f"UPDATE import_staging SET state = 'ending' {_ONE_STAGING}",
+                    (effective_tenant, content_sha256, token),
+                )
             conn.commit()
         finally:
             conn.close()
+        if token is not None:
+            self._end_staging(effective_tenant, content_sha256, token)
 
     def import_artifact(
         self,

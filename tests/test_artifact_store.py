@@ -35,6 +35,7 @@ from vestigo.store import (
     ArtifactNotFoundError,
     ArtifactStore,
     ArtifactVersion,
+    ImportStagingLost,
     NameStatus,
     StagedVersion,
     _deletion_order,
@@ -4522,6 +4523,321 @@ class TestADeletedBuildsChildren:
         assert [a[:4] for a in builds.settled_attempts()] == [
             ("build-1", "built", version, "att-1")
         ]
+
+
+class TestEachStagingHasItsOwnBytes:
+    """Each upload has a blob key of its own: ending a staging never takes bytes a later
+    one holds, and nothing an upload writes outlives every row naming it."""
+
+    T0 = 1_000_000.0
+    LATER = T0 + IMPORT_STAGING_TTL_SECONDS + 1
+
+    @staticmethod
+    def _source(tmp_path, data: bytes):
+        source = tmp_path / hashlib.sha256(data).hexdigest()
+        source.write_bytes(data)
+        return source, hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _read(store, digest) -> bytes | None:
+        reader = store.open_staged_import("acme", digest)
+        if reader is None:
+            return None
+        with reader:
+            return reader.read()
+
+    @staticmethod
+    def _rows(store, digest) -> int:
+        conn = store._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM import_staging WHERE content_sha256 = ?", (digest,)
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _recording_publishes(store, monkeypatch) -> list:
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def recording(blob_id, version, path):
+            published.append((blob_id, version))
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", recording)
+        return published
+
+    @staticmethod
+    def _before_first_staged_delete(store, monkeypatch, act) -> list:
+        """Run *act* once, just before the first staged bytes are deleted."""
+        delete = store.blob_store.delete_blob
+        acted = []
+
+        def act_then_delete(blob_id, version):
+            if blob_id.startswith("import-staging-") and not acted:
+                acted.append(True)
+                act()
+            return delete(blob_id, version)
+
+        monkeypatch.setattr(store.blob_store, "delete_blob", act_then_delete)
+        return acted
+
+    @staticmethod
+    def _unreachable(blob_id, version):
+        raise ConnectionError("the object store is unreachable")
+
+    def test_a_retried_upload_joins_the_staging_and_leaves_no_copy(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """The held bytes stay, which an import may be reading; one release ends it."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1)
+
+        first, second = published
+        assert first != second
+        assert store.blob_store.blob_exists(*first)
+        assert not store.blob_store.blob_exists(*second)
+        assert self._rows(store, digest) == 1
+        store.release_staged_import("acme", digest)
+        assert self._read(store, digest) is None
+        assert not store.blob_store.blob_exists(*first)
+        assert self._rows(store, digest) == 0
+
+    def test_an_upload_the_drop_took_meanwhile_raises_and_leaves_no_bytes(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """One that outlasted the TTL: its client is told, rather than answered 201."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def swept_before_landing(blob_id, version, path):
+            if not published:
+                published.append((blob_id, version))
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ImportStagingLost):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+        assert self._read(store, other_digest) == b"other"
+
+    def test_a_lost_upload_whose_bytes_fail_to_go_leaves_them_for_the_next_drop(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        published = []
+
+        def swept_before_landing(blob_id, version, path):
+            if not published:
+                published.append((blob_id, version))
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+                # The object store goes away once the drop is done.
+                monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ConnectionError):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+        assert store.blob_store.blob_exists(*published[0])
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+
+    def test_an_upload_whose_row_a_drop_is_ending_is_lost_not_ready(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        """The drop took the row out of reach and could not delete its bytes yet: the
+        upload must not make the row ready again."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        other, other_digest = self._source(tmp_path, b"other")
+        publish = store.blob_store.publish_blob_from_path
+        delete = store.blob_store.delete_blob
+
+        def swept_before_landing(blob_id, version, path):
+            if blob_id.endswith(tuple("0123456789abcdef")) and digest in blob_id:
+                store.blob_store.delete_blob = self._unreachable
+                store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+                store.blob_store.delete_blob = delete
+            publish(blob_id, version, path)
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", swept_before_landing)
+        with pytest.raises(ImportStagingLost):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+
+        assert self._read(store, digest) is None
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+        assert self._rows(store, digest) == 0
+
+    def test_a_restage_repairs_a_staging_whose_bytes_are_gone(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        store.blob_store.delete_blob(*published[0])  # a lifecycle rule, an operator
+        assert self._read(store, digest) is None
+
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1)
+
+        assert self._read(store, digest) == b"payload"
+        assert self._rows(store, digest) == 1
+
+    def test_an_upload_during_a_release_keeps_its_bytes(self, backend_store, monkeypatch, tmp_path):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        acted = self._before_first_staged_delete(
+            store,
+            monkeypatch,
+            lambda: store.stage_import_blob("acme", digest, source, 7, now=self.T0 + 1),
+        )
+
+        store.release_staged_import("acme", digest)
+
+        assert acted
+        assert self._read(store, digest) == b"payload"
+
+    def test_an_upload_as_the_sweep_drops_a_stale_staging_keeps_its_bytes(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        acted = self._before_first_staged_delete(
+            store,
+            monkeypatch,
+            lambda: store.stage_import_blob("acme", digest, source, 7, now=self.LATER),
+        )
+        other, other_digest = self._source(tmp_path, b"other")
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+
+        assert acted
+        assert self._read(store, digest) == b"payload"
+        assert self._rows(store, digest) == 1
+
+    def test_a_released_staging_is_out_of_reach_before_its_bytes_go(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        seen = []
+        self._before_first_staged_delete(
+            store, monkeypatch, lambda: seen.append(store.open_staged_import("acme", digest))
+        )
+
+        store.release_staged_import("acme", digest)
+
+        assert seen == [None]
+
+    def test_an_upload_that_dies_is_dropped_with_the_stale_stagings(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        publish = store.blob_store.publish_blob_from_path
+        written = []
+
+        def dies_after_writing(blob_id, version, path):
+            publish(blob_id, version, path)
+            written.append((blob_id, version))
+            raise ConnectionError("the connection dropped")
+
+        monkeypatch.setattr(store.blob_store, "publish_blob_from_path", dies_after_writing)
+        with pytest.raises(ConnectionError):
+            store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.undo()
+        assert self._read(store, digest) is None
+
+        other, other_digest = self._source(tmp_path, b"other")
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+
+        (upload,) = written
+        assert not store.blob_store.blob_exists(*upload)
+        assert self._rows(store, digest) == 0
+
+    def test_a_release_whose_bytes_fail_to_go_leaves_them_for_the_stale_drop(
+        self, backend_store, monkeypatch, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        published = self._recording_publishes(store, monkeypatch)
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+
+        with pytest.raises(ConnectionError):
+            store.release_staged_import("acme", digest)
+        monkeypatch.undo()
+        assert self._read(store, digest) is None
+
+        other, other_digest = self._source(tmp_path, b"other")
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+        assert not store.blob_store.blob_exists(*published[0])
+        assert self._rows(store, digest) == 0
+
+    def test_a_stale_staging_whose_bytes_fail_to_go_stays_for_the_next_sweep(
+        self, backend_store, monkeypatch, tmp_path, caplog
+    ):
+        """And the upload whose staging swept it still stages."""
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        store.stage_import_blob("acme", digest, source, 7, now=self.T0)
+        other, other_digest = self._source(tmp_path, b"other")
+        monkeypatch.setattr(store.blob_store, "delete_blob", self._unreachable)
+
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER)
+        monkeypatch.undo()
+
+        assert "could not drop a staging" in caplog.text
+        assert self._read(store, other_digest) == b"other"
+        assert self._rows(store, digest) == 1
+        store.stage_import_blob("acme", other_digest, other, 5, now=self.LATER + 1)
+        assert self._rows(store, digest) == 0
+
+    def test_a_staging_from_before_tokens_reads_and_releases_the_shared_key(
+        self, backend_store, tmp_path
+    ):
+        store = backend_store
+        source, digest = self._source(tmp_path, b"payload")
+        # The key every staging of the digest had then.
+        tenant_key = hashlib.sha256(b"acme").hexdigest()[:16]
+        shared = (f"import-staging-{tenant_key}-{digest}", 0)
+        store.blob_store.publish_blob_from_path(*shared, source)
+        conn = store._get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO import_staging (tenant, content_sha256, byte_size, staged_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("acme", digest, 7, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert self._read(store, digest) == b"payload"
+        store.release_staged_import("acme", digest)
+        assert self._read(store, digest) is None
+        assert not store.blob_store.blob_exists(*shared)
 
 
 class TestPublicCallablesTheSuiteMissed:

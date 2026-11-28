@@ -2613,6 +2613,64 @@ class TestRootsKeyedByTenantMigration:
             reopened.close()
 
 
+class TestStagingsKeyedByTokenMigration:
+    def test_the_migration_rekeys_the_table_and_keeps_its_stagings(
+        self, store, postgres_dsn, tmp_path
+    ):
+        """The SQLite half is the migration-shape test in ``test_schema_migrations.py``."""
+        source = tmp_path / "payload"
+        source.write_bytes(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
+        tenant_key = hashlib.sha256(b"acme").hexdigest()[:16]
+        conn = store._get_connection()
+        try:
+            conn.execute("DROP TABLE import_staging")
+            conn.execute(
+                "CREATE TABLE import_staging (tenant TEXT NOT NULL DEFAULT '', "
+                "content_sha256 TEXT NOT NULL, byte_size BIGINT NOT NULL, "
+                "staged_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (tenant, content_sha256))"
+            )
+            conn.execute(
+                "INSERT INTO import_staging VALUES ('acme', ?, 7, ?)", (digest, time.time())
+            )
+            conn.execute("DELETE FROM schema_version")
+            conn.execute("INSERT INTO schema_version (version, applied_at) VALUES (20, 0)")
+            conn.commit()
+        finally:
+            conn.close()
+
+        reopened = ArtifactStore(tmp_path / "again", dialect=PostgresDialect(postgres_dsn))
+        try:
+            conn = reopened._get_connection()
+            try:
+                key = [
+                    row["attname"]
+                    for row in conn.execute(
+                        "SELECT a.attname FROM pg_index i "
+                        "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true "
+                        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum "
+                        "WHERE i.indrelid = 'import_staging'::regclass AND i.indisprimary "
+                        "ORDER BY k.n"
+                    ).fetchall()
+                ]
+                states = conn.execute("SELECT state FROM import_staging").fetchall()
+            finally:
+                conn.close()
+            assert key == ["tenant", "content_sha256", "blob_token"]
+            assert [row["state"] for row in states] == ["ready"]
+            # The key every staging of the digest had then, in this store's blobs.
+            shared = (f"import-staging-{tenant_key}-{digest}", 0)
+            reopened.blob_store.publish_blob_from_path(*shared, source)
+            with reopened.open_staged_import("acme", digest) as reader:
+                assert reader.read() == b"payload"
+            reopened.stage_import_blob("acme", digest, source, 7)  # joins it
+            reopened.release_staged_import("acme", digest)
+            assert reopened.open_staged_import("acme", digest) is None
+            assert not reopened.blob_store.blob_exists(*shared)
+        finally:
+            reopened.close()
+
+
 class TestTheHoldTablesIndexes:
     """Names, aliases and pending changes indexed by the version they hold, which every
     chunk of a sweep's claim asks, on a new ledger and an old one."""
