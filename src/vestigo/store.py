@@ -4852,6 +4852,9 @@ class ArtifactStore:
 
             effective_tenant = tenant if tenant is not None else ""
             if action == "set":
+                # The audit lock before the read, as set_alias takes it: a move committed
+                # after the read would be audited before the request it decided.
+                self._serialize_audit(conn)
                 cursor = conn.execute(
                     "SELECT artifact_id, version FROM artifact_aliases "
                     "WHERE name = ? AND alias = ? AND tenant = ?",
