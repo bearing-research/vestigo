@@ -3859,7 +3859,9 @@ def test_collect_takes_a_live_attempt_s_saves_that_can_no_longer_be_released(
 
     def rejected(self: ReleaseStore, release_id: str, *args: object) -> None:
         # The lease lapsed at acceptance; the renewal took it back after.
-        self._settle(release_id, "rejected")
+        release = self.get(release_id)
+        assert release is not None
+        self._settle(release.build_id, release_id, "rejected")
         raise ReleaseRejected("lease lapsed")
 
     def staged(run: Run, step: int) -> set[tuple[str, int]]:

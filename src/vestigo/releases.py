@@ -368,7 +368,7 @@ class ReleaseStore:
             now = self._now(conn)
             if not lease_held(conn, release.build_id, release.attempt, now):
                 conn.rollback()
-                self._settle(release_id, "rejected")
+                self._settle(release.build_id, release_id, "rejected")
                 raise ReleaseRejected(
                     f"attempt {release.attempt} no longer holds build {release.build_id}"
                 )
@@ -389,7 +389,7 @@ class ReleaseStore:
             overtaken = self._overtaken(conn, staged)
             if overtaken:
                 conn.rollback()
-                self._settle(release_id, "rejected")
+                self._settle(release.build_id, release_id, "rejected")
                 raise ReleaseOvertaken(
                     f"release {release_id}: a newer value is current for " + ", ".join(overtaken)
                 )
@@ -438,7 +438,7 @@ class ReleaseStore:
                     # Every build writer here takes the build's key, but a consumer's
                     # own transaction need not: the release must not outlive the build.
                     conn.rollback()
-                    self._settle(release_id, "rejected")
+                    self._settle(release.build_id, release_id, "rejected")
                     raise ReleaseRejected(
                         f"build {release.build_id} is no longer building under attempt "
                         f"{release.attempt}"
@@ -763,10 +763,15 @@ class ReleaseStore:
     def _outputs_on(self, conn: StoreConnection, release_id: str) -> list[ArtifactVersion]:
         return self._artifacts._versions_where(conn, "release_id = ?", (release_id,))
 
-    def _settle(self, release_id: str, state: str) -> None:
-        """Settle an unsettled release; one a retry settled meanwhile is left as it is."""
+    def _settle(self, build_id: str, release_id: str, state: str) -> None:
+        """Settle an unsettled release; one a retry settled meanwhile is left as it is.
+
+        Under the build's key, as an acceptance settles: a row staged under the release
+        (``create_artifact``, ``stage_promotion``) lands before this or finds it settled.
+        """
         conn = self._connect()
         try:
+            self._dialect.begin_write(conn, build_id)
             self._settle_on(conn, release_id, state)
             conn.commit()
         finally:

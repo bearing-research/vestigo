@@ -1159,12 +1159,12 @@ class TestVersionPromotion:
         store.blob_store.write_blob("file-1", 1, b"file")
         store.finalize_artifact("file-1", 1, "{}", 1, 4)
         manifest = store.create_artifact(
-            "manifest",
-            "prov-m",
-            requires=[("file-1", 1)],
-            release_id="rel-1",
-            computation_key="comp-1",
+            "manifest", "prov-m", requires=[("file-1", 1)], computation_key="comp-1"
         )
+        conn = store._get_connection()
+        conn.execute("UPDATE artifact_versions SET release_id = 'rel-1' WHERE id = 'manifest'")
+        conn.commit()
+        conn.close()
         store.blob_store.write_blob("manifest", manifest, b"m")
         store.finalize_artifact("manifest", manifest, "{}", 1, 1)
         self._ready(store, "manifest", "prov-m2", b"m2")
