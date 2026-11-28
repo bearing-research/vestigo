@@ -5414,8 +5414,10 @@ class ArtifactStore:
         must not break its descendants checks :meth:`find_dependents` first.
 
         Raises:
-            ValueError: If the version is published or held by a retention root; a
-                hold is a promise to restore it, so it is released first, deliberately.
+            ValueError: If the version is published, held by a retention root, or the
+                target of a pending alias change; a hold is a promise to restore it, and
+                a pending change one to review it, so each is released first,
+                deliberately.
         """
         ref = f"{artifact_id}@v={version}"
         conn = self._get_connection()
@@ -5484,6 +5486,19 @@ class ArtifactStore:
                 raise ValueError(
                     f"{artifact_id}@v={version} is held ({root['kind']} {root['holder']}); "
                     "release the hold before deleting it"
+                )
+            # Else an approval moves the alias to what the reviewer never saw: a version
+            # built later under this number, or none.
+            pending = conn.execute(
+                "SELECT name, alias FROM registry_pending "
+                "WHERE artifact_id = ? AND version = ? AND action = 'set' "
+                "ORDER BY name, alias LIMIT 1",
+                (artifact_id, version),
+            ).fetchone()
+            if pending is not None:
+                raise ValueError(
+                    f"{artifact_id}@v={version} is the target of a pending change to "
+                    f"{pending['name']}@{pending['alias']}; reject it before deleting it"
                 )
             held_pointers = conn.execute(
                 "SELECT id, version FROM artifact_versions WHERE superseded_by = ?", (ref,)

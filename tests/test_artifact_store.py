@@ -1950,7 +1950,12 @@ class TestApproveAtomicity:
     def test_dead_target_keeps_pending_intact(self, store):
         _make_ready_artifact(store, "m1", "prov-1")
         store.request_alias_change("demo/model", "champion", "set", artifact_id="m1", version=1)
-        store.delete_artifact("m1", 1)  # target dies between request and approve
+        # The target dies between request and approve: not by delete_artifact, which
+        # refuses a pending change's target, but as a row lost some other way.
+        conn = store._get_connection()
+        conn.execute("DELETE FROM artifact_versions WHERE id = 'm1' AND version = 1")
+        conn.commit()
+        conn.close()
 
         with pytest.raises(ValueError, match="no longer available"):
             store.approve_alias_change("demo/model", "champion")
@@ -3375,6 +3380,32 @@ class _Racing:
         competitor.dialect.close()
 
 
+class TestWhatADeleteLeavesBehind:
+    """A pending change's target is not stood in for by one built later under its number."""
+
+    @staticmethod
+    def _ready(store, provenance: str, data: bytes) -> int:
+        version = store.create_artifact("x", provenance)
+        store.write_blob("x", version, data)
+        store.finalize_artifact("x", version, "{}", 0, len(data))
+        return version
+
+    def test_a_version_a_pending_change_targets_is_deleted_only_once_it_is_rejected(
+        self, backend_store
+    ):
+        store = backend_store
+        self._ready(store, "prov-1", b"one")
+        reviewed = self._ready(store, "prov-2", b"reviewed")
+        store.request_alias_change("m", "prod", "set", "x", reviewed, actor="alice")
+
+        with pytest.raises(ValueError, match="pending change to m@prod"):
+            store.delete_artifact("x", reviewed)
+        assert store.get_artifact("x", reviewed) is not None
+
+        store.reject_alias_change("m", "prod", actor="bob")
+        assert store.delete_artifact("x", reviewed)
+
+
 class TestDeleteAgainstADuplicateFinalize(_Racing):
     """A duplicate's finalize and a delete of its canonical, in every order, leave the
     duplicate reading bytes (audit SR-B)."""
@@ -4708,10 +4739,9 @@ class TestProtectedAliasEvents:
             store.approve_alias_change(
                 "team/model", "champion", actor="ana", require_distinct_approver=True
             )
-        assert store.delete_artifact("gone", 1)
+        with pytest.raises(ValueError, match="pending change"):
+            store.delete_artifact("gone", 1)
         after_delete = len(store.read_events())
-        with pytest.raises(ValueError, match="no longer available"):
-            store.approve_alias_change("team/model", "champion", actor="ben")
 
         assert queued == baseline + 1
         assert len(store.read_events()) == after_delete
