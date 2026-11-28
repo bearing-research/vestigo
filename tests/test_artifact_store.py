@@ -3983,6 +3983,63 @@ class TestPromotionIsNotARelease:
         assert ("model-1", 2) not in releases.collectable_checkpoints(keep=1)
 
 
+class TestASourceIsHeldWhileItsCopyStreams:
+    """A promotion's bytes stream after its row commits: a sweep then must spare the source."""
+
+    @staticmethod
+    def _during_copy(store, monkeypatch, step):
+        """Run *step* once the copy's row has committed, before its bytes are written."""
+        open_writer = store.blob_store.open_blob_writer
+
+        def opened(blob_id, version):
+            step()
+            return open_writer(blob_id, version)
+
+        monkeypatch.setattr(store.blob_store, "open_blob_writer", opened)
+
+    def test_a_sweep_mid_copy_spares_the_source(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        swept = []
+        self._during_copy(
+            store, monkeypatch, lambda: swept.append(store.garbage_collect(max_idle_days=0))
+        )
+
+        promoted = store.promote_version("art", old)
+
+        assert swept and store.get_artifact("art", old) is not None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_the_copy_holds_its_source_no_longer_once_it_lands(self, backend_store):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+        promoted = store.promote_version("art", old)
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
+        assert store.read_blob("art", promoted.version) == b"old bytes"
+
+    def test_a_failed_copy_holds_its_source_no_longer(self, backend_store, monkeypatch):
+        store = backend_store
+        old = _finished(store, "art", "prov-old", b"old bytes")
+        _finished(store, "art", "prov-new", b"new bytes")
+
+        def broken():
+            raise OSError("the disk filled up")
+
+        self._during_copy(store, monkeypatch, broken)
+        with pytest.raises(OSError, match="disk filled"):
+            store.promote_version("art", old)
+        monkeypatch.undo()
+
+        store.garbage_collect(max_idle_days=0)
+
+        assert store.get_artifact("art", old) is None
+
+
 class TestAReadThroughAPointer:
     def test_both_uses_are_noted_after_every_read(self, store):
         """The note turns SQLite's busy handler off for what follows (audit SL-9)."""
