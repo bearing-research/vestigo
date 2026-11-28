@@ -14,7 +14,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypedDict
 
@@ -360,7 +360,7 @@ class BuildStore:
         self,
         db_path: Path,
         dialect: SqlDialect | None = None,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
     ):
         """Open the store and create its schema.
 
@@ -368,13 +368,35 @@ class BuildStore:
             db_path: SQLite database; ignored when ``dialect`` is given.
             dialect: Metadata backend; pass the artifact store's to share its database.
             clock: Wall-clock source in seconds, injectable so tests can expire a
-                lease without sleeping.
+                lease without sleeping; by default the database's (:meth:`now`).
         """
         self.db_path = db_path
         self._dialect: SqlDialect = dialect if dialect is not None else SqliteDialect(db_path)
         self._owns_dialect = dialect is None
         self._clock = clock
         self._init_schema()
+
+    def now(self, conn: StoreConnection | None = None) -> float:
+        """The time every lease and write-window decision reads, in seconds: the injected
+        clock, else the database's, so hosts whose clocks disagree still agree on when a
+        lease lapses. Read on *conn*, which a thread already holding a connection must
+        pass (Postgres lends it no second one), else on a connection of its own. Each
+        fence here reads it once it holds the build's key. Take an attempt's
+        ``writable_until`` from it: a deadline from another clock is off by the skew."""
+        if self._clock is not None:
+            return self._clock()
+        if conn is not None:
+            return self._dialect.server_time(conn)
+        own = self._get_connection()
+        try:
+            return self._dialect.server_time(own)
+        finally:
+            own.close()
+
+    def _host_now(self) -> float:
+        """The injected clock, else this host's: for a signed URL's expiry, which the
+        signing host's clock set and the object store enforces, not the database."""
+        return self._clock() if self._clock is not None else time.time()
 
     def close(self) -> None:
         """Close the connections kept open between calls, when the dialect is this
@@ -522,7 +544,7 @@ class BuildStore:
             executor_url=executor_url,
             tenant_id=tenant_id,
             principal_id=principal_id,
-            created_at=self._clock(),
+            created_at=0.0,
             input_uris=input_uris,
             params=params,
             name=name,
@@ -532,6 +554,7 @@ class BuildStore:
         )
         conn = self._get_connection()
         try:
+            build = replace(build, created_at=self.now(conn))
             _insert_build(conn, build)
             conn.commit()
             return build
@@ -603,7 +626,7 @@ class BuildStore:
                 if row is not None:
                     conn.commit()
                     return _row_to_build_state(row)
-            now = self._clock()
+            now = self.now(conn)
             _insert_build(
                 conn,
                 BuildState(
@@ -679,7 +702,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             opened = self.open_attempt_within(
                 conn,
                 build_id,
@@ -922,7 +945,7 @@ class BuildStore:
                 SET state = 'building', started_at = ?
                 WHERE build_id = ? AND state = 'pending'
                 """,
-                (self._clock(), build_id),
+                (self.now(conn), build_id),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -944,7 +967,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
             cursor = conn.execute(
                 """
@@ -979,10 +1002,8 @@ class BuildStore:
         attempt's heartbeat renew its successor's lease. A claim's lease, before an
         attempt opens, is renewed without it. A lapsed lease stays lapsed:
         its attempt is fenced for good, and the build goes on only in a new attempt or a
-        reclaim. It has lapsed by the clock read once this holds the build's key, so time
-        spent waiting for the key counts: renew well before the deadline. Every process
-        sharing the ledger must read the same clock (synchronized hosts): one running
-        behind could renew a lease another has already called lapsed.
+        reclaim. It has lapsed by :meth:`now`, read once this holds the build's key, so
+        time spent waiting for the key counts: renew well before the deadline.
         """
         conn = self._get_connection()
         try:
@@ -990,7 +1011,7 @@ class BuildStore:
             # the wait could predate a lapse a fence check acted on meanwhile, and the
             # renewal would revive the fenced attempt.
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
             sql = """
                 UPDATE artifact_builds
@@ -1026,7 +1047,7 @@ class BuildStore:
             self._dialect.begin_write(conn, build_id)
             # Strictly past: a lease is live through its deadline, so one ending at now
             # would still let the attempt through within the same clock reading.
-            lapsed_at = math.nextafter(self._clock(), -math.inf)
+            lapsed_at = math.nextafter(self.now(conn), -math.inf)
             sql = """
                 UPDATE artifact_builds
                 SET lease_owner = NULL, lease_expires_at = ?
@@ -1065,7 +1086,7 @@ class BuildStore:
         conn = self._get_connection()
         try:
             self._dialect.begin_write(conn, build_id)
-            now = self._clock()
+            now = self.now(conn)
             lease_expires_at = now + lease_duration_seconds
             row = conn.execute(
                 "SELECT attempt FROM artifact_builds WHERE build_id = ?", (build_id,)
@@ -1105,7 +1126,7 @@ class BuildStore:
         dispatch_clause, dispatch_params = _dispatch_filter(dispatch)
         conn = self._get_connection()
         try:
-            now = self._clock()
+            now = self.now(conn)
             cursor = conn.execute(
                 f"""
                 SELECT {_BUILD_COLUMNS}
@@ -1153,7 +1174,7 @@ class BuildStore:
                 SET state = 'ready', completed_at = ?, output_byte_count = ?, logs = ?
                 WHERE build_id = ? AND state = 'building'
             """
-            now = self._clock()
+            now = self.now(conn)
             params: list[SqlValue] = [now, output_byte_count, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
@@ -1196,7 +1217,7 @@ class BuildStore:
             WHERE build_id = ? AND state = 'building' AND lease_owner = ?
         """
         params: list[SqlValue] = [
-            self._clock(),
+            self.now(conn),
             output_byte_count,
             logs,
             artifact_id,
@@ -1221,7 +1242,8 @@ class BuildStore:
         """Record a blob key a build attempt may write, before anything can write it.
 
         ``writable_until`` is when the last write capability expires (a signed URL's
-        expiry, or now for a runner). Re-recording keeps the later time.
+        expiry, or now for a runner), by this host's clock, which
+        :meth:`settled_attempts` reads too. Re-recording keeps the later time.
         """
         conn = self._get_connection()
         try:
@@ -1236,7 +1258,7 @@ class BuildStore:
                     ELSE build_attempts.writable_until
                 END
                 """,
-                (build_id, artifact_id, version, attempt, writable_until, self._clock()),
+                (build_id, artifact_id, version, attempt, writable_until, self._host_now()),
             )
             conn.commit()
         finally:
@@ -1261,7 +1283,7 @@ class BuildStore:
                   AND (b.build_id IS NULL OR b.state NOT IN ('pending', 'building'))
                 LIMIT ?
                 """,
-                (self._clock(), limit),
+                (self._host_now(), limit),
             ).fetchall()
         finally:
             conn.close()
@@ -1300,7 +1322,7 @@ class BuildStore:
                 )
                 ON CONFLICT (build_id, stream, seq) DO NOTHING
                 """,
-                (build_id, stream, seq, chunk, self._clock(), build_id),
+                (build_id, stream, seq, chunk, self.now(conn), build_id),
             )
             conn.commit()
             return cursor.rowcount > 0
@@ -1375,7 +1397,7 @@ class BuildStore:
                 SET state = 'failed', completed_at = ?, error_message = ?, error_code = ?, logs = ?
                 WHERE build_id = ? AND state IN ('pending', 'building')
             """
-            params: list[SqlValue] = [self._clock(), error_message, error_code, logs, build_id]
+            params: list[SqlValue] = [self.now(conn), error_message, error_code, logs, build_id]
             if lease_owner is not None:
                 sql += " AND lease_owner = ?"
                 params.append(lease_owner)
@@ -1483,7 +1505,7 @@ class BuildStore:
         """
         conn = self._get_connection()
         try:
-            cutoff = self._clock() - (max_age_days * 86400)
+            cutoff = self.now(conn) - (max_age_days * 86400)
             conn.execute(
                 """
                 DELETE FROM build_console_chunks

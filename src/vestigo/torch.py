@@ -1445,7 +1445,7 @@ class Ledger:
         spec = self._spec(program, inputs.spec, init)
         key = compute_provenance_hash([], spec)
         attempt = uuid.uuid4().hex
-        now = time.time()
+        now = self.builds.now()
         if alone:
             # An open build that finishes before its resume leaves the computation free:
             # open again. Each round's placeholder is failed before the resume, so a
@@ -1454,7 +1454,7 @@ class Ledger:
                 build_id, placeholder, version = self._placeholder(
                     key, spec, "run", definition=[program.spec]
                 )
-                now = time.time()
+                now = self.builds.now()
                 build = self._open_build(
                     build_id,
                     placeholder,
@@ -1603,7 +1603,7 @@ class Ledger:
         self.releases.resume(
             execution_id,
             attempt,
-            writable_until=time.time() + self.config.writable_seconds,
+            writable_until=self.builds.now() + self.config.writable_seconds,
             lease_owner=attempt,
             lease_duration_seconds=self.lease_seconds,
             from_release=from_release,
@@ -1933,7 +1933,7 @@ class Ledger:
             attempt,
             computation_key=key,
             executor_ref=DERIVE_EXECUTOR,
-            writable_until=time.time() + self.config.writable_seconds,
+            writable_until=self.builds.now() + self.config.writable_seconds,
             lease_owner=attempt,
             lease_duration_seconds=self.config.writable_seconds,
             params=spec.params,
@@ -2074,7 +2074,7 @@ class Ledger:
                 accepted[attempt] = max(v.params["step"], accepted.get(attempt, -1))
         # A derivation leases its whole write window, so one still building past its
         # lease died: nothing it releases would be accepted now.
-        now = time.time()
+        now = self.builds.now()
         # By the build, not its release: one whose open reply was lost has none, and one
         # whose cleanup failed may have settled it already.
         dead_builds = [
@@ -2277,18 +2277,19 @@ class Ledger:
     def _closed(self, writer: _Checkpoints) -> str | None:
         """Why the attempt's write window refuses it, or None while the window is open."""
         attempt = self.builds.get_attempt(writer.execution_id, writer.attempt)
-        if attempt is None or attempt.writable_until > time.time():
+        now = self.builds.now()
+        if attempt is None or attempt.writable_until > now:
             return None
         return (
             f"attempt {writer.attempt}'s write window on execution {writer.execution_id} "
-            f"closed {time.time() - attempt.writable_until:.0f}s ago (writable_seconds): "
+            f"closed {now - attempt.writable_until:.0f}s ago (writable_seconds): "
             "resume it in a new attempt"
         )
 
     def _require_lease(self, writer: _Checkpoints) -> None:
         conn = self.store._get_connection()
         try:
-            held = lease_held(conn, writer.execution_id, writer.attempt, time.time())
+            held = lease_held(conn, writer.execution_id, writer.attempt, self.builds.now(conn))
         finally:
             conn.close()
         if not held:
@@ -2344,7 +2345,7 @@ class Ledger:
                 size,
                 digest,
                 fence=lambda conn, *_: lease_held(
-                    conn, writer.execution_id, writer.attempt, time.time()
+                    conn, writer.execution_id, writer.attempt, self.builds.now(conn)
                 ),
             )
         except Exception:

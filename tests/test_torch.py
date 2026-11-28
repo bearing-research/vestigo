@@ -753,7 +753,9 @@ def test_finish_and_close_wait_for_the_save_in_flight_while_the_lease_holds(
 
         def closed() -> None:
             build = ledger.builds.get_build(run.execution_id)
-            events.append("close, held" if build.lease_expires_at > time.time() else "close")
+            events.append(
+                "close, held" if build.lease_expires_at > ledger.builds.now() else "close"
+            )
             close()
 
         monkeypatch.setattr(run.manager, "close", closed)

@@ -6406,6 +6406,8 @@ class ArtifactStore:
 
         A row a build with a live lease may still write is spared: the build's target,
         its releases' outputs, and every row of its computation (``computation_key``).
+        Live by the database's clock, as ``BuildStore.now`` reads it by default; the age
+        is by this host's.
         Any other old enough ``building`` row is demoted, which is safe only where no
         writer without a lease holds one that long: a server before its build runner
         accepts work, or a notebook's own store.
@@ -6427,7 +6429,9 @@ class ArtifactStore:
                              OR b.build_id IN (SELECT r.build_id FROM build_releases r
                                                WHERE r.release_id = artifact_versions.release_id)))
                 """
-                params.append(now)
+                # By the database's clock, as every lease decision is: a sweeping host
+                # whose clock runs ahead would otherwise demote a live build's rows.
+                params.append(self._dialect.server_time(conn))
             cursor = conn.execute(
                 f"""
                 UPDATE artifact_versions

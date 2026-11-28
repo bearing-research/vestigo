@@ -304,6 +304,12 @@ class SqlDialect(Protocol):
         """
         ...
 
+    def server_time(self, conn: StoreConnection) -> float:
+        """Seconds since the epoch by the database's clock, read now on *conn*: one clock
+        for every host deciding whether a lease has lapsed. SQLite's is the host's own,
+        as one database file is one host's."""
+        ...
+
     def share_write(self, conn: StoreConnection, key: str) -> None:
         """Hold ``key`` shared until the transaction ends, as its first lock: any number
         of writers share it, and a :meth:`begin_write` on ``key`` waits for them all, as
@@ -551,6 +557,9 @@ class SqliteDialect:
     def begin_write(self, conn: StoreConnection, key: str) -> None:
         # SQLite locks the whole file, so the key is unused.
         conn.execute("BEGIN IMMEDIATE")
+
+    def server_time(self, conn: StoreConnection) -> float:
+        return time.time()
 
     def share_write(self, conn: StoreConnection, key: str) -> None:
         # The writer's own begin_write takes the whole file, which a begin_write on any
@@ -956,6 +965,12 @@ class PostgresDialect:
         :attr:`integrity_error`.
         """
         conn.execute("SELECT pg_advisory_xact_lock(?)", (advisory_lock_id(key),))
+
+    def server_time(self, conn: StoreConnection) -> float:
+        # clock_timestamp(), not now(): now() is the transaction's start, which can
+        # precede the wait for a lock the reading is meant to follow.
+        row = one(conn.execute("SELECT EXTRACT(EPOCH FROM clock_timestamp())::float8 AS now"))
+        return float(row["now"])
 
     def share_write(self, conn: StoreConnection, key: str) -> None:
         conn.execute("SELECT pg_advisory_xact_lock_shared(?)", (advisory_lock_id(key),))

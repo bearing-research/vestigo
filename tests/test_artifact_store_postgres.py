@@ -1436,10 +1436,10 @@ class TestBuildStoreSharesTheBackend:
             conn.close()
             reopened = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
 
-            before = time.time()
+            before = reopened.now()  # the database's clock, which writes opened_at
             assert reopened.open_attempt("b", "a1", writable_until=1e12)
             # To the second: a single-precision column would round it by a minute.
-            assert before <= reopened.get_attempt("b", "a1").opened_at <= time.time()
+            assert before <= reopened.get_attempt("b", "a1").opened_at <= reopened.now()
             conn = dialect.connect()
             [column] = conn.execute(
                 "SELECT data_type FROM information_schema.columns "
@@ -1540,7 +1540,7 @@ class TestBuildStoreSharesTheBackend:
             version = artifacts.create_artifact("big", "prov-big", _spec())
 
             store = BuildStore(tmp_path / "x.sqlite", dialect=dialect)
-            before = time.time()
+            before = store.now()  # the database's clock, which writes created_at
             build_id = "build-widths"
             store.create_build(
                 build_id=build_id,
@@ -1550,7 +1550,7 @@ class TestBuildStoreSharesTheBackend:
             )
             store.start_build(build_id)
             store.complete_build(build_id, output_byte_count=3 * 1024**3)
-            after = time.time()
+            after = store.now()
 
             build = store.get_build(build_id)
             assert build.output_byte_count == 3 * 1024**3
@@ -2676,3 +2676,45 @@ class TestTheOpenBuildIndex:
             assert self._present(reopened) == {"idx_build_open"}
         finally:
             reopened.close()
+
+
+class TestOneClockForEveryHost:
+    """Lease decisions read the database's clock, so a host whose own clock runs two
+    minutes ahead, past a one-minute lease, still finds the lease live."""
+
+    @staticmethod
+    def _live_build(store: ArtifactStore, tmp_path) -> BuildStore:
+        builds = BuildStore(tmp_path / "x.sqlite", dialect=store.dialect)
+        version = store.create_artifact("art", "prov-art", _spec())
+        builds.create_build(build_id="b", artifact_id="art", version=version, executor_ref="x")
+        assert builds.open_attempt(
+            "b",
+            "a1",
+            writable_until=builds.now() + 3600,
+            lease_owner="runner-1",
+            lease_duration_seconds=60.0,
+        )
+        return builds
+
+    @staticmethod
+    def _run_ahead(monkeypatch: pytest.MonkeyPatch) -> None:
+        real = time.time
+        monkeypatch.setattr(time, "time", lambda: real() + 120)
+
+    def test_a_host_running_ahead_finds_a_live_lease_live(self, store, tmp_path, monkeypatch):
+        builds = self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert builds.list_expired_leases(dispatch=None) == []
+        assert not builds.reclaim_expired_build("b", "runner-2", dispatch=None)
+        assert builds.renew_lease("b", "runner-1", 60.0, attempt="a1")
+        assert ReleaseStore(store, builds).prepare("b", "a1", "checkpoint").state == "preparing"
+
+    def test_a_zombie_sweep_on_a_host_running_ahead_spares_a_live_build(
+        self, store, tmp_path, monkeypatch
+    ):
+        self._live_build(store, tmp_path)
+        self._run_ahead(monkeypatch)
+
+        assert store.sweep_zombie_builds(max_age_seconds=60) == 0
+        assert store.get_artifact("art", 1).state == "building"
