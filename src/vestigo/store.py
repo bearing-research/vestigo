@@ -5403,9 +5403,11 @@ class ArtifactStore:
     def delete_artifact(self, artifact_id: str, version: int, tenant: str | None = None) -> bool:
         """Delete an artifact version, its blob, and every name, alias and tag pointing at it.
 
-        With ``tenant`` the artifact must belong to that tenant or be tenantless.
-        Returns False if it does not exist or belongs to another tenant. A version
-        that reads these bytes through ``superseded_by`` gets a copy of its own first.
+        Each name and alias it removes is audited (``name_delete``, ``alias_delete``)
+        from this version, whose id the rows also carry. With ``tenant`` the
+        artifact must belong to that tenant or be tenantless. Returns False if it does
+        not exist or belongs to another tenant. A version that reads these bytes
+        through ``superseded_by`` gets a copy of its own first.
 
         An explicit delete beats lineage and requirements: unlike a sweep, it does not
         ask whether a named, published or held version descends from this one or
@@ -5524,13 +5526,29 @@ class ArtifactStore:
             # Past this point the delete is committed to; the blob cleanup
             # below the finally runs only for rows that actually existed.
 
+            # Name and alias deletions are audited, from this version, so a pointer
+            # vanishing with its target stays reconstructible. Read
+            # under the audit lock and this row's lock: no name or alias can move onto
+            # the version meanwhile.
+            cursor = conn.execute(
+                "SELECT name, tenant FROM artifact_names WHERE artifact_id = ? AND version = ?",
+                (artifact_id, version),
+            )
+            for row in cursor.fetchall():
+                self._audit_in_connection(
+                    conn,
+                    action="name_delete",
+                    name=row["name"],
+                    artifact_id=artifact_id,
+                    from_artifact_id=artifact_id,
+                    from_version=version,
+                    tenant=row["tenant"] if row["tenant"] else None,
+                )
             conn.execute(
                 "DELETE FROM artifact_names WHERE artifact_id = ? AND version = ?",
                 (artifact_id, version),
             )
 
-            # Alias deletions are audited, so an alias vanishing with its target stays
-            # reconstructible.
             cursor = conn.execute(
                 "SELECT name, alias, tenant FROM artifact_aliases "
                 "WHERE artifact_id = ? AND version = ?",
@@ -5542,7 +5560,9 @@ class ArtifactStore:
                     action="alias_delete",
                     name=row["name"],
                     alias=row["alias"],
+                    # As before, so read_audit(artifact_id=...) finds the removal.
                     artifact_id=artifact_id,
+                    from_artifact_id=artifact_id,
                     from_version=version,
                     tenant=row["tenant"] if row["tenant"] else None,
                 )

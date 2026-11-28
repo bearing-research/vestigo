@@ -1757,6 +1757,26 @@ class TestRegistryAudit:
         actions = [e["action"] for e in store.read_audit(name="demo/model")]
         assert actions[0] == "name_delete"
 
+    def test_a_deleted_version_s_names_and_aliases_are_audited_from_it(self, backend_store):
+        store = backend_store
+        _make_ready_artifact(store, "m1", "prov-1")
+        store.set_name("demo/model", "m1", 1, tenant="acme")
+        store.set_alias("demo/model", "champion", "m1", 1, tenant="acme")
+
+        assert store.delete_artifact("m1", 1)
+
+        assert [
+            (e["action"], e["alias"], e["from_artifact_id"], e["from_version"], e["tenant"])
+            for e in store.read_audit(name="demo/model", tenant="acme")[:2]
+        ] == [
+            ("alias_delete", "champion", "m1", 1, "acme"),
+            ("name_delete", None, "m1", 1, "acme"),
+        ]
+        assert {e["action"] for e in store.read_audit(artifact_id="m1")} >= {
+            "alias_delete",
+            "name_delete",
+        }
+
     def test_finalize_promotion_audited(self, store):
         """Names set through finalize_and_set_name land in the audit too."""
         store.create_artifact("m1", "prov-f")
