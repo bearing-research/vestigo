@@ -534,8 +534,10 @@ class TestDefinitions:
     def test_versions_without_a_definition_can_be_given_one_once(self, store):
         spec = TransformSpec("x@v1", {}, [])
         v1 = store.create_artifact("old", "prov-1", spec)
+        store.write_blob("old", v1, b"bytes")
         store.finalize_artifact("old", v1, "{}", 1, 1)
         v2 = store.create_artifact("old", "prov-2", spec)
+        store.write_blob("old", v2, b"bytes")
         store.finalize_artifact("old", v2, "{}", 1, 1)
         unfinished = store.create_artifact("building", "prov-3", spec)
         leaf, first, second = store.graph.put_batch(THREE)
@@ -561,6 +563,7 @@ class TestDefinitions:
             version = backend_store.create_artifact(
                 artifact_id, f"prov-{artifact_id}", TransformSpec(executor, {}, [])
             )
+            backend_store.write_blob(artifact_id, version, b"bytes")
             backend_store.finalize_artifact(artifact_id, version, "{}", 1, 1)
 
         for executor, artifact_id in (("x@v1", "lower"), ("X@v1", "upper")):
@@ -572,8 +575,10 @@ class TestDefinitions:
         spec = TransformSpec("x@v1", {}, [])
         for tenant in ("t1", "t2"):
             version = store.create_artifact("old-" + tenant, "prov-" + tenant, spec, tenant=tenant)
+            store.write_blob("old-" + tenant, version, b"bytes")
             store.finalize_artifact("old-" + tenant, version, "{}", 1, 1)
         version = store.create_artifact("old", "prov-none", spec)
+        store.write_blob("old", version, b"bytes")
         store.finalize_artifact("old", version, "{}", 1, 1)
 
         lacking = store.versions_lacking_definition()
@@ -595,6 +600,7 @@ class TestDefinitions:
         """A string that is not a node of the version's scope is refused, not recorded."""
         spec = TransformSpec("x@v1", {}, [])
         v1 = store.create_artifact("old", "prov-1", spec)
+        store.write_blob("old", v1, b"bytes")
         store.finalize_artifact("old", v1, "{}", 1, 1)
         with pytest.raises(ValueError):
             store.set_definitions({("old", 1): _hex(5)})

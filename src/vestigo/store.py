@@ -151,6 +151,12 @@ class ImportStagingLost(RuntimeError):
     """A staging's upload outlasted ``IMPORT_STAGING_TTL_SECONDS``, and a drop took it."""
 
 
+def _no_bytes_error(artifact_id: str, version: int) -> ValueError:
+    return ValueError(
+        f"Artifact {artifact_id}@v={version} has no bytes stored; write them before finalizing"
+    )
+
+
 class BuildLeaseLost(RuntimeError):
     """A build attempt tried to publish after its lease moved to another."""
 
@@ -3208,10 +3214,16 @@ class ArtifactStore:
         superseding any other.
 
         Raises:
-            ValueError: If a version is not found or not in "building" state.
+            ValueError: If a version is not found, not in "building" state, or has no
+                bytes stored; none is made ready.
         """
         if not staged:
             return []
+        # One HEAD each, before any lock: a ready row with nothing stored would be served
+        # as a cache hit. Existence only; an acceptance also compares sizes.
+        for item in staged:
+            if not self.blob_store.blob_exists(item.artifact_id, item.version):
+                raise _no_bytes_error(item.artifact_id, item.version)
         # Retried: a keyed advisory lock only serializes writers sharing an artifact id, so a
         # writer under another id can commit a ready row with our provenance between our
         # supersede and our promote, and the uniqueness index rejects us.
@@ -3330,7 +3342,11 @@ class ArtifactStore:
         Raises:
             ArtifactNotFoundError: The artifact does not exist, or *name* is given and
                 the artifact's tenant is one the caller cannot name in; one error for both.
-            ValueError: If the artifact is not in "building" state.
+            ValueError: If the artifact is not in "building" state, or would become ready
+                with no bytes stored (it stays building); one overtaken by a duplicate
+                reads the duplicate's bytes and needs none. Checked before the write's
+                locks: it catches an upload that never landed, not a delete racing the
+                finalize. Raised before ``fence`` runs.
             BuildLeaseLost: If ``fence`` found the lease held by another attempt.
         """
 
@@ -3393,6 +3409,7 @@ class ArtifactStore:
                 raise ArtifactNotFoundError(f"Artifact {artifact_id}@v={version} not found")
 
             digest = content_sha256
+            checked = False
             for attempt in range(_CANONICAL_PROMOTE_ATTEMPTS):
                 # Two builds with the same (tenant, provenance_hash) can complete at once.
                 existing = self.find_by_provenance(provenance_hash, tenant=artifact_tenant)
@@ -3427,6 +3444,14 @@ class ArtifactStore:
                     # Recorded here, not at write time: every write path (bytes, streamed writer,
                     # file, import) arrives here, and this is the moment the bytes become final.
                     digest = self.blob_digest(artifact_id, version, blob_attempt)
+                    if digest is None:
+                        raise _no_bytes_error(artifact_id, version)
+                elif not checked:
+                    # The caller's digest is no proof the bytes landed: a lost upload or a
+                    # crashed writer would leave a ready row a cache hit serves with nothing.
+                    if not self.blob_exists(artifact_id, version, blob_attempt):
+                        raise _no_bytes_error(artifact_id, version)
+                checked = True
 
                 self._hold_off_sweeps(conn)
                 if existing is not None:

@@ -89,6 +89,9 @@ if hit is None:
   deleted version, so an edge, a review or a link naming `id@v=N` never comes to mean
   other bytes here. An import keeps the number its source store gave it.
   `get_latest_version(id)` is the id's current value, its newest `ready` one.
+- **A finalize with no bytes stored** raises `ValueError` and leaves the row
+  `building`, so a lost upload is never served as a hit. With `content_sha256` given it
+  costs one existence check on the blob store; without it, the bytes are hashed anyway.
 - **A write that fails** should be marked with `fail_artifact`; until then the row
   stays `building`. `cleanup_failed(max_age_seconds=)` deletes failed rows, in batches that each commit on their own.
   `sweep_zombie_builds` fails every `building` row older than its cutoff, except the
