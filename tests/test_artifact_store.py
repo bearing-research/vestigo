@@ -2160,6 +2160,117 @@ class TestAliasIdempotence:
         assert len(store.list_pending_changes()) == 1
 
 
+class _PausedAfterRead:
+    """A connection that, once it has read *table*, gives another writer a moment."""
+
+    def __init__(self, conn, table: str, read: threading.Event, other_done: threading.Event):
+        self._conn, self._table, self._read, self._other_done = conn, table, read, other_done
+
+    def execute(self, sql, *args, **kwargs):
+        cursor = self._conn.execute(sql, *args, **kwargs)
+        if not self._read.is_set() and sql.lstrip().startswith("SELECT") and self._table in sql:
+            self._read.set()
+            # Long enough for an unserialized writer to commit; one that waits for this
+            # transaction does not finish, so the wait times out.
+            self._other_done.wait(1)
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _moves(store, name: str, alias: str | None) -> list[tuple[str, int | None, int | None]]:
+    events = sorted(store.read_audit(name=name), key=lambda event: event["seq"])
+    return [
+        (event["action"], event["from_version"], event["to_version"])
+        for event in events
+        if event["alias"] == alias and event["action"] != "alias_approved"
+    ]
+
+
+class TestAuditedMovesFromWhatWasThere:
+    """A pointer's audited move or deletion names the target it replaced, though another
+    writer moves it meanwhile."""
+
+    @pytest.mark.parametrize(
+        ("alias", "slow", "expected"),
+        [
+            (None, "set", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            (None, "finalize", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            (None, "delete", [("set", None, 1), ("delete", 1, None), ("set", None, 3)]),
+            ("prod", "set", [("set", None, 1), ("set", 1, 2), ("set", 2, 3)]),
+            ("prod", "delete", [("set", None, 1), ("delete", 1, None), ("set", None, 3)]),
+        ],
+    )
+    def test_a_move_racing_another_is_audited_from_its_predecessor(
+        self, backend_store, monkeypatch, alias, slow, expected
+    ):
+        store = backend_store
+        if slow == "set" and store.dialect.name == "sqlite":
+            pytest.skip("a move locks its target, which on SQLite is the write lock")
+        for version in (1, 2, 3):
+            store.create_artifact("x", f"prov-{version}")
+            store.write_blob("x", version, _ipc_bytes(version))
+            store.finalize_artifact("x", version, "{}", 1, 10)
+
+        def point(version: int) -> None:
+            if alias is None:
+                store.set_name("m", "x", version)
+            else:
+                store.set_alias("m", alias, "x", version)
+
+        def drop() -> None:
+            if alias is None:
+                store.delete_name("m")
+            else:
+                store.delete_alias("m", alias)
+
+        writes = {
+            "set": lambda: point(2),
+            # A retry of x@2's finalize, which names its result again.
+            "finalize": lambda: store.finalize_and_set_name("x", 2, "{}", 1, 10, "m"),
+            "delete": drop,
+        }
+        point(1)
+        read, other_done = threading.Event(), threading.Event()
+        table = "artifact_names" if alias is None else "artifact_aliases"
+        connect = store._get_connection
+        writer = threading.Thread(target=writes[slow])
+        monkeypatch.setattr(
+            store,
+            "_get_connection",
+            lambda: (
+                _PausedAfterRead(connect(), table, read, other_done)
+                if threading.current_thread() is writer
+                else connect()
+            ),
+        )
+        writer.start()
+        assert read.wait(10)
+        point(3)
+        other_done.set()
+        writer.join(10)
+        assert not writer.is_alive()
+
+        kind = "name" if alias is None else "alias"
+        assert _moves(store, "m", alias) == [
+            (f"{kind}_{action}", before, after) for action, before, after in expected
+        ]
+
+    @pytest.mark.parametrize("alias", [None, "prod"])
+    def test_a_deletion_is_audited_from_the_id_and_version_it_removed(self, store, alias):
+        _make_ready_artifact(store, "y", "prov-y")
+        if alias is None:
+            store.set_name("m", "y", 1)
+            store.delete_name("m")
+        else:
+            store.set_alias("m", alias, "y", 1)
+            store.delete_alias("m", alias)
+
+        deletion = store.read_audit(name="m")[0]
+        assert (deletion["from_artifact_id"], deletion["from_version"]) == ("y", 1)
+
+
 class TestAuditTenantScoping:
     """read_audit isolates by tenant for request-serving callers."""
 
