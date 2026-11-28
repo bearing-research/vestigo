@@ -16,6 +16,7 @@ from __future__ import annotations
 
 LEDGER_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("artifact_versions", ("id", "version")),
+    ("artifact_high_water", ("id",)),
     ("artifact_names", ("tenant", "name")),
     ("artifact_aliases", ("tenant", "name", "alias")),
     ("artifact_tags", ("tenant", "artifact_id", "version", "key")),

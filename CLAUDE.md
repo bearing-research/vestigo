@@ -109,7 +109,8 @@ entry point, and the README's overview when a capability is added.
    only by the attempt whose lease is live; a lapsed lease fences its attempt.
 4. **The ledger never parses a node's payload**; traversals are bounded.
 5. **Immutable means immutable.** Versions are never rewritten; a promote
-   writes a new version; `cleanup_failed` never reuses a version number.
+   writes a new version; `create_artifact` never hands out a number twice, a
+   deleted one included (`artifact_high_water`); an import keeps its source's.
 6. **Only a missing object is "absent"** on a blob backend; access denied,
    expired credentials and connection errors propagate as the SDK's error.
 7. **The URI scheme is persisted** in `input_versions`, so a store keeps the
