@@ -5,6 +5,8 @@ All notable changes to vestigo are recorded here. The format follows
 
 ## Unreleased
 
+## 0.9.0 - 2026-11-27
+
 ### Added
 
 - `BlobStore.adopt_blob_file` publishes a complete local file as a blob and consumes it.
